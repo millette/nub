@@ -1,20 +1,21 @@
 //! `nub pm use nub` — the full switch into nub identity — and the yaml
 //! regeneration half of `nub pm use pnpm` (the exact reverse).
 //!
-//! Spec: wiki/commands/pm/identity-policy.md (`pm use`, the four axioms) +
-//! wiki/commands/pm/workspace-yaml-migration.md (the exhaustive key table and
+//! Spec: `identity-policy` (no such document) (`pm use`, the four axioms) +
+//! `workspace-yaml-migration` (no such document) (the exhaustive key table and
 //! its Bun-names addendum). The two-mode model in one paragraph: compat mode
 //! (default) plays the incumbent PM's role completely — its lockfile, its
 //! config surface, its grammar. `pm use nub` is the explicit graduation:
-//! `packageManager: "nub@<exact>"` + `devEngines.packageManager
-//! {name:"nub", version:"^<ver>", onFail:"warn"}`, the lockfile renamed (or
-//! converted) to `lock.yaml` (pnpm-v9 bytes, generic name), and
-//! `pnpm-workspace.yaml` ALWAYS migrated and deleted:
+//! `devEngines.packageManager {name:"nub", version:"^<ver>", onFail:"ignore"}`
+//! (the non-locking cross-tool signal, always written) plus — ONLY on the
+//! explicit `pm use nub@<exact>` opt-in — the hard `packageManager: "nub@<exact>"`
+//! pin; the lockfile renamed (or converted) to `nub.lock` (pnpm-v9 bytes,
+//! generic name), and `pnpm-workspace.yaml` ALWAYS migrated and deleted:
 //!
 //! - resolution-bearing keys → `package.json` under ecosystem-standard
 //!   top-level names (`workspaces` incl. the object form,
 //!   `workspaces.catalog(s)`, `overrides`, `patchedDependencies`, the
-//!   three-state `allowBuilds` map, `auditConfig`);
+//!   three-state `allowScripts` map);
 //! - settings → `.npmrc` (the same vocabulary, kebab spellings — one engine
 //!   reads both homes, so this is a mechanical move, not a translation);
 //! - engine-unsupported keys → warn-drop naming each (the three repo-wide
@@ -36,7 +37,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use super::use_align::{self, AlignPlan, NUB_LOCKFILE};
+use super::use_align::{self, AlignPlan, NUB_LEGACY_LOCKFILE, NUB_LOCKFILE};
 
 /// Yaml/settings keys whose post-migration home is `.npmrc`, per the audit
 /// table. Spellings are the camelCase yaml forms; emission converts to the
@@ -44,6 +45,11 @@ use super::use_align::{self, AlignPlan, NUB_LOCKFILE};
 /// at build time, so the kebab line always parses). Objects and lists are
 /// emitted as JSON values — the engine's npmrc readers parse both
 /// (`object_setting_from_npmrc`, `parse_string_list`).
+///
+/// This is the HOME table, not the consumed set: an entry nub's embedder profile
+/// declares unsupported is warn-dropped by the earlier profile arm and never
+/// reaches this one. Entries deliberately stay listed so a setting that later
+/// becomes consumed resumes migrating without a second edit here.
 const NPMRC_KEYS: &[&str] = &[
     // data-shaped keys whose only engine-readable post-yaml home is .npmrc
     // (Bun-names addendum: no manifest-commons squatting)
@@ -126,6 +132,7 @@ const NPMRC_KEYS: &[&str] = &[
     "resolutionMode",
     "resolvePeersFromWorkspaceRoot",
     "savePrefix",
+    "saveTypes",
     "saveWorkspaceProtocol",
     "scriptShell",
     "shamefullyHoist",
@@ -179,6 +186,7 @@ const NPMRC_KEYS: &[&str] = &[
     "linkConcurrency",
     "hoistingLimits",
     "disableGlobalVirtualStoreForPackages",
+    "diskMaterializePackages",
 ];
 
 /// Keys the engine has zero implementation for: warn-drop, naming each and
@@ -232,6 +240,14 @@ const ENGINE_UNSUPPORTED: &[(&str, &str)] = &[
     (
         "allowUnusedPatches",
         "unreferenced patch files always error in the engine",
+    ),
+    // Was migrated to a top-level `auditConfig` until nub stopped reading that
+    // key. Reporting it is the whole point: the alternative is a conversion
+    // that says it succeeded while the project's triaged advisories quietly
+    // come back on the next audit.
+    (
+        "auditConfig",
+        "nub has no persistent audit-ignore config — pass `nub audit --ignore <id>`, which takes advisory numbers, GHSA ids and CVE ids",
     ),
     (
         "fetchingConcurrency",
@@ -370,13 +386,11 @@ pub(crate) struct YamlMigration {
     /// and package.json live in the same directory, so relative patch paths
     /// stay correct).
     pub patched_dependencies: Option<Map<String, Value>>,
-    /// Top-level three-state `allowBuilds` map. Folds the legacy trio:
-    /// `onlyBuiltDependencies` → `true`, `neverBuiltDependencies` /
-    /// `ignoredBuiltDependencies` → `false` (asked-and-answered, not
-    /// security denial). Explicit `allowBuilds` entries win the fold.
+    /// Entries for the top-level three-state `allowScripts` map. Folds the
+    /// legacy trio: `onlyBuiltDependencies` → `true`, `neverBuiltDependencies`
+    /// / `ignoredBuiltDependencies` → `false` (asked-and-answered, not
+    /// security denial). Explicit pnpm `allowBuilds` entries win the fold.
     pub allow_builds: Option<Map<String, Value>>,
-    /// Top-level `auditConfig` (aube's existing extension home).
-    pub audit_config: Option<Value>,
     /// `.npmrc` lines to append, as `(key, value)` (key already kebab).
     pub npmrc: Vec<(String, String)>,
     /// Engine-unsupported keys found, as `key — note` summary lines.
@@ -429,6 +443,9 @@ pub(crate) fn plan_migration(source: &Map<String, Value>) -> Result<YamlMigratio
     }
 
     for (key, value) in source {
+        // Looked up once, ahead of the match, because a match GUARD cannot bind
+        // what it tests and the arm needs the same meta to reach the advice.
+        let unsupported = aube_settings::meta::unsupported_for_key(key);
         match key.as_str() {
             // structural / resolution-bearing → package.json
             "packages" => m.packages = Some(value.clone()),
@@ -436,7 +453,6 @@ pub(crate) fn plan_migration(source: &Map<String, Value>) -> Result<YamlMigratio
             "catalogs" => m.catalogs = Some(value.clone()),
             "overrides" => m.overrides = value.as_object().cloned(),
             "patchedDependencies" => m.patched_dependencies = value.as_object().cloned(),
-            "auditConfig" => m.audit_config = Some(value.clone()),
             // handled by the folds above
             "allowBuilds"
             | "onlyBuiltDependencies"
@@ -477,6 +493,18 @@ pub(crate) fn plan_migration(source: &Map<String, Value>) -> Result<YamlMigratio
                     .iter()
                     .find(|(k, _)| k == key)
                     .map(|(_, n)| *n)
+                    .unwrap_or_default();
+                m.dropped.push(format!("{key} — {note}"));
+            }
+            // A setting nub's embedder profile declares it does not consume.
+            // Asked BEFORE [`NPMRC_KEYS`] and derived from the profile rather
+            // than a second hand-kept list, so the two cannot drift: migrating
+            // one of these would move a value out of a file pnpm read into a
+            // file nothing reads, and report it as migrated. The profile's own
+            // advice line is the note, so the drop names the replacement.
+            _ if unsupported.is_some() => {
+                let note = unsupported
+                    .and_then(|meta| aube_settings::meta::unsupported_advice(meta.name))
                     .unwrap_or_default();
                 m.dropped.push(format!("{key} — {note}"));
             }
@@ -522,6 +550,56 @@ pub(crate) fn plan_migration(source: &Map<String, Value>) -> Result<YamlMigratio
     Ok(m)
 }
 
+/// Write nub's two identity fields onto the root manifest object: the exact
+/// corepack-visible pin `packageManager: "nub@<v>"` — a HARD lock, written only
+/// when `exact_pin` is `Some` (the `nub pm use nub@<exact>` opt-in or `nub pm
+/// pin`), and REMOVED when `None` (the non-locking `nub pm use nub`, so the
+/// field never contradicts the devEngines entry) — and, always, the
+/// `devEngines.packageManager {name:"nub", version:"^<range>", onFail:"ignore"}`
+/// signal beside it (sibling devEngines entries survive). The pair is kept in
+/// lockstep by this one writer so the exact pin and the caret range can't drift.
+///
+/// `onFail:"ignore"` and not `"warn"`: the entry exists to be READ (it is the PM
+/// signal nub's unbranded lockfile withholds), and detectors read `name`/`version`
+/// only. `"warn"` additionally asks npm to ENFORCE it, which npm does on every
+/// command in the project — including `npx`, which manages no dependencies at all
+/// — for a mismatch npm can never satisfy, since "nub" is not npm. That is a
+/// permanent unactionable warning block bought for no detection benefit. Note the
+/// asymmetry with [`nub_core::pm::resolve::write_declared_pm`], which keeps
+/// `"warn"` when declaring a FOREIGN manager: there the warning names a manager
+/// the user can actually switch to.
+/// Shared by the full into-nub switch ([`apply_manifest_edits`]) and the
+/// lightweight lock (`nub pm pin`), which writes ONLY these two fields.
+///
+/// Why the pin stays EXACT while only devEngines carries a `^` range: turbo
+/// enforces exact 3-part semver on BOTH fields, so a range anywhere the signal
+/// lives costs turbo recognition. The range exists for nub's own self-shim to
+/// satisfy, not for external detection.
+// @lat: [[research/nub-field-write-vs-detection#Which field maximizes coverage]]
+pub(crate) fn write_nub_identity_fields(
+    obj: &mut Map<String, Value>,
+    exact_pin: Option<&str>,
+    range_version: &str,
+) {
+    match exact_pin {
+        Some(v) => {
+            obj.insert("packageManager".into(), Value::String(format!("nub@{v}")));
+        }
+        None => {
+            obj.remove("packageManager");
+        }
+    }
+    let dev = obj
+        .entry("devEngines")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(dev) = dev.as_object_mut() {
+        dev.insert(
+            "packageManager".into(),
+            json!({ "name": "nub", "version": format!("^{range_version}"), "onFail": "ignore" }),
+        );
+    }
+}
+
 /// Apply the migration's package.json half onto the (already parsed) root
 /// manifest object, plus the identity fields. Merge rules preserve the
 /// pre-switch EFFECTIVE config:
@@ -529,9 +607,10 @@ pub(crate) fn plan_migration(source: &Map<String, Value>) -> Result<YamlMigratio
 /// - `workspaces` membership + catalogs: the yaml was authoritative under
 ///   pnpm (it shadows `package.json#workspaces`), so yaml values overwrite —
 ///   any differing pre-existing value is named in the returned notes.
-/// - `overrides` / `patchedDependencies` / `allowBuilds` / `auditConfig`:
+/// - `overrides` / `patchedDependencies` / `allowScripts`:
 ///   per-key insert; an existing top-level entry wins (the engine's merge
-///   already ranked top-level above the yaml), conflicts named.
+///   already ranked top-level above the yaml), conflicts named. pnpm's
+///   `allowBuilds` map lands under the neutral `allowScripts` name.
 /// - `pnpm` namespace: removed (migrated through the same table by the
 ///   caller; unread under nub identity).
 ///
@@ -541,26 +620,12 @@ pub(crate) fn plan_migration(source: &Map<String, Value>) -> Result<YamlMigratio
 pub(crate) fn apply_manifest_edits(
     obj: &mut Map<String, Value>,
     m: &YamlMigration,
-    nub_version: &str,
+    exact_pin: Option<&str>,
+    range_version: &str,
 ) -> Vec<String> {
     let mut notes = Vec::new();
 
-    obj.insert(
-        "packageManager".into(),
-        Value::String(format!("nub@{nub_version}")),
-    );
-    // devEngines.packageManager: created (this verb is the one sanctioned
-    // creator), replacing any prior entry wholesale; sibling devEngines
-    // entries (runtime/os/…) survive.
-    let dev = obj
-        .entry("devEngines")
-        .or_insert_with(|| Value::Object(Map::new()));
-    if let Some(dev) = dev.as_object_mut() {
-        dev.insert(
-            "packageManager".into(),
-            json!({ "name": "nub", "version": format!("^{nub_version}"), "onFail": "warn" }),
-        );
-    }
+    write_nub_identity_fields(obj, exact_pin, range_version);
 
     // workspaces: array vs object form.
     let has_catalogs = m.catalog.is_some() || m.catalogs.is_some();
@@ -610,7 +675,7 @@ pub(crate) fn apply_manifest_edits(
     for (key, entries) in [
         ("overrides", &m.overrides),
         ("patchedDependencies", &m.patched_dependencies),
-        ("allowBuilds", &m.allow_builds),
+        (aube_manifest::ROOT_ALLOW_SCRIPTS_KEY, &m.allow_builds),
     ] {
         let Some(entries) = entries else { continue };
         let target = obj.entry(key).or_insert_with(|| Value::Object(Map::new()));
@@ -634,14 +699,6 @@ pub(crate) fn apply_manifest_edits(
             }
         }
     }
-    if let Some(audit) = &m.audit_config
-        && obj.get("auditConfig").is_none_or(|prev| prev == audit)
-    {
-        obj.insert("auditConfig".into(), audit.clone());
-    } else if m.audit_config.is_some() {
-        notes.push("auditConfig: package.json already sets a differing value — kept".into());
-    }
-
     obj.remove("pnpm");
     notes
 }
@@ -710,23 +767,64 @@ pub(crate) fn read_workspace_yaml(root: &Path) -> Result<Option<Map<String, Valu
     Ok(Some(json.as_object().cloned().unwrap_or_default()))
 }
 
-/// The merged migration source: yaml keys ∪ `package.json#pnpm.*` keys, yaml
-/// winning duplicates (it was the live value under pnpm v11). Returns the
-/// source plus conflict notes for the summary.
+/// Which config home wins when `package.json#pnpm.*` and `pnpm-workspace.yaml`
+/// set the SAME resolution key — a per-major fact of pnpm, not a fixed rule:
+///
+/// - **pnpm 9 / 10** (`PnpmNsWins`): `package.json#pnpm.*` is authoritative,
+///   and a `pnpm.<key>` block REPLACES the yaml block WHOLESALE (empirically:
+///   a v10 `pnpm.overrides` drops the yaml `overrides` entirely, even for
+///   non-overlapping inner keys — the `recursive.ts:150` second-pass re-read).
+/// - **pnpm 11** (`YamlWins`): the `pnpm.*` namespace is deprecated
+///   (warn+ignore), so `pnpm-workspace.yaml` carries the live value.
+///
+/// `merged_source` merges at top-level-KEY granularity (a whole block wins or
+/// loses; never a deep inner-key merge), so "replaces wholesale" is the
+/// natural semantics on both sides — only the *winner* flips by major. Reading
+/// the wrong rule mis-migrates a project that sets the same resolution key in
+/// both homes (gap #6 in the pnpm migrate audit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VocabPrecedence {
+    /// pnpm 9/10: `package.json#pnpm.*` wins, replacing the yaml block.
+    PnpmNsWins,
+    /// pnpm 11: `pnpm-workspace.yaml` wins.
+    YamlWins,
+}
+
+/// The merged migration source: `pnpm-workspace.yaml` keys ∪
+/// `package.json#pnpm.*` keys. On a DUPLICATE top-level key the winner is the
+/// incumbent pnpm major's real rule (`precedence` — see [`VocabPrecedence`]),
+/// and the winning block replaces the loser's wholesale; a key present in only
+/// one home always migrates. Returns the source plus conflict notes for the
+/// summary.
 pub(crate) fn merged_source(
     yaml: Option<&Map<String, Value>>,
     pnpm_ns: Option<&Map<String, Value>>,
+    precedence: VocabPrecedence,
 ) -> (Map<String, Value>, Vec<String>) {
     let mut merged = yaml.cloned().unwrap_or_default();
     let mut notes = Vec::new();
     if let Some(ns) = pnpm_ns {
         for (k, v) in ns {
             match merged.get(k) {
-                Some(existing) if existing != v => notes.push(format!(
-                    "package.json#pnpm.{k} differs from the pnpm-workspace.yaml value — \
-                     the yaml value migrated (it was authoritative under pnpm v11)"
-                )),
+                // Same key in both homes, differing values: the major decides.
+                Some(existing) if existing != v => match precedence {
+                    VocabPrecedence::YamlWins => notes.push(format!(
+                        "package.json#pnpm.{k} differs from the pnpm-workspace.yaml value — \
+                         the yaml value migrated (pnpm 11 deprecates the pnpm.* namespace; \
+                         the yaml is authoritative)"
+                    )),
+                    VocabPrecedence::PnpmNsWins => {
+                        merged.insert(k.clone(), v.clone());
+                        notes.push(format!(
+                            "package.json#pnpm.{k} differs from the pnpm-workspace.yaml value — \
+                             the package.json value migrated and the yaml block was dropped \
+                             wholesale (pnpm 9/10: package.json#pnpm.* wins)"
+                        ));
+                    }
+                },
+                // Identical in both homes: nothing to choose, no note.
                 Some(_) => {}
+                // Present only in pnpm.*: always migrated.
                 None => {
                     merged.insert(k.clone(), v.clone());
                 }
@@ -736,11 +834,33 @@ pub(crate) fn merged_source(
     (merged, notes)
 }
 
+/// Resolve the `pnpm.*` ↔ `pnpm-workspace.yaml` precedence for the incumbent
+/// pnpm at `root`. Provably-v11+ → `YamlWins`; everything else (v9/v10, or an
+/// undeclared / unparseable / non-pnpm pin) → `PnpmNsWins`, the dominant
+/// v9/v10 model. An undeclared major can't be recovered from the lockfile (the
+/// pnpm lock is `lockfileVersion: '9.0'` across all three majors), so the
+/// declared `packageManager`/`devEngines` pin is the only signal — mirrors
+/// `mod.rs::pnpm_incumbent_major_is_v11_plus`, keyed on the workspace `root`
+/// being migrated rather than cwd. Read before `apply_manifest_edits` flips
+/// the pin to `nub@`, while the incumbent `pnpm@x` is still present.
+fn pnpm_vocab_precedence(root: &Path) -> VocabPrecedence {
+    let major = nub_core::pm::resolve::declared_pm_version(root, "pnpm")
+        .and_then(|v| super::parse_major_minor(&v).0);
+    if major.is_some_and(|m| m >= 11) {
+        VocabPrecedence::YamlWins
+    } else {
+        VocabPrecedence::PnpmNsWins
+    }
+}
+
 /// `nub pm use nub` — the full switch. `root` is the workspace root (where
-/// the declaration, lockfiles, yaml, and `.npmrc` live). Prints the
-/// file-by-file summary; never silent.
-pub(crate) fn run_use_nub(root: &Path) -> Result<i32> {
-    // The brand preflight registers the yaml names + lock.yaml filename the
+/// the declaration, lockfiles, yaml, and `.npmrc` live). `exact_pin` carries an
+/// explicit `nub pm use nub@<version>` opt-in: `Some(v)` writes the hard
+/// `packageManager: nub@<v>` pin (and bases the devEngines range on `v`); `None`
+/// (bare `nub pm use nub`) writes only the non-locking devEngines caret range on
+/// the running version. Prints the file-by-file summary; never silent.
+pub(crate) fn run_use_nub(root: &Path, exact_pin: Option<&str>) -> Result<i32> {
+    // The brand preflight registers the yaml names + nub.lock filename the
     // discovery below and the engine writers read.
     super::engine_brand_preflight();
 
@@ -749,39 +869,32 @@ pub(crate) fn run_use_nub(root: &Path) -> Result<i32> {
 
     let manifest_content = std::fs::read_to_string(root.join("package.json"))
         .with_context(|| format!("reading {}", root.join("package.json").display()))?;
-    let manifest: Value = serde_json::from_str(&manifest_content)
+    let manifest: Value = serde_json::from_str(nub_core::strip_utf8_bom(&manifest_content))
         .with_context(|| format!("parsing {}", root.join("package.json").display()))?;
     let pnpm_ns = manifest.get("pnpm").and_then(Value::as_object).cloned();
 
+    // The incumbent pnpm major decides pnpm.* ↔ pnpm-workspace.yaml precedence
+    // (gap #6): pnpm 9/10 = package.json#pnpm.* wins; pnpm 11 = yaml wins.
+    // Resolved from the still-present `pnpm@x` pin before the manifest edits
+    // below flip it to `nub@`.
+    let precedence = pnpm_vocab_precedence(root);
+
     let yaml = read_workspace_yaml(root)?;
     let had_yaml = yaml.is_some();
-    let (source, mut merge_notes) = merged_source(yaml.as_ref(), pnpm_ns.as_ref());
+    let (source, mut merge_notes) = merged_source(yaml.as_ref(), pnpm_ns.as_ref(), precedence);
     let mut migration = plan_migration(&source)?;
     migration.notes.append(&mut merge_notes);
 
-    // Layout preservation (the maintainer ruling, 2026-06-10): a hoisted-origin repo
-    // (npm/yarn/bun lockfile converted) keeps its flat layout — going
-    // isolated is the team's deliberate follow-up, not a side effect of
-    // switching tools. Skipped when the migration itself carries a
-    // node-linker (the explicit setting wins).
-    let hoisted_origin = matches!(
-        &plan,
-        AlignPlan::Convert {
-            from_kind: aube_lockfile::LockfileKind::Npm
-                | aube_lockfile::LockfileKind::NpmShrinkwrap
-                | aube_lockfile::LockfileKind::Yarn
-                | aube_lockfile::LockfileKind::YarnBerry
-                | aube_lockfile::LockfileKind::Bun,
-            ..
-        }
-    );
     // Phantom-dependency warning gate (writeup §6): switching FROM a *hoisting*
-    // PM (npm or yarn — flat node_modules) changes the layout, so undeclared
-    // imports that only resolved via hoisting may break. pnpm/bun are already
-    // isolated (non-hoisting), so they get no warning; nor does a fresh project
-    // or a pnpm→nub rename. Bun is part of `hoisted_origin` above only for the
-    // layout-preservation note (it carries a flat-ish lockfile shape there), but
-    // it is NOT a hoisting PM for phantom-deps purposes — exclude it here.
+    // PM (npm or yarn — flat node_modules) to nub's isolated default changes
+    // the layout, so undeclared imports that only resolved via hoisting may
+    // break. The switch no longer writes `node-linker=hoisted` to preserve the
+    // flat layout (it once did; dropped 2026-06-28 to match the isolated+GVS
+    // install default — the layout-preservation note is gone, the warning
+    // stays). pnpm/bun are already isolated (non-hoisting), so they get no
+    // warning; nor does a fresh project or a pnpm→nub rename. (Bun's lockfile
+    // shape is flat-ish, but it is NOT a hoisting PM for phantom-deps purposes —
+    // exclude it here.)
     let from_hoisting_pm = matches!(
         &plan,
         AlignPlan::Convert {
@@ -792,30 +905,25 @@ pub(crate) fn run_use_nub(root: &Path) -> Result<i32> {
             ..
         }
     );
-    if hoisted_origin && !migration.npmrc.iter().any(|(k, _)| k == "node-linker") {
-        migration
-            .npmrc
-            .push(("node-linker".into(), "hoisted".into()));
-        migration.notes.push(
-            "layout preserved: the project was on a hoisted (flat) node_modules layout, so \
-             node-linker=hoisted is written to .npmrc — remove it to adopt nub's isolated layout"
-                .into(),
-        );
-    }
-
     // ── writes ──────────────────────────────────────────────────────────
-    let nub_version = env!("CARGO_PKG_VERSION");
+    // The devEngines range is based on the pinned version when one is named
+    // (`nub@<v>`), else the running binary. The exact `packageManager` field is
+    // written only for the named-version opt-in (see `apply_manifest_edits`).
+    let running_version = env!("CARGO_PKG_VERSION");
+    let range_version = exact_pin.unwrap_or(running_version);
     let mut manifest_notes = Vec::new();
     nub_core::pm::resolve::edit_root_manifest(root, |obj| {
-        manifest_notes = apply_manifest_edits(obj, &migration, nub_version);
+        manifest_notes = apply_manifest_edits(obj, &migration, exact_pin, range_version);
     })?;
 
     let (appended, skipped) = append_npmrc(root, &migration.npmrc)?;
 
-    println!("using nub@{nub_version}");
-    println!("  package.json: packageManager = nub@{nub_version}");
+    println!("using nub@{running_version}");
+    if let Some(v) = exact_pin {
+        println!("  package.json: packageManager = nub@{v}");
+    }
     println!(
-        "  package.json: devEngines.packageManager = {{ name: \"nub\", version: \"^{nub_version}\", onFail: \"warn\" }}"
+        "  package.json: devEngines.packageManager = {{ name: \"nub\", version: \"^{range_version}\", onFail: \"ignore\" }}"
     );
     if migration.packages.is_some() || migration.catalog.is_some() || migration.catalogs.is_some() {
         println!(
@@ -828,8 +936,10 @@ pub(crate) fn run_use_nub(root: &Path) -> Result<i32> {
             "patchedDependencies",
             migration.patched_dependencies.is_some(),
         ),
-        ("allowBuilds", migration.allow_builds.is_some()),
-        ("auditConfig", migration.audit_config.is_some()),
+        (
+            aube_manifest::ROOT_ALLOW_SCRIPTS_KEY,
+            migration.allow_builds.is_some(),
+        ),
     ] {
         if present {
             println!("  package.json: top-level {key} migrated");
@@ -845,11 +955,20 @@ pub(crate) fn run_use_nub(root: &Path) -> Result<i32> {
             println!("  no lockfile — the next install writes {NUB_LOCKFILE}");
         }
         AlignPlan::Keep { kept, remove } => {
-            println!(
-                "  {}: kept (already nub's lockfile)",
-                kept.file_name().unwrap_or_default().to_string_lossy()
-            );
-            remove_strays(&remove, "lock.yaml is authoritative")?;
+            let kept_name = kept.file_name().unwrap_or_default().to_string_lossy();
+            // The explicit graduation must leave the project on the current
+            // name: converge a kept LEGACY-named nub lockfile to `nub.lock`
+            // (byte-identical rename), rather than reporting "kept" and leaving
+            // the old filename for a later install to migrate.
+            if kept_name == NUB_LEGACY_LOCKFILE {
+                let to = root.join(NUB_LOCKFILE);
+                std::fs::rename(&kept, &to)
+                    .with_context(|| format!("renaming {kept_name} to {NUB_LOCKFILE}"))?;
+                println!("  {NUB_LOCKFILE}: renamed from {kept_name} (bytes unchanged)");
+            } else {
+                println!("  {kept_name}: kept (already nub's lockfile)");
+            }
+            remove_strays(&remove, &format!("{NUB_LOCKFILE} is authoritative"))?;
         }
         AlignPlan::Rename { from, remove } => {
             let to = root.join(NUB_LOCKFILE);
@@ -914,11 +1033,23 @@ pub(crate) fn run_use_nub(root: &Path) -> Result<i32> {
     // support thread later.
     println!();
     println!("heads-up for teammates and tooling not on nub:");
-    println!("  - corepack-enabled shells hard-error on packageManager \"nub@…\" —");
-    println!("    fix: install nub (npm i -g @nubjs/nub) or `corepack disable`");
+    // The corepack hard-error is triggered by the exact `packageManager` field
+    // only — corepack ignores `devEngines`, so the bare (range-only) switch does
+    // not hit it.
+    if exact_pin.is_some() {
+        println!("  - corepack-enabled shells hard-error on packageManager \"nub@…\" —");
+        println!("    fix: install nub (npm i -g @nubjs/nub) or `corepack disable`");
+    }
     println!("  - real pnpm refuses to run here (ERR_PNPM_OTHER_PM_EXPECTED) — by design;");
     println!("    `nub pm use pnpm` reverses this switch completely");
-    println!("  - turbo requires a recognized packageManager + lockfile name and will error");
+    // Turborepo recognizes nub from 2.10.2 (vercel/turborepo#13120), through the
+    // exact `packageManager` field only; 2.10.3 (vercel/turborepo#13189) also
+    // accepts the devEngines range a bare switch writes.
+    if exact_pin.is_some() {
+        println!("  - turbo needs 2.10.2 or later to recognize nub");
+    } else {
+        println!("  - turbo needs 2.10.3 or later to recognize nub");
+    }
     println!("  - hosted update bots (Renovate/Dependabot) can't regenerate {NUB_LOCKFILE} yet");
     println!("  - lockfile-sniffing deploy platforms won't auto-detect a PM — run installs");
     println!("    with nub in CI");
@@ -945,7 +1076,8 @@ fn warn_phantom_dependencies() {
         "  npm and yarn use a flat, hoisted layout. Packages you imported but never",
         "  declared in package.json (\"phantom dependencies\") were only reachable via",
         "  that hoisting and may no longer resolve. If an install or run fails on a",
-        "  missing module, add it to package.json explicitly.",
+        "  missing module, add it to package.json explicitly — or add",
+        "  node-linker=hoisted to .npmrc to keep the flat layout.",
     ];
     eprintln!();
     for line in lines {
@@ -968,22 +1100,50 @@ fn remove_strays(paths: &[std::path::PathBuf], why: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fold the two manifest-root build-allowlist spellings into the single map
+/// pnpm reads, with an explicit `false` beating any allow — the same deny-wins
+/// rule the engine applies when one package is named by several sources.
+///
+/// Both arguments are passed because a manifest can legitimately carry both: the
+/// rename refusal only guards paths that build an install session, and `nub pm
+/// use pnpm` is not one. Order is irrelevant to the result; a denial in either
+/// map survives.
+///
+/// `None` when neither name holds an object, which is what keeps a manifest with
+/// nothing to migrate on the idempotent-rerun path.
+fn merge_root_allow_maps(legacy: Option<&Value>, current: Option<&Value>) -> Option<Value> {
+    let mut out: Option<Map<String, Value>> = None;
+    for map in [legacy, current].into_iter().flatten() {
+        let Some(map) = map.as_object() else { continue };
+        let acc = out.get_or_insert_with(Map::new);
+        for (key, value) in map {
+            if acc.get(key) == Some(&Value::Bool(false)) {
+                continue;
+            }
+            acc.insert(key.clone(), value.clone());
+        }
+    }
+    out.map(Value::Object)
+}
+
 /// The yaml-regeneration half of `nub pm use pnpm` — the exact reverse of
 /// [`run_use_nub`]'s migration: collect the nub-mode homes out of
 /// `package.json` (`workspaces` membership + catalogs, top-level `overrides`
-/// / `patchedDependencies` / `allowBuilds` / `auditConfig`), write them into
-/// `pnpm-workspace.yaml` (merging into an existing yaml, package.json values
+/// / `patchedDependencies` / `allowScripts`, plus a legacy `auditConfig` left
+/// by a pre-drop conversion), write them into
+/// `pnpm-workspace.yaml` under pnpm's own key names (`allowScripts` →
+/// `allowBuilds`; the rest keep their spelling), merging into an existing yaml
+/// with package.json values
 /// winning — they were the live config under nub), and remove the migrated
 /// keys from `package.json`. Settings already in `.npmrc` stay there — pnpm
 /// reads them too. Returns the summary lines; empty when there was nothing
 /// to move (the idempotent rerun).
 pub(crate) fn regenerate_workspace_yaml(root: &Path) -> Result<Vec<String>> {
     let manifest_path = root.join("package.json");
-    let manifest: Value = serde_json::from_str(
-        &std::fs::read_to_string(&manifest_path)
-            .with_context(|| format!("reading {}", manifest_path.display()))?,
-    )
-    .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let manifest_raw = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let manifest: Value = serde_json::from_str(nub_core::strip_utf8_bom(&manifest_raw))
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
 
     let workspaces = manifest.get("workspaces");
     let (packages, catalog, catalogs) = match workspaces {
@@ -997,7 +1157,27 @@ pub(crate) fn regenerate_workspace_yaml(root: &Path) -> Result<Vec<String>> {
     };
     let overrides = manifest.get("overrides").cloned();
     let patched = manifest.get("patchedDependencies").cloned();
-    let allow_builds = manifest.get("allowBuilds").cloned();
+    // The nub-mode home is the neutral top-level `allowScripts`; pnpm's home
+    // for the same map is `allowBuilds`, so this one entry is renamed on the
+    // way out rather than moved verbatim.
+    //
+    // The pre-cutover root key is read here too, and MERGED rather than chosen
+    // between. This command never builds an install session, so the
+    // `ERR_NUB_ALLOW_BUILDS_RENAMED` refusal cannot reach it — a project that
+    // predates the rename, or that is part-way through it and carries both
+    // spellings, would otherwise switch to pnpm with its build policy stranded
+    // at a root key pnpm does not read. Taking one map wholesale would drop the
+    // other's entries silently, and the entry that matters is a `false`: losing
+    // a denial runs a script the project refused.
+    let allow_builds = merge_root_allow_maps(
+        manifest.get(aube_manifest::LEGACY_ROOT_ALLOW_BUILDS_KEY),
+        manifest.get(aube_manifest::ROOT_ALLOW_SCRIPTS_KEY),
+    );
+    // Rescue only. `nub pm use nub` no longer writes this key — nub has no
+    // persistent audit-ignore config — but a project converted before that
+    // change still carries one, doing nothing. Carrying it back to pnpm's own
+    // home is the one place it becomes live again, so the switch restores a
+    // policy rather than leaving it stranded at a name nothing reads.
     let audit_config = manifest.get("auditConfig").cloned();
 
     if packages.is_none()
@@ -1038,7 +1218,11 @@ pub(crate) fn regenerate_workspace_yaml(root: &Path) -> Result<Vec<String>> {
             "workspaces",
             "overrides",
             "patchedDependencies",
-            "allowBuilds",
+            aube_manifest::ROOT_ALLOW_SCRIPTS_KEY,
+            // Cleared alongside the current spelling. Both were folded into the
+            // one map written above, so removing only one would strand a
+            // duplicate nothing reads.
+            aube_manifest::LEGACY_ROOT_ALLOW_BUILDS_KEY,
             "auditConfig",
         ] {
             obj.remove(key);
@@ -1059,6 +1243,49 @@ mod tests {
 
     fn src(json: serde_json::Value) -> Map<String, Value> {
         json.as_object().cloned().unwrap()
+    }
+
+    /// `pnpm.auditConfig` has no destination under nub identity, so the
+    /// conversion must NAME it rather than write it somewhere nothing reads.
+    ///
+    /// It used to be migrated to a top-level `package.json` `auditConfig`.
+    /// Once nub stopped reading that key the same write became a silent policy
+    /// loss dressed as a successful migration — the project's triaged
+    /// advisories would come back on the next audit with nothing said. The
+    /// assertions are the two halves of "loud": it must not reach the manifest,
+    /// and the summary must carry the remedy.
+    #[test]
+    fn an_audit_config_is_reported_as_unsupported_rather_than_migrated() {
+        let m = plan_migration(&src(json!({
+            "auditConfig": { "ignoreGhsas": ["GHSA-xxxx-yyyy-zzzz"] }
+        })))
+        .unwrap();
+
+        let dropped = m.dropped.join("\n");
+        assert!(
+            dropped.contains("auditConfig"),
+            "the conversion must name the key it could not carry: {dropped:?}"
+        );
+        assert!(
+            dropped.contains("nub audit --ignore"),
+            "and must name what replaces it: {dropped:?}"
+        );
+        assert!(
+            !m.npmrc.iter().any(|(k, _)| k.contains("audit")),
+            "no invented `.npmrc` home either: {:?}",
+            m.npmrc
+        );
+
+        let mut manifest = Map::new();
+        let notes = apply_manifest_edits(&mut manifest, &m, None, "^0.8.0");
+        assert!(
+            manifest.get("auditConfig").is_none(),
+            "a key nub does not read must not be written to package.json: {manifest:?}"
+        );
+        assert!(
+            !notes.join("\n").contains("auditConfig"),
+            "and it must not be reported as moved: {notes:?}"
+        );
     }
 
     #[test]
@@ -1202,13 +1429,14 @@ mod tests {
             "catalog": { "react": "^18.0.0" }
         })))
         .unwrap();
+        // Explicit `nub@<exact>` opt-in: the hard packageManager pin IS written.
         let mut obj = src(json!({ "name": "app", "pnpm": { "overrides": {} } }));
-        apply_manifest_edits(&mut obj, &m, "0.1.0");
+        apply_manifest_edits(&mut obj, &m, Some("0.1.0"), "0.1.0");
 
         assert_eq!(obj.get("packageManager"), Some(&json!("nub@0.1.0")));
         assert_eq!(
             obj.get("devEngines").unwrap().get("packageManager"),
-            Some(&json!({ "name": "nub", "version": "^0.1.0", "onFail": "warn" }))
+            Some(&json!({ "name": "nub", "version": "^0.1.0", "onFail": "ignore" }))
         );
         assert_eq!(
             obj.get("workspaces"),
@@ -1217,6 +1445,21 @@ mod tests {
         );
         assert!(obj.get("pnpm").is_none(), "pnpm namespace must be removed");
 
+        // Bare `nub pm use nub` (None): devEngines range only, and any prior
+        // packageManager (here the incumbent pnpm pin) is CLEARED so the field
+        // never contradicts the nub devEngines entry.
+        let mut obj = src(json!({ "name": "app", "packageManager": "pnpm@9.1.0" }));
+        apply_manifest_edits(&mut obj, &m, None, "0.2.9");
+        assert!(
+            obj.get("packageManager").is_none(),
+            "bare use nub writes no exact packageManager and clears the incumbent pin: {obj:?}"
+        );
+        assert_eq!(
+            obj.get("devEngines").unwrap().get("packageManager"),
+            Some(&json!({ "name": "nub", "version": "^0.2.9", "onFail": "ignore" })),
+            "bare use nub still writes the non-locking devEngines range"
+        );
+
         // Conflicting top-level override: package.json wins, named in notes.
         let m = plan_migration(&src(json!({
             "packages": ["packages/*"],
@@ -1224,7 +1467,7 @@ mod tests {
         })))
         .unwrap();
         let mut obj = src(json!({ "name": "app", "overrides": { "lodash": "4.17.20" } }));
-        let notes = apply_manifest_edits(&mut obj, &m, "0.1.0");
+        let notes = apply_manifest_edits(&mut obj, &m, Some("0.1.0"), "0.1.0");
         assert_eq!(
             obj.get("overrides").unwrap().get("lodash"),
             Some(&json!("4.17.20")),
@@ -1276,7 +1519,7 @@ mod tests {
                 "packageManager": "nub@0.1.0",
                 "workspaces": { "packages": ["packages/*"], "catalog": { "react": "^18.0.0" } },
                 "overrides": { "lodash": "4.17.21" },
-                "allowBuilds": { "esbuild": true, "fsevents": false }
+                "allowScripts": { "esbuild": true, "fsevents": false }
             }))
             .unwrap(),
         )
@@ -1292,13 +1535,15 @@ mod tests {
         assert_eq!(yaml["packages"][0], "packages/*");
         assert_eq!(yaml["catalog"]["react"], "^18.0.0");
         assert_eq!(yaml["overrides"]["lodash"], "4.17.21");
+        // The map is renamed on the way out: nub's neutral `allowScripts`
+        // lands under pnpm's own `allowBuilds` key in the yaml.
         assert_eq!(yaml["allowBuilds"]["esbuild"], true);
 
         let manifest: Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
         )
         .unwrap();
-        for key in ["workspaces", "overrides", "allowBuilds"] {
+        for key in ["workspaces", "overrides", "allowScripts"] {
             assert!(
                 manifest.get(key).is_none(),
                 "{key} must move back into the yaml"
@@ -1307,5 +1552,198 @@ mod tests {
 
         // Idempotent rerun: nothing left to move.
         assert!(regenerate_workspace_yaml(dir.path()).unwrap().is_empty());
+    }
+
+    /// A project that predates the `allowBuilds` → `allowScripts` rename can
+    /// reach `nub pm use pnpm` directly: that command builds no install
+    /// session, so the rename refusal never runs. The legacy map must still
+    /// migrate, or the switch strands the whole build policy at a root key
+    /// pnpm does not read.
+    #[test]
+    fn regenerate_migrates_a_pre_cutover_allow_builds_map() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "app",
+                "packageManager": "nub@0.1.0",
+                "allowBuilds": { "esbuild": true, "fsevents": false }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let lines = regenerate_workspace_yaml(dir.path()).unwrap();
+        assert!(
+            !lines.is_empty(),
+            "the legacy map must be migrated, not skipped"
+        );
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(dir.path().join("pnpm-workspace.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(yaml["allowBuilds"]["esbuild"], true);
+        assert_eq!(
+            yaml["allowBuilds"]["fsevents"], false,
+            "a denial must survive the switch — losing it runs a script the project refused"
+        );
+
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            manifest.get("allowBuilds").is_none(),
+            "the legacy key must not be left behind as a duplicate"
+        );
+    }
+
+    /// A manifest can carry both spellings — the rename refusal guards only the
+    /// paths that build an install session, and this is not one. Choosing one
+    /// map wholesale would drop the other's entries, and the entry that matters
+    /// is the denial: `fsevents: false` in the stale map against `true` in the
+    /// new one has to reach pnpm as `false`, or the switch runs a script the
+    /// project refused.
+    #[test]
+    fn regenerate_folds_both_allow_spellings_with_the_denial_winning() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "app",
+                "packageManager": "nub@0.1.0",
+                "allowScripts": { "esbuild": true, "fsevents": true, "sharp": true },
+                "allowBuilds": { "fsevents": false, "canvas": false, "sharp": true }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        regenerate_workspace_yaml(dir.path()).unwrap();
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(dir.path().join("pnpm-workspace.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            yaml["allowBuilds"]["fsevents"], false,
+            "a denial in the stale map must beat an allow in the new one"
+        );
+        assert_eq!(
+            yaml["allowBuilds"]["esbuild"], true,
+            "an entry only the new map carries must survive"
+        );
+        assert_eq!(
+            yaml["allowBuilds"]["canvas"], false,
+            "an entry only the stale map carries must survive"
+        );
+        assert_eq!(yaml["allowBuilds"]["sharp"], true);
+
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+        for key in ["allowScripts", "allowBuilds"] {
+            assert!(
+                manifest.get(key).is_none(),
+                "{key} must not be left behind once folded into the yaml"
+            );
+        }
+    }
+
+    #[test]
+    fn merged_source_pnpm_ns_wins_wholesale_for_v9_v10() {
+        // pnpm 9/10: a `package.json#pnpm.overrides` block REPLACES the yaml
+        // `overrides` block wholesale — the yaml-only `is-even` key is dropped,
+        // matching real pnpm 10 (the second-pass re-read drops the yaml block).
+        let yaml = src(json!({ "overrides": { "is-even": "1.0.0" } }));
+        let ns = src(json!({ "overrides": { "is-odd": "2.0.0" } }));
+        let (merged, notes) = merged_source(Some(&yaml), Some(&ns), VocabPrecedence::PnpmNsWins);
+        assert_eq!(
+            merged.get("overrides"),
+            Some(&json!({ "is-odd": "2.0.0" })),
+            "pnpm 9/10: package.json#pnpm.overrides replaces the yaml block wholesale"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("package.json value migrated") && n.contains("overrides")),
+            "the wholesale replacement must be named in the summary: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn merged_source_yaml_wins_for_v11() {
+        // pnpm 11 deprecated the pnpm.* namespace, so the yaml is the live value.
+        let yaml = src(json!({ "overrides": { "is-even": "1.0.0" } }));
+        let ns = src(json!({ "overrides": { "is-odd": "2.0.0" } }));
+        let (merged, notes) = merged_source(Some(&yaml), Some(&ns), VocabPrecedence::YamlWins);
+        assert_eq!(
+            merged.get("overrides"),
+            Some(&json!({ "is-even": "1.0.0" })),
+            "pnpm 11: the pnpm-workspace.yaml value wins"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("yaml value migrated")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn merged_source_unions_disjoint_keys_on_either_precedence() {
+        // The flip governs only DUPLICATE keys; a key in just one home migrates
+        // on both precedences, with no conflict note.
+        let yaml = src(json!({ "packages": ["pkg/*"] }));
+        let ns = src(json!({ "overrides": { "lodash": "4.17.21" } }));
+        for precedence in [VocabPrecedence::PnpmNsWins, VocabPrecedence::YamlWins] {
+            let (merged, notes) = merged_source(Some(&yaml), Some(&ns), precedence);
+            assert_eq!(merged.get("packages"), Some(&json!(["pkg/*"])));
+            assert_eq!(
+                merged.get("overrides"),
+                Some(&json!({ "lodash": "4.17.21" }))
+            );
+            assert!(notes.is_empty(), "disjoint keys produce no note: {notes:?}");
+        }
+    }
+
+    #[test]
+    fn vocab_precedence_keys_on_the_declared_pnpm_major() {
+        let precedence_for = |pm: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut manifest = json!({ "name": "app" });
+            if let Some(pm) = pm {
+                manifest["packageManager"] = json!(pm);
+            }
+            std::fs::write(
+                dir.path().join("package.json"),
+                serde_json::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
+            pnpm_vocab_precedence(dir.path())
+        };
+
+        assert_eq!(
+            precedence_for(Some("pnpm@10.34.3")),
+            VocabPrecedence::PnpmNsWins,
+            "pnpm 10 → package.json#pnpm.* wins"
+        );
+        assert_eq!(
+            precedence_for(Some("pnpm@11.9.0")),
+            VocabPrecedence::YamlWins,
+            "pnpm 11 → yaml wins"
+        );
+        assert_eq!(
+            precedence_for(Some("pnpm@9.15.9")),
+            VocabPrecedence::PnpmNsWins,
+            "pnpm 9 → package.json#pnpm.* wins"
+        );
+        // No declaration: the pnpm lock is v9.0 across all majors and can't
+        // disambiguate, so default to the dominant v9/v10 model.
+        assert_eq!(
+            precedence_for(None),
+            VocabPrecedence::PnpmNsWins,
+            "undeclared major → v9/v10 default"
+        );
     }
 }

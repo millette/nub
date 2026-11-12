@@ -4,10 +4,13 @@
 //! wiring under test lives in `src/pm_engine/install_family.rs`; `install` /
 //! `ci` have their own file (`install_engine.rs`).
 //!
-//! Network tests are `#[ignore]` per the provisioning-test convention — run
-//! via `cargo test -p nub-cli --test pm_verbs -- --ignored` — and self-skip
-//! when the registry is unreachable. Everything else is offline by
-//! construction (gate pre-flights, lockfile conversion, symlink plumbing).
+//! Registry tests whose packages are seeded in the offline test registry run
+//! against it and self-skip when `NUB_TEST_REGISTRY` is unset (`source
+//! tests/registry/start.bash`). The other network tests are `#[ignore]` per the
+//! provisioning-test convention — run via
+//! `cargo test -p nub-cli --test pm_verbs -- --ignored` — and self-skip when
+//! the registry is unreachable. Everything else is offline by construction
+//! (gate pre-flights, lockfile conversion, symlink plumbing).
 //!
 //! Brand guard: every test asserts no `aube` token in the combined output.
 //! Exception: `link`/`unlink -g` print the engine's global-links registry
@@ -67,14 +70,46 @@ impl Output {
 /// the given roots — pass the same pair across spawns that must share engine
 /// state (the CAS store rides `XDG_DATA_HOME`; the packument cache and the
 /// global-links registry ride `XDG_CACHE_HOME`).
+/// The Verdaccio offline test registry URL (set by `tests/registry/start.bash`
+/// via `NUB_TEST_REGISTRY`). When set, tests run against the pre-seeded
+/// offline registry instead of registry.npmjs.org.
+fn test_registry() -> Option<String> {
+    std::env::var("NUB_TEST_REGISTRY")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Point a `Command` at the offline Verdaccio registry when
+/// `NUB_TEST_REGISTRY` is set: writes a project `.npmrc` + bypasses any
+/// inherited HTTP_PROXY for localhost. No-op when the env var is unset.
+fn apply_test_registry(cmd: &mut Command, dir: &Path) {
+    if let Some(registry) = test_registry() {
+        let npmrc = dir.join(".npmrc");
+        let existing = std::fs::read_to_string(&npmrc).unwrap_or_default();
+        if !existing
+            .lines()
+            .any(|l| l.trim_start().starts_with("registry="))
+        {
+            let prefix = if existing.is_empty() || existing.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            std::fs::write(&npmrc, format!("{existing}{prefix}registry={registry}\n")).unwrap();
+        }
+        cmd.env("NO_PROXY", "localhost,127.0.0.1")
+            .env("no_proxy", "localhost,127.0.0.1");
+    }
+}
+
 fn run_nub_with(dir: &Path, args: &[&str], xdg_data: &Path, xdg_cache: &Path) -> Output {
-    let out = Command::new(nub_binary())
-        .args(args)
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(args)
         .current_dir(dir)
         .env("XDG_DATA_HOME", xdg_data)
-        .env("XDG_CACHE_HOME", xdg_cache)
-        .output()
-        .expect("failed to spawn nub");
+        .env("XDG_CACHE_HOME", xdg_cache);
+    apply_test_registry(&mut cmd, dir);
+    let out = cmd.output().expect("failed to spawn nub");
     Output {
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
         stderr: String::from_utf8_lossy(&out.stderr).to_string(),
@@ -124,14 +159,77 @@ const IS_POSITIVE_PACKAGE_LOCK: &str = r#"{
 }
 "#;
 
+/// A minimal npm lockfile where `demo-plugin` declares a peer on `demo-host`,
+/// with both as direct deps. An organic pnpm-lock keys the plugin as
+/// `demo-plugin@1.0.0(demo-host@1.0.0)`; the #453 bug wrote a bare
+/// `demo-plugin@1.0.0`. `import` reads peer data straight from the lockfile —
+/// no registry — so synthetic package names exercise the pass fully offline.
+/// bun.lock counterpart of [`PEER_DEP_PACKAGE_LOCK`]: ajv@6.12.6 +
+/// ajv-keywords@3.5.2 (a real published peer pair, captured from `bun install`).
+/// Exercises the same import peer pass through the BUN parser, whose
+/// peer-dependency plumbing is separate from the npm one.
+const AJV_PEER_BUN_LOCK: &str = r#"{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "fixture",
+      "dependencies": {
+        "ajv": "6.12.6",
+        "ajv-keywords": "3.5.2",
+      },
+    },
+  },
+  "packages": {
+    "ajv": ["ajv@6.12.6", "", { "dependencies": { "fast-deep-equal": "^3.1.1", "fast-json-stable-stringify": "^2.0.0", "json-schema-traverse": "^0.4.1", "uri-js": "^4.2.2" } }, "sha512-j3fVLgvTo527anyYyJOGTYJbG+vnnQYvE0m5mmkc1TK+nxAppkCLMIL0aZ4dblVCNoGShhm+kzE4ZUykBoMg4g=="],
+
+    "ajv-keywords": ["ajv-keywords@3.5.2", "", { "peerDependencies": { "ajv": "^6.9.1" } }, "sha512-5p6WTN0DdTGVQk6VjcEju19IgaHudalcfabD7yhDGeA6bcQnmL+CpveLJq/3hvfwd1aof6L386Ougkx6RfyMIQ=="],
+
+    "fast-deep-equal": ["fast-deep-equal@3.1.3", "", {}, "sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q=="],
+
+    "fast-json-stable-stringify": ["fast-json-stable-stringify@2.1.0", "", {}, "sha512-lhd/wF+Lk98HZoTCtlVraHtfh5XYijIjalXck7saUtuanSDyLMxnHhSXEDJqHxD7msR8D0uCmqlkwjCV8xvwHw=="],
+
+    "json-schema-traverse": ["json-schema-traverse@0.4.1", "", {}, "sha512-xbbCH5dCYU5T8LcEhhuh7HJ88HXuW3qsI3Y0zOZFKfZEHcpWiHU/Jxzk629Brsab/mMiHQti9wMP+845RPe3Vg=="],
+
+    "punycode": ["punycode@2.3.1", "", {}, "sha512-vYt7UD1U9Wg6138shLtLOvdAu+8DsC/ilFtEVHcH+wydcSpNE20AfSOduf6MkRFahL5FY7X1oU7nKVZFtfq8Fg=="],
+
+    "uri-js": ["uri-js@4.4.1", "", { "dependencies": { "punycode": "^2.1.0" } }, "sha512-7rKUyy33Q1yc98pQ1DAmLtwX109F7TIfWlW1Ydo8Wl1ii1SeHieeh0HHfPeL2fMXK6z0s8ecKs9frCuLJvndBg=="],
+  }
+}"#;
+
+const PEER_DEP_PACKAGE_LOCK: &str = r#"{
+  "name": "fixture",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "fixture",
+      "version": "1.0.0",
+      "dependencies": { "demo-plugin": "1.0.0", "demo-host": "1.0.0" }
+    },
+    "node_modules/demo-host": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/demo-host/-/demo-host-1.0.0.tgz",
+      "integrity": "sha512-8ND1j3y9/HP94TOvGzr69/FgbkX2ruOldhLEsTWwcJVfo4oRjwemJmJxt7RJkKYH8tz7vYBP9JcKQY8CLuJ90Q=="
+    },
+    "node_modules/demo-plugin": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/demo-plugin/-/demo-plugin-1.0.0.tgz",
+      "integrity": "sha512-8ND1j3y9/HP94TOvGzr69/FgbkX2ruOldhLEsTWwcJVfo4oRjwemJmJxt7RJkKYH8tz7vYBP9JcKQY8CLuJ90Q==",
+      "peerDependencies": { "demo-host": "^1.0.0" }
+    }
+  }
+}
+"#;
+
 /// `nub add` then `nub rm` (alias) round-trip on a truly-fresh project: add
-/// persists the dep + writes nub's neutral `lock.yaml` + links node_modules;
+/// persists the dep + writes nub's neutral `nub.lock` + links node_modules;
 /// remove strips the dep from the manifest again. Both outputs brand-clean.
 #[test]
-#[ignore = "network: resolves + fetches is-positive@3.1.0 from the npm registry"]
 fn add_then_remove_round_trips_manifest_lockfile_and_node_modules() {
-    if !registry_reachable() {
-        eprintln!("skipping: registry.npmjs.org unreachable");
+    if test_registry().is_none() {
+        eprintln!("skipping: NUB_TEST_REGISTRY not set — run: source tests/registry/start.bash");
         return;
     }
     let dir = pm_tmpdir("addrm");
@@ -155,10 +253,10 @@ fn add_then_remove_round_trips_manifest_lockfile_and_node_modules() {
         "add must persist the dependency: {manifest}"
     );
     assert!(
-        dir.join("lock.yaml").is_file()
+        dir.join("nub.lock").is_file()
             && !dir.join("pnpm-lock.yaml").exists()
             && !dir.join("aube-lock.yaml").exists(),
-        "add on a truly-fresh project writes nub's neutral lock.yaml"
+        "add on a truly-fresh project writes nub's neutral nub.lock"
     );
     assert!(
         dir.join("node_modules/is-positive/package.json").is_file(),
@@ -178,13 +276,13 @@ fn add_then_remove_round_trips_manifest_lockfile_and_node_modules() {
 
 /// The patch workflow round-trips: `patch` extracts into a nub-named edit
 /// dir and prints the rebranded patch-commit hint; `patch-commit` writes
-/// the `.patch` file, records `pnpm.patchedDependencies`, and re-links the
-/// edited content; `patch-remove` reverts all of it. All outputs brand-clean.
+/// the `.patch` file, records the neutral top-level `patchedDependencies`
+/// field (nub identity emits no pnpm namespace), and re-links the edited
+/// content; `patch-remove` reverts all of it. All outputs brand-clean.
 #[test]
-#[ignore = "network: resolves + fetches is-positive@3.1.0 from the npm registry"]
 fn patch_workflow_round_trips_through_commit_and_remove() {
-    if !registry_reachable() {
-        eprintln!("skipping: registry.npmjs.org unreachable");
+    if test_registry().is_none() {
+        eprintln!("skipping: NUB_TEST_REGISTRY not set — run: source tests/registry/start.bash");
         return;
     }
     let dir = pm_tmpdir("patchwf");
@@ -228,8 +326,12 @@ fn patch_workflow_round_trips_through_commit_and_remove() {
     );
     let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();
     assert!(
-        manifest.contains("patchedDependencies") && manifest.contains("\"pnpm\""),
-        "patch-commit must record the entry under the pnpm namespace: {manifest}"
+        manifest.contains("patchedDependencies"),
+        "patch-commit must record the neutral top-level patchedDependencies field: {manifest}"
+    );
+    assert!(
+        !manifest.contains("\"pnpm\""),
+        "nub identity must not emit a pnpm namespace for patches: {manifest}"
     );
     let linked = dir.join("node_modules/is-positive/index.js");
     assert!(
@@ -278,10 +380,184 @@ fn update_latest_moves_the_manifest_and_lockfile_forward() {
         manifest.contains("3.1.0"),
         "--latest must rewrite the manifest past the pin: {manifest}"
     );
-    let lock = std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap();
+    // Fresh project with no incumbent lockfile → nub writes its neutral
+    // nub.lock; a project already on pnpm-lock.yaml keeps that.
+    let lock = std::fs::read_to_string(dir.join("nub.lock"))
+        .or_else(|_| std::fs::read_to_string(dir.join("pnpm-lock.yaml")))
+        .expect("update must write a lockfile");
     assert!(
         lock.contains("3.1.0") && !lock.contains("is-positive@3.0.0"),
         "the lockfile must resolve the updated version: {lock}"
+    );
+}
+
+/// `nub up <pkg>@<version>` pins the named dep to that version, preserving
+/// the manifest's existing range operator (`^3.0.0` + `is-positive@3.1.0` ->
+/// `^3.1.0`) — matching `pnpm update <pkg>@<version>`. The pre-fix engine
+/// rejected any non-`latest` spec here.
+#[test]
+#[ignore = "network: resolves is-positive from the npm registry"]
+fn update_pins_named_version_preserving_manifest_operator() {
+    if !registry_reachable() {
+        eprintln!("skipping: registry.npmjs.org unreachable");
+        return;
+    }
+    let dir = pm_tmpdir("updatepin");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"updatepin","version":"1.0.0","dependencies":{"is-positive":"^3.0.0"}}"#,
+    )
+    .unwrap();
+
+    let up = run_nub(&dir, &["up", "is-positive@3.1.0"]);
+    assert_eq!(up.code, 0, "stdout: {}\nstderr: {}", up.stdout, up.stderr);
+    up.assert_brand_clean();
+    let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();
+    assert!(
+        manifest.contains("\"is-positive\": \"^3.1.0\""),
+        "the caret operator must be preserved on the pinned version: {manifest}"
+    );
+    // Fresh project with no incumbent lockfile → nub writes its neutral
+    // nub.lock; a project already on pnpm-lock.yaml keeps that.
+    let lock = std::fs::read_to_string(dir.join("nub.lock"))
+        .or_else(|_| std::fs::read_to_string(dir.join("pnpm-lock.yaml")))
+        .expect("update must write a lockfile");
+    assert!(
+        lock.contains("3.1.0") && !lock.contains("is-positive@3.0.0"),
+        "the lockfile must resolve the pinned version: {lock}"
+    );
+}
+
+/// `nub up <pkg>@<version>` on an EXACT pin keeps the pin exact (`3.0.0` +
+/// `is-positive@3.1.0` -> `3.1.0`, never `^3.1.0`). This is also the path a
+/// range pick on a pinned row of the interactive picker takes: the picker
+/// hands the resolver exactly this explicit spec.
+#[test]
+#[ignore = "network: resolves is-positive from the npm registry"]
+fn update_to_a_named_version_keeps_an_exact_pin_exact() {
+    if !registry_reachable() {
+        eprintln!("skipping: registry.npmjs.org unreachable");
+        return;
+    }
+    let dir = pm_tmpdir("updateexact");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"updateexact","version":"1.0.0","dependencies":{"is-positive":"3.0.0"}}"#,
+    )
+    .unwrap();
+
+    let up = run_nub(&dir, &["up", "is-positive@3.1.0"]);
+    assert_eq!(up.code, 0, "stdout: {}\nstderr: {}", up.stdout, up.stderr);
+    let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();
+    assert!(
+        manifest.contains("\"is-positive\": \"3.1.0\""),
+        "an exact pin must stay exact on the new version: {manifest}"
+    );
+}
+
+/// The in-range floor-bump is decided per key: a bare `^` dep updated in the
+/// same invocation as an explicit `<pkg>@latest` still gets its manifest
+/// range moved to the resolved version (`^3.0.0` -> `^3.0.1`), exactly as it
+/// does when updated alone. It used to be skipped whenever any explicit spec
+/// rode along, leaving the lockfile ahead of an unchanged manifest floor.
+#[test]
+#[ignore = "network: resolves is-positive and is-odd from the npm registry"]
+fn update_floor_bumps_a_bare_key_beside_an_explicit_latest() {
+    if !registry_reachable() {
+        eprintln!("skipping: registry.npmjs.org unreachable");
+        return;
+    }
+    let dir = pm_tmpdir("updatemixed");
+    let manifest_with = |is_odd: &str| {
+        format!(
+            r#"{{"name":"updatemixed","version":"1.0.0","dependencies":{{"is-odd":"{is_odd}","is-positive":"3.0.0"}}}}"#
+        )
+    };
+    // Lock is-odd at 3.0.0 first, then widen its range so the lockfile trails
+    // the newest in-range release (3.0.1).
+    std::fs::write(dir.join("package.json"), manifest_with("3.0.0")).unwrap();
+    let install = run_nub(&dir, &["install", "--ignore-scripts"]);
+    assert_eq!(install.code, 0, "stderr: {}", install.stderr);
+    std::fs::write(dir.join("package.json"), manifest_with("^3.0.0")).unwrap();
+
+    let up = run_nub(&dir, &["up", "is-positive@latest", "is-odd"]);
+    assert_eq!(up.code, 0, "stdout: {}\nstderr: {}", up.stdout, up.stderr);
+    let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();
+    assert!(
+        manifest.contains("\"is-positive\": \"3.1.0\""),
+        "the explicit @latest must move the pin: {manifest}"
+    );
+    assert!(
+        manifest.contains("\"is-odd\": \"^3.0.1\""),
+        "the bare key must keep its floor-bump beside an explicit spec: {manifest}"
+    );
+}
+
+/// `nub up <pkg>@<protocol-spec>` (npm alias, `link:`, `file:`, git, a
+/// tarball URL, a non-`latest` dist-tag) is rejected up front with a
+/// non-zero exit and the manifest left untouched — pinning one of those
+/// into a semver slot would silently corrupt package.json. The rejection
+/// is a pre-flight, so this needs no network.
+#[test]
+fn update_rejects_non_semver_specs_without_touching_the_manifest() {
+    let dir = pm_tmpdir("updatereject");
+    let manifest_src =
+        r#"{"name":"updatereject","version":"1.0.0","dependencies":{"is-odd":"^3.0.0"}}"#;
+    for spec in [
+        "is-odd@npm:is-even@1.0.0",
+        "is-odd@link:../bar",
+        "is-odd@file:./bar",
+        "is-odd@github:a/b",
+        "is-odd@https://example.com/is-odd.tgz",
+        "is-odd@next",
+    ] {
+        std::fs::write(dir.join("package.json"), manifest_src).unwrap();
+        let out = run_nub(&dir, &["up", spec]);
+        assert_ne!(out.code, 0, "`{spec}` must be rejected: {}", out.combined());
+        out.assert_brand_clean();
+        let after = std::fs::read_to_string(dir.join("package.json")).unwrap();
+        assert_eq!(
+            after, manifest_src,
+            "a rejected `{spec}` must leave package.json byte-identical"
+        );
+    }
+}
+
+/// `nub add <pkg>@<version> --lockfile-only` resolves and writes the
+/// lockfile + manifest but never links `node_modules` — the grammar the
+/// pre-fix `add` rejected outright (`unexpected argument '--lockfile-only'`).
+#[test]
+fn add_lockfile_only_writes_lockfile_without_linking_node_modules() {
+    if test_registry().is_none() {
+        eprintln!("skipping: NUB_TEST_REGISTRY not set — run: source tests/registry/start.bash");
+        return;
+    }
+    let dir = pm_tmpdir("addlockonly");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"addlockonly","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let add = run_nub(&dir, &["add", "is-positive@3.1.0", "--lockfile-only"]);
+    assert_eq!(
+        add.code, 0,
+        "stdout: {}\nstderr: {}",
+        add.stdout, add.stderr
+    );
+    add.assert_brand_clean();
+    let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();
+    assert!(
+        manifest.contains("is-positive"),
+        "add must still persist the dependency to package.json: {manifest}"
+    );
+    assert!(
+        dir.join("nub.lock").exists() || dir.join("pnpm-lock.yaml").exists(),
+        "the lockfile must be written"
+    );
+    assert!(
+        !dir.join("node_modules/is-positive").exists(),
+        "--lockfile-only must skip linking node_modules"
     );
 }
 
@@ -306,6 +582,39 @@ fn dlx_installs_and_runs_a_bin_from_a_scratch_project() {
     assert!(
         printed.len() == 36 && printed.chars().filter(|c| *c == '-').count() == 4,
         "uuid's bin must print one v4 uuid, got: {printed:?}"
+    );
+}
+
+/// dlx/create children carry the role-aware `npm_config_user_agent` (pnpm
+/// parity) — create-* scaffolders sniff it to emit the invoking PM's commands
+/// and fall back to npm-mode when it's absent.
+#[test]
+#[ignore = "network: installs uuid into a dlx scratch project"]
+fn dlx_child_sees_nub_user_agent() {
+    if !registry_reachable() {
+        eprintln!("skipping: registry.npmjs.org unreachable");
+        return;
+    }
+    let dir = pm_tmpdir("dlxua");
+    let out = run_nub(
+        &dir,
+        &[
+            "dlx",
+            "--shell-mode",
+            "-p",
+            "uuid",
+            "node -p process.env.npm_config_user_agent",
+        ],
+    );
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stdout.contains("nub/"),
+        "dlx child must see a nub-first user agent, got: {}",
+        out.stdout
     );
 }
 
@@ -371,6 +680,133 @@ fn yarn_gate_refuses_mutating_verbs_and_names_the_remedy() {
     );
 }
 
+/// Workspace `link:` deps must not surface in dedupe's diff (#494): the
+/// lockfile parser synthesizes `<name>@link+<hash>` package entries that a
+/// fresh resolve never produces, so dedupe reported every workspace link as
+/// "removed" on each run — while the lockfile stayed byte-identical (the
+/// writer never serializes links) and `--check` failed forever. Offline by
+/// construction: the fixture's only deps are workspace members.
+#[test]
+fn dedupe_ignores_workspace_links_and_check_passes() {
+    let dir = pm_tmpdir("dedupe-ws");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"fixture","private":true,"devDependencies":{"@repro/a":"workspace:*"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )
+    .unwrap();
+    for (rel, manifest) in [
+        (
+            "packages/a",
+            r#"{"name":"@repro/a","version":"1.0.0","dependencies":{"@repro/b":"workspace:*"}}"#,
+        ),
+        ("packages/b", r#"{"name":"@repro/b","version":"1.0.0"}"#),
+    ] {
+        let pkg = dir.join(rel);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("package.json"), manifest).unwrap();
+    }
+
+    let (xdg_data, xdg_cache) = (pm_tmpdir("dedupe-ws-data"), pm_tmpdir("dedupe-ws-cache"));
+    let install = run_nub_with(&dir, &["install"], &xdg_data, &xdg_cache);
+    assert_eq!(
+        install.code, 0,
+        "stdout: {}\nstderr: {}",
+        install.stdout, install.stderr
+    );
+    let lock_before = std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap();
+
+    let dedupe = run_nub_with(&dir, &["dedupe"], &xdg_data, &xdg_cache);
+    assert_eq!(
+        dedupe.code, 0,
+        "stdout: {}\nstderr: {}",
+        dedupe.stdout, dedupe.stderr
+    );
+    assert!(
+        dedupe.combined().contains("already deduped"),
+        "workspace links must not be reported as dedupe changes: {}",
+        dedupe.combined()
+    );
+    dedupe.assert_brand_clean();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap(),
+        lock_before,
+        "dedupe must not change the lockfile"
+    );
+
+    let check = run_nub_with(&dir, &["dedupe", "--check"], &xdg_data, &xdg_cache);
+    assert_eq!(
+        check.code,
+        0,
+        "dedupe --check must pass on a deduped workspace: {}",
+        check.combined()
+    );
+}
+
+/// An `npm:` alias must not read as a dedupe change (#578). The pnpm
+/// reader synthesizes an alias-keyed package and used to keep the
+/// canonical real-name entry too, while a fresh resolve emits only the
+/// clone — so `dedupe` reported the target as removed on every run and
+/// `--check` failed forever on a byte-identical lockfile. Needs the
+/// registry: dedupe's whole job is a fresh resolve.
+#[test]
+fn dedupe_ignores_npm_alias_targets_and_check_passes() {
+    if test_registry().is_none() {
+        eprintln!("skipping: NUB_TEST_REGISTRY not set — run: source tests/registry/start.bash");
+        return;
+    }
+    let dir = pm_tmpdir("dedupe-alias");
+    // `packageManager` selects pnpm-lock.yaml; the bug is specific to that
+    // format, since only its writer re-keys an alias under the real name.
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"fixture","private":true,"packageManager":"pnpm@11.17.0","dependencies":{"number-alias":"npm:is-number@7.0.0"}}"#,
+    )
+    .unwrap();
+    let (data, cache) = (
+        pm_tmpdir("dedupe-alias-data"),
+        pm_tmpdir("dedupe-alias-cache"),
+    );
+
+    let install = run_nub_with(&dir, &["install"], &data, &cache);
+    assert_eq!(
+        install.code, 0,
+        "stdout: {}\nstderr: {}",
+        install.stdout, install.stderr
+    );
+    let lock_before = std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap();
+
+    let dedupe = run_nub_with(&dir, &["dedupe"], &data, &cache);
+    assert_eq!(
+        dedupe.code, 0,
+        "stdout: {}\nstderr: {}",
+        dedupe.stdout, dedupe.stderr
+    );
+    assert!(
+        dedupe.combined().contains("already deduped"),
+        "an alias target must not be reported as removed: {}",
+        dedupe.combined()
+    );
+    dedupe.assert_brand_clean();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap(),
+        lock_before,
+        "dedupe must not change the lockfile"
+    );
+
+    let check = run_nub_with(&dir, &["dedupe", "--check"], &data, &cache);
+    assert_eq!(
+        check.code,
+        0,
+        "dedupe --check must pass on an aliased project: {}",
+        check.combined()
+    );
+}
+
 /// `nub import` converts a foreign lockfile to pnpm-lock.yaml (nub's
 /// canonical format — never aube-lock.yaml), refuses a second run without
 /// `--force`, and works fully offline.
@@ -421,6 +857,78 @@ fn import_converts_package_lock_to_pnpm_lock() {
     );
     let forced = run_nub(&dir, &["import", "--force"]);
     assert_eq!(forced.code, 0, "stderr: {}", forced.stderr);
+}
+
+/// Regression for #453: importing a suffix-less source (npm/bun) must run the
+/// peer-context pass so the written pnpm-lock carries peer suffixes. The install
+/// path skips that pass for pnpm incumbents, assuming a pnpm-lock already has
+/// them; a bare `demo-plugin@1.0.0` would leave the store-resident plugin with
+/// no peer sibling under the isolated layout and fail at runtime with
+/// `Cannot find package 'demo-host'`.
+#[test]
+fn import_writes_peer_suffixes_for_suffixless_source() {
+    let dir = pm_tmpdir("import-peer");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"fixture","version":"1.0.0","dependencies":{"demo-plugin":"1.0.0","demo-host":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("package-lock.json"), PEER_DEP_PACKAGE_LOCK).unwrap();
+
+    let out = run_nub(&dir, &["import"]);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    let lock = std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains("demo-plugin@1.0.0(demo-host@1.0.0)"),
+        "imported pnpm-lock must peer-suffix the plugin key (#453): {lock}"
+    );
+}
+
+/// Same guarantee through the BUN lockfile parser: a real published peer pair
+/// (ajv-keywords peers on ajv) must come out suffixed with the resolved peer
+/// mirrored into the snapshot's dependencies — the edge that gives the
+/// store-resident copy its sibling link under the isolated layout (#453).
+#[test]
+fn import_writes_peer_suffixes_for_bun_lock_source() {
+    let dir = pm_tmpdir("import-peer-bun");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"fixture","version":"1.0.0","dependencies":{"ajv":"6.12.6","ajv-keywords":"3.5.2"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("bun.lock"), AJV_PEER_BUN_LOCK).unwrap();
+
+    let out = run_nub(&dir, &["import"]);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    let lock = std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains("ajv-keywords@3.5.2(ajv@6.12.6)"),
+        "bun-sourced import must carry the peer-context suffix: {lock}"
+    );
+    // Bound the check to ajv-keywords' OWN snapshot block: split on its
+    // suffixed key (unique to the snapshots section — the packages key stays
+    // bare), then cut at the blank line that separates snapshot entries. The
+    // whole-file remainder would let a peer edge that landed on the wrong
+    // snapshot still pass.
+    let snapshot = lock
+        .split("ajv-keywords@3.5.2(ajv@6.12.6):")
+        .nth(1)
+        .unwrap_or("")
+        .split("\n\n")
+        .next()
+        .unwrap_or("");
+    assert!(
+        snapshot.contains("ajv: 6.12.6"),
+        "resolved peer must be mirrored into ajv-keywords' snapshot deps: {snapshot}"
+    );
 }
 
 /// `nub link` (register) → `nub link <name>` (consume) → `nub unlink <name>`
@@ -497,18 +1005,20 @@ fn verb_help_is_rebranded_and_exits_zero() {
     }
 }
 
-/// `init` is reserved for nub's own project init: not an engine verb, not a
-/// PM redirect — the answer names the coming nub feature and nothing else.
+/// `init` is nub's own project scaffolder (src/init.rs), never an engine verb
+/// or a PM redirect. In a dir that already has a manifest it refuses with
+/// nub's own conflict message — no engine routing, no "pnpm init" spelling.
+/// The scaffold contract itself lives in tests/init_cmd.rs.
 #[test]
-fn init_is_reserved_and_answers_with_the_coming_note() {
+fn init_is_nub_own_and_never_redirects_to_a_pm() {
     let dir = pm_tmpdir("init");
     std::fs::write(dir.join("package.json"), r#"{"name":"init-fixture"}"#).unwrap();
-    let out = run_nub(&dir, &["init"]);
-    assert_ne!(out.code, 0, "init must error until nub's own init ships");
+    let out = run_nub(&dir, &["init", "-y", "--no-install"]);
+    assert_ne!(out.code, 0, "init must refuse over an existing manifest");
     out.assert_brand_clean();
     assert!(
-        out.stderr.contains("nub's own project init is coming"),
-        "the message must name the coming nub feature: {}",
+        out.stderr.contains("refusing to overwrite"),
+        "the refusal is nub's own conflict message: {}",
         out.stderr
     );
     assert!(

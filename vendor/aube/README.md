@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://aube.jdx.dev">
+  <a href="https://aube.sh">
     <img src="assets/logo.svg" alt="aube logo" width="140" height="140">
   </a>
 </p>
@@ -19,27 +19,41 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://aube.jdx.dev">Read the docs</a></strong>
+  <strong><a href="https://aube.sh">Read the docs</a></strong>
 </p>
 
 <p align="center">
-  Sponsored by <a href="https://37signals.com">37signals</a>.<br>
-  <a href="https://en.dev/sponsors.html">View all sponsors</a>.
+  Sponsored by<br><br>
+  <a href="https://entire.io">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://jdx.dev/sponsors/entire-lockup.svg">
+      <img src="https://jdx.dev/sponsors/entire-lockup-on-light.svg" alt="Entire" height="36">
+    </picture>
+  </a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://omarchy.org/patrons/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://jdx.dev/sponsors/omacom-foundation.svg">
+      <img src="https://jdx.dev/sponsors/omacom-foundation-on-light.svg" alt="Omacom Foundation" height="36">
+    </picture>
+  </a>
+  <br><br>
+  <a href="https://jdx.dev/sponsors.html">View all sponsors</a>
 </p>
 
 ## Why Try It
 
 <!-- BENCH_RATIOS:START -->
-**[Fast installs](https://aube.jdx.dev/benchmarks).** Warm installs are about 5x faster than pnpm and about 2x faster than Bun in the current benchmarks. Repeat test commands run up to 34x faster than pnpm and up to 4x faster than Bun.
+**[Fast installs](https://aube.sh/benchmarks).** Warm installs are about 8x faster than pnpm and about 3x faster than Bun in the current benchmarks. Repeat test commands run up to 24x faster than pnpm and up to 2x faster than Bun.
 <!-- BENCH_RATIOS:END -->
 
-**[Existing lockfiles](https://aube.jdx.dev/package-manager/lockfiles).** Reads and writes `pnpm-lock.yaml`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, and `bun.lock` in place.
+**[Existing lockfiles](https://aube.sh/package-manager/lockfiles).** Reads and writes `pnpm-lock.yaml`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, and `bun.lock` in place.
 
-**[Cheap repeat commands](https://aube.jdx.dev/package-manager/scripts).** `aubr test`, `aube test`, and `aube exec vitest` auto-install when dependencies are stale, then skip that work when nothing changed. `aubx` uses a local binary when one is installed, or a throwaway environment for one-off tools.
+**[Cheap repeat commands](https://aube.sh/package-manager/scripts).** `aubr test`, `aube test`, and `aube exec vitest` auto-install when dependencies are stale, then skip that work when nothing changed. `aubx` uses a local binary when one is installed, or a throwaway environment for one-off tools.
 
-**[Less disk use](https://aube.jdx.dev/package-manager/node-modules).** A global content-addressable store lets projects share package files instead of keeping a full copy of the same dependencies in every checkout.
+**[Less disk use](https://aube.sh/package-manager/node-modules).** A global content-addressable store lets projects share package files instead of keeping a full copy of the same dependencies in every checkout.
 
-**[Secure defaults](https://aube.jdx.dev/security).** Out of the box, exotic transitive deps are blocked, lifecycle scripts wait for approval, trust downgrades fail at resolve, and brand-new releases sit in a 24h cooling window. One `paranoid: true` line adds the build jail and turns the soft gates into hard fails.
+**[Secure defaults](https://aube.sh/security).** Out of the box, exotic transitive deps are blocked, lifecycle scripts wait for approval, trust downgrades fail at resolve, and brand-new releases sit in a 24h cooling window. One `paranoid: true` line adds the build jail and turns the soft gates into hard fails.
 
 ## Install
 
@@ -49,10 +63,13 @@ The recommended path is mise:
 mise use -g aube
 ```
 
-aube switches [Node.js versions](https://aube.jdx.dev/package-manager/node-runtime)
+aube switches [Node.js versions](https://aube.sh/package-manager/node-runtime)
 itself: if a project pins Node through `package.json`
 (`devEngines.runtime`), `.nvmrc`, or `.node-version`, every script and
-binary run through aube gets that version — no shims or shell hooks.
+binary run through aube gets that version. If you want plain `node`,
+`pnpm`, `yarn`, and npm-family commands to go through the same resolver,
+opt into shell activation with `eval "$(aube activate zsh)"`,
+`eval "$(aube activate bash)"`, or `aube activate fish | source`.
 When a pinned version is missing, aube delegates the install to mise if
 you have it (one shared Node store on disk) and downloads from
 nodejs.org otherwise.
@@ -87,7 +104,7 @@ Homebrew installs come from the jdx tap:
 brew install jdx/tap/aube
 ```
 
-See [other install methods](https://aube.jdx.dev/installation).
+See [other install methods](https://aube.sh/installation).
 
 ## First Run
 
@@ -164,6 +181,15 @@ that should be installed for a one-off command.
 The release archives ship all three binaries side by side; no extra
 setup is needed when you install aube via mise or the tarball.
 
+### Shell activation
+
+`aube activate bash`, `aube activate zsh`, and `aube activate fish`
+create an aube-owned shim directory and print the shell code to put it
+on PATH. Activated shells route `node`, `npm`, `npx`, `pnpm`, `pnpx`,
+`yarn`, and `yarnpkg` through aube. `node` uses the resolved project
+runtime; package-manager shims route to aube commands so the existing
+project lockfile kind stays authoritative.
+
 ## CI
 
 Use `aube ci` when the lockfile must be treated as the source of truth:
@@ -215,7 +241,10 @@ When more than one lockfile exists, prefer keeping one canonical lockfile for th
 
 ## Dependency Scripts
 
-aube skips dependency lifecycle scripts by default. That protects installs from unexpected build steps in transitive packages.
+aube skips dependency lifecycle scripts by default, except for packages on its
+built-in trusted-dependencies list. That protects installs from unexpected build
+steps while keeping packages that require an installer functional out of the
+box. An explicit deny rule always overrides the built-in trust.
 
 To allow packages that need build scripts:
 
@@ -229,7 +258,7 @@ You can inspect packages whose scripts were skipped:
 aube ignored-builds
 ```
 
-For approved packages, `jailBuilds: true` runs lifecycle scripts with a scrubbed env and temporary `HOME`. It defaults to `false` today and is planned to default to `true` in the next major version. Use package globs in `jailBuildPermissions` or `jailBuildExclusions` for packages that need specific env vars, paths, network, or a full opt-out.
+For approved packages, `jailBuilds: true` runs lifecycle scripts with a scrubbed env and temporary `HOME`. It defaults to `false` today and is planned to default to `true` in aube 3. Use package globs in `jailBuildPermissions` or `jailBuildExclusions` for packages that need specific env vars, paths, network, or a full opt-out.
 
 ## Package Layout
 
@@ -259,38 +288,28 @@ aube store path
 aube store prune
 ```
 
-aube also matches pnpm 11's runtime surface: `aube runtime set node <version>` pins a Node version in `devEngines.runtime` and the lockfile, and `aube runtime list` shows what a project resolves to. Some pnpm commands are intentionally out of scope: `setup` and `self-update` belong in tools like mise, and registry account helpers such as `whoami`, `token`, `owner`, `search`, `pkg`, and `set-script` are compatibility stubs that point you to the npm command instead.
+aube also matches pnpm 11's runtime surface: `aube runtime set node <version>` pins a Node version in `devEngines.runtime` and the lockfile, and `aube runtime list` shows what a project resolves to. `aube node` runs Node through that resolver, and shell activation can expose compatible tool shims. Some pnpm commands are intentionally out of scope: `setup` and `self-update` belong in tools like mise, and registry account helpers such as `whoami`, `token`, `owner`, `search`, `pkg`, and `set-script` are compatibility stubs that point you to the npm command instead.
 
 ## Learn More
 
-- [Documentation](https://aube.jdx.dev)
-- [Benchmarks](https://aube.jdx.dev/benchmarks)
-- [Lockfile compatibility](https://aube.jdx.dev/package-manager/lockfiles)
-- [Run scripts and binaries](https://aube.jdx.dev/package-manager/scripts)
-
-## CI
-
-<p>
-  <a href="https://namespace.so">
-    <img src="assets/namespace-logo.svg" alt="Namespace" width="64">
-  </a>
-</p>
-
-Thanks to [Namespace](https://namespace.so) for providing CI for aube.
+- [Documentation](https://aube.sh)
+- [Benchmarks](https://aube.sh/benchmarks)
+- [Lockfile compatibility](https://aube.sh/package-manager/lockfiles)
+- [Run scripts and binaries](https://aube.sh/package-manager/scripts)
 
 ## Star History
 
 <a href="https://www.star-history.com/?repos=jdx%2Faube&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=jdx/aube&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=jdx/aube&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=jdx/aube&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=aubepkg/aube&type=date&theme=dark&legend=top-left&sealed_token=DittFna0Wy8uarlDVdMQmftPSDrk5iHeM_2M3W29oCIHgkBqNaXeWjnIPLZF985B9f4lmEGXoWpmfS7b4XyGnSJG9N3wY4gIl2jcX_F7ubwVv-aO9YDgVa76qt3ec9ObE2jVxQW9PklITRQf2Q_DCdKU5ZN5Dr489tSkLetEDtcrRIryb1NQH7xM_e3U" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=aubepkg/aube&type=date&legend=top-left&sealed_token=DittFna0Wy8uarlDVdMQmftPSDrk5iHeM_2M3W29oCIHgkBqNaXeWjnIPLZF985B9f4lmEGXoWpmfS7b4XyGnSJG9N3wY4gIl2jcX_F7ubwVv-aO9YDgVa76qt3ec9ObE2jVxQW9PklITRQf2Q_DCdKU5ZN5Dr489tSkLetEDtcrRIryb1NQH7xM_e3U" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=aubepkg/aube&type=date&legend=top-left&sealed_token=DittFna0Wy8uarlDVdMQmftPSDrk5iHeM_2M3W29oCIHgkBqNaXeWjnIPLZF985B9f4lmEGXoWpmfS7b4XyGnSJG9N3wY4gIl2jcX_F7ubwVv-aO9YDgVa76qt3ec9ObE2jVxQW9PklITRQf2Q_DCdKU5ZN5Dr489tSkLetEDtcrRIryb1NQH7xM_e3U" />
  </picture>
 </a>
 
 ## Contributors
 
-[![Contributors](https://contrib.rocks/image?repo=jdx/aube)](https://github.com/jdx/aube/graphs/contributors)
+[![Contributors](https://contrib.rocks/image?repo=aubepkg/aube)](https://github.com/aubepkg/aube/graphs/contributors)
 
 <p>
   <a href="https://jdx.dev">

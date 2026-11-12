@@ -1,10 +1,12 @@
 use super::jsonc::strip_jsonc;
 use super::raw::{BunEntry, RawBunLockfile};
 use super::source::{
-    bin_value_to_map, bun_key_to_alias_name, classify_bun_ident,
-    rebase_workspace_scoped_local_source, resolve_nested_bun, resolve_workspace_dep, split_ident,
+    bin_value_to_map, bun_key_to_alias_name, classify_bun_ident, rebase_member_tarball,
+    resolve_nested_bun, resolve_workspace_dep, split_ident,
 };
-use crate::{DepType, DirectDep, Error, LockedPackage, LockfileGraph, PeerDepMeta};
+use crate::{
+    DepType, DirectDep, Error, LockedPackage, LockfileGraph, PeerDepMeta, version_protocol,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -23,11 +25,18 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         Err(e) => return Err(Error::parse_json_err(path, raw_content, &e)),
     };
 
-    if raw.lockfile_version != 1 {
+    // bun.lock's on-disk JSON shape is identical across v1 and v2: bun's
+    // own writer documents v1→v2 as added parse-time STRICTNESS on the
+    // same content (it rejects an off-registry npm tuple with missing
+    // integrity and an unsafe git `.bun-tag` that v1 tolerated), not a
+    // format change. v2 became the default for fresh installs in bun 1.4.
+    // So accept both versions through the identical parse path; we don't
+    // replicate bun's v2 strictness (this is a lenient reader).
+    if !matches!(raw.lockfile_version, 1 | 2) {
         return Err(Error::parse(
             path,
             format!(
-                "bun.lock lockfileVersion {} is not supported (expected 1)",
+                "bun.lock lockfileVersion {} is not supported (expected 1 or 2)",
                 raw.lockfile_version
             ),
         ));
@@ -52,12 +61,32 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         })
         .collect();
     workspace_scopes.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
+    // Member directories, verbatim. `classify_bun_ident` needs this to
+    // tell `workspace:<dir>` from `workspace:<selector>` — the tail of
+    // a top-level member carries no separator, so its shape alone is
+    // indistinguishable from a selector.
+    let workspace_dirs: BTreeSet<&str> = raw
+        .workspaces
+        .keys()
+        .filter(|ws_path| !ws_path.is_empty())
+        .map(String::as_str)
+        .collect();
 
     // First pass: parse (name, version) for each entry. bun.lock keys look
     // like the package name ("foo") for the hoisted version, or a nested
     // path ("parent/foo") when multiple versions exist.
     let mut key_info: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut packages: BTreeMap<String, LockedPackage> = BTreeMap::new();
+    // Under `strict_unsupported_source` (nub), an entry whose ident tail
+    // carries a protocol the classifier can't resolve is RECORDED here
+    // (keyed by its bun.lock key) and withheld from `key_info`/`packages`,
+    // instead of being reclassified to a registry `name@version` that 404s
+    // at fetch — the edge sites below (where optionality is known) raise
+    // an eager fatal / warn+skip. Empty (and inert) for standalone aube,
+    // which keeps the reclassify default.
+    let strict = aube_util::embedder().strict_unsupported_source;
+    let mut unsupported: BTreeMap<String, crate::UnsupportedSpec> = BTreeMap::new();
+    let mut skipped_optional: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
 
     for (key, entry) in &entries {
         let Some((raw_name, raw_version)) = split_ident(&entry.ident) else {
@@ -85,9 +114,31 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             &raw_name,
             &raw_version,
             entry.integrity.as_deref(),
+            &workspace_dirs,
         )?;
+        // A protocol-shaped tail that fell through the classifier means a
+        // source this reader can't resolve — an unknown or future bun
+        // protocol, or a malformed spec like a `git+…` tail
+        // `parse_git_spec` rejected. Withhold the entry so the edge sites
+        // below fatal / warn+skip instead of resolving to a bogus registry
+        // pin. Consulted only under `strict_unsupported_source`; the
+        // lenient default keeps the historical reclassify behavior.
+        if strict
+            && local_source.is_none()
+            && let Some(protocol) = version_protocol(&raw_version)
+        {
+            unsupported.insert(
+                key.clone(),
+                crate::UnsupportedSpec {
+                    name: name.clone(),
+                    key: entry.ident.clone(),
+                    protocol: protocol.to_string(),
+                },
+            );
+            continue;
+        }
         let local_source = local_source
-            .map(|local| rebase_workspace_scoped_local_source(key, local, &workspace_scopes));
+            .map(|local| rebase_member_tarball(key, local, &raw.workspaces, &workspace_scopes));
         key_info.insert(key.clone(), (name.clone(), version.clone()));
 
         let dep_path = format!("{name}@{version}");
@@ -181,6 +232,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 // registry on the next resolve. Empty/default → None.
                 tarball_url: entry.registry_url.clone(),
                 declared_dependencies: declared,
+                declared_dependencies_known: true,
                 bin: bin_map,
                 extra_meta,
                 ..Default::default()
@@ -208,13 +260,54 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             .keys()
             .chain(entry.meta.optional_dependencies.keys())
         {
-            if let Some(target_key) = resolve_nested_bun(key, dep_name, &key_info)
-                && let Some((dname, dver)) = key_info.get(&target_key)
+            // ONE walk over the union of both key sets, so the withheld
+            // entry keeps its position in bun's nesting resolution: a
+            // withheld `parent/foo` must not be shadowed by a supported
+            // hoisted `foo` (that would silently resolve the WRONG
+            // package — the exact divergence this policy exists to
+            // refuse). Union == key_info alone unless strict — the
+            // unsupported map is empty otherwise.
+            if let Some(target_key) = resolve_nested_bun(key, dep_name, |k| {
+                key_info.contains_key(k) || unsupported.contains_key(k)
+            }) {
+                if let Some((dname, dver)) = key_info.get(&target_key) {
+                    let target_dep_path = format!("{dname}@{dver}");
+                    resolved.insert(
+                        dep_name.clone(),
+                        crate::npm::dep_path_tail(dname, &target_dep_path).to_string(),
+                    );
+                } else if let Some(u) = unsupported.get(&target_key) {
+                    // Fatal for a required edge, warn+skip for an optional
+                    // one (a name in both meta maps is required).
+                    let optional = !entry.meta.dependencies.contains_key(dep_name);
+                    crate::unsupported_edge(u, optional, path)?;
+                }
+            } else if let Some(range) = entry.meta.dependencies.get(dep_name) {
+                // A required child with no entry: the lockfile is broken. Keep the
+                // edge, pointing at nothing, as the pnpm and npm readers do, so the
+                // drift check can see it and a re-resolve fetches the child.
+                resolved.insert(dep_name.clone(), range.clone());
+            }
+        }
+        // bun writes no edge for a peer: the package finds it by node
+        // resolution from where it sits, which is this same walk. Without
+        // the edge, a required provider nothing else depends on (goober's
+        // peer `csstype` under react-hot-toast) is pruned before peer
+        // resolution runs. Optional peers are left to peer resolution, which
+        // binds them as a fresh resolve does; binding every placed one here
+        // would bind more than pnpm or a fresh install.
+        for peer in entry.meta.peer_dependencies.keys() {
+            if resolved.contains_key(peer) || entry.meta.optional_peers.contains(peer) {
+                continue;
+            }
+            if let Some(target_key) = resolve_nested_bun(key, peer, |k| key_info.contains_key(k))
+                && target_key != *key
+                && let Some((pname, pver)) = key_info.get(&target_key)
             {
-                let target_dep_path = format!("{dname}@{dver}");
+                let target_dep_path = format!("{pname}@{pver}");
                 resolved.insert(
-                    dep_name.clone(),
-                    crate::npm::dep_path_tail(dname, &target_dep_path).to_string(),
+                    peer.clone(),
+                    crate::npm::dep_path_tail(pname, &target_dep_path).to_string(),
                 );
             }
         }
@@ -268,27 +361,63 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             .then(|| ws_raw.extra.get("name").and_then(serde_json::Value::as_str))
             .flatten();
         let mut direct: Vec<DirectDep> = Vec::new();
-        let push_dep =
-            |name: &str, specifier: &str, dep_type: DepType, direct: &mut Vec<DirectDep>| {
-                if let Some(target_key) = resolve_workspace_dep(ws_path, ws_name, name, &key_info)
-                    && let Some((dname, dver)) = key_info.get(&target_key)
-                {
+        let push_dep = |name: &str,
+                        specifier: &str,
+                        dep_type: DepType,
+                        direct: &mut Vec<DirectDep>,
+                        skipped: &mut BTreeMap<String, BTreeMap<String, String>>|
+         -> Result<(), Error> {
+            // Same union walk as the transitive pass above: a withheld
+            // scoped override (`<ws>/<dep>`) must not be shadowed by a
+            // supported hoisted entry. When the walk lands on a withheld
+            // entry: fatal for a required edge, warn for an optional one —
+            // recorded as a consciously-skipped optional so a frozen
+            // install's drift check tolerates the absent dep (same as a
+            // platform-filtered optional). Inert unless strict — the
+            // unsupported map is empty otherwise.
+            if let Some(target_key) = resolve_workspace_dep(ws_path, ws_name, name, |k| {
+                key_info.contains_key(k) || unsupported.contains_key(k)
+            }) {
+                if let Some((dname, dver)) = key_info.get(&target_key) {
                     direct.push(DirectDep {
                         name: dname.clone(),
                         dep_path: format!("{dname}@{dver}"),
                         dep_type,
                         specifier: Some(specifier.to_string()),
                     });
+                } else if let Some(u) = unsupported.get(&target_key) {
+                    let optional = matches!(dep_type, DepType::Optional);
+                    crate::unsupported_edge(u, optional, path)?;
+                    if optional {
+                        skipped
+                            .entry(importer_path.clone())
+                            .or_default()
+                            .insert(name.to_string(), specifier.to_string());
+                    }
                 }
-            };
+            }
+            Ok(())
+        };
         for (n, spec) in &ws_raw.dependencies {
-            push_dep(n, spec, DepType::Production, &mut direct);
+            push_dep(
+                n,
+                spec,
+                DepType::Production,
+                &mut direct,
+                &mut skipped_optional,
+            )?;
         }
         for (n, spec) in &ws_raw.dev_dependencies {
-            push_dep(n, spec, DepType::Dev, &mut direct);
+            push_dep(n, spec, DepType::Dev, &mut direct, &mut skipped_optional)?;
         }
         for (n, spec) in &ws_raw.optional_dependencies {
-            push_dep(n, spec, DepType::Optional, &mut direct);
+            push_dep(
+                n,
+                spec,
+                DepType::Optional,
+                &mut direct,
+                &mut skipped_optional,
+            )?;
         }
         // Required workspace peers. bun links a workspace's
         // `peerDependencies` entry into that workspace's `node_modules`
@@ -319,7 +448,13 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                     continue;
                 }
                 let spec = spec.as_str().unwrap_or_default();
-                push_dep(n, spec, DepType::Production, &mut direct);
+                push_dep(
+                    n,
+                    spec,
+                    DepType::Production,
+                    &mut direct,
+                    &mut skipped_optional,
+                )?;
             }
         }
         importers.insert(importer_path.clone(), direct);
@@ -394,6 +529,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         catalogs: catalogs_map,
         extra_fields: raw.extra,
         workspace_extra_fields,
+        skipped_optional_dependencies: skipped_optional,
         ..Default::default()
     })
 }

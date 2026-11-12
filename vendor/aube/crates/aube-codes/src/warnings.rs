@@ -15,32 +15,51 @@ pub const WARN_AUBE_HOOK_IMPORTER_MUTATED: &str = "WARN_AUBE_HOOK_IMPORTER_MUTAT
 pub const WARN_AUBE_HOOK_IMPORTER_ADDED: &str = "WARN_AUBE_HOOK_IMPORTER_ADDED";
 pub const WARN_AUBE_HOOK_IDENTITY_REWRITTEN: &str = "WARN_AUBE_HOOK_IDENTITY_REWRITTEN";
 pub const WARN_AUBE_HOOK_PACKAGE_ADDED: &str = "WARN_AUBE_HOOK_PACKAGE_ADDED";
+#[rustfmt::skip] pub const WARN_AUBE_HOOK_PRE_RESOLUTION_MUTATED: &str = "WARN_AUBE_HOOK_PRE_RESOLUTION_MUTATED";
 
 // ── install lifecycle ───────────────────────────────────────────────
 pub const WARN_AUBE_IGNORED_BUILD_SCRIPTS: &str = "WARN_AUBE_IGNORED_BUILD_SCRIPTS";
 pub const WARN_AUBE_DEFAULT_TRUST_BUILDS: &str = "WARN_AUBE_DEFAULT_TRUST_BUILDS";
+#[rustfmt::skip] pub const WARN_AUBE_BUILD_NOT_ATTEMPTED: &str = "WARN_AUBE_BUILD_NOT_ATTEMPTED";
+#[rustfmt::skip] pub const WARN_AUBE_OPTIONAL_BUILD_FAILED: &str = "WARN_AUBE_OPTIONAL_BUILD_FAILED";
+#[rustfmt::skip] pub const WARN_AUBE_NODE_GYP_BOOTSTRAP_FAILED: &str = "WARN_AUBE_NODE_GYP_BOOTSTRAP_FAILED";
+pub const WARN_AUBE_DEPRECATED_PACKAGE: &str = "WARN_AUBE_DEPRECATED_PACKAGE";
+pub const WARN_AUBE_DEPRECATED_PACKAGE_SUMMARY: &str = "WARN_AUBE_DEPRECATED_PACKAGE_SUMMARY";
 #[rustfmt::skip] pub const WARN_AUBE_SUSPICIOUS_LIFECYCLE_SCRIPT: &str = "WARN_AUBE_SUSPICIOUS_LIFECYCLE_SCRIPT";
 #[rustfmt::skip] pub const WARN_AUBE_WINDOWS_JOB_OBJECT_UNAVAILABLE: &str = "WARN_AUBE_WINDOWS_JOB_OBJECT_UNAVAILABLE";
 pub const WARN_AUBE_MISSING_INTEGRITY: &str = "WARN_AUBE_MISSING_INTEGRITY";
+pub const WARN_AUBE_ADD_ROLLBACK_FAILED: &str = "WARN_AUBE_ADD_ROLLBACK_FAILED";
 pub const WARN_AUBE_CACHE_WRITE_FAILED: &str = "WARN_AUBE_CACHE_WRITE_FAILED";
 pub const WARN_AUBE_CLONE_STRATEGY_FALLBACK: &str = "WARN_AUBE_CLONE_STRATEGY_FALLBACK";
 pub const WARN_AUBE_LTHASH_MISMATCH: &str = "WARN_AUBE_LTHASH_MISMATCH";
 pub const WARN_AUBE_DELTA_INVALIDATE_FAILED: &str = "WARN_AUBE_DELTA_INVALIDATE_FAILED";
 pub const WARN_AUBE_GVS_INCOMPATIBLE: &str = "WARN_AUBE_GVS_INCOMPATIBLE";
 pub const WARN_AUBE_GVS_MODE_CHANGED: &str = "WARN_AUBE_GVS_MODE_CHANGED";
+pub const WARN_AUBE_GVS_CROSS_VOLUME: &str = "WARN_AUBE_GVS_CROSS_VOLUME";
+#[rustfmt::skip] pub const WARN_AUBE_QUARANTINE_STRIP_FAILED: &str = "WARN_AUBE_QUARANTINE_STRIP_FAILED";
+pub const WARN_AUBE_STORE_PRUNE_ENTRY_DISAPPEARED: &str = "WARN_AUBE_STORE_PRUNE_ENTRY_DISAPPEARED";
 
 // ── settings / config validation ────────────────────────────────────
 pub const WARN_AUBE_INVALID_CONCURRENCY: &str = "WARN_AUBE_INVALID_CONCURRENCY";
 pub const WARN_AUBE_INVALID_TRUST_POLICY: &str = "WARN_AUBE_INVALID_TRUST_POLICY";
+pub const WARN_AUBE_INVALID_BUNDLED_PACKAGE_EXTENSION: &str =
+    "WARN_AUBE_INVALID_BUNDLED_PACKAGE_EXTENSION";
+pub const WARN_AUBE_INVALID_MINIMUM_RELEASE_AGE_EXCLUDE: &str =
+    "WARN_AUBE_INVALID_MINIMUM_RELEASE_AGE_EXCLUDE";
 pub const WARN_AUBE_OVERRIDE_MISSING_DEP: &str = "WARN_AUBE_OVERRIDE_MISSING_DEP";
 pub const WARN_AUBE_OVERRIDE_DOLLAR_REF_DEPRECATED: &str =
     "WARN_AUBE_OVERRIDE_DOLLAR_REF_DEPRECATED";
+pub const WARN_AUBE_UNUSED_PATCH: &str = "WARN_AUBE_UNUSED_PATCH";
 pub const WARN_AUBE_INVALID_PEER_PATTERN: &str = "WARN_AUBE_INVALID_PEER_PATTERN";
 pub const WARN_AUBE_INVALID_SAVE_PREFIX: &str = "WARN_AUBE_INVALID_SAVE_PREFIX";
 pub const WARN_AUBE_CONCURRENCY_ENV_INVALID: &str = "WARN_AUBE_CONCURRENCY_ENV_INVALID";
+pub const WARN_AUBE_MANAGED_CONFIG_ENFORCED: &str = "WARN_AUBE_MANAGED_CONFIG_ENFORCED";
+pub const WARN_AUBE_INVALID_NAMED_REGISTRY_URL: &str = "WARN_AUBE_INVALID_NAMED_REGISTRY_URL";
 
 // ── update / prerelease ─────────────────────────────────────────────
 pub const WARN_AUBE_PRERELEASE_CHECK_SKIPPED: &str = "WARN_AUBE_PRERELEASE_CHECK_SKIPPED";
+pub const WARN_AUBE_MINIMUM_RELEASE_AGE_BLOCKED_UPDATE: &str =
+    "WARN_AUBE_MINIMUM_RELEASE_AGE_BLOCKED_UPDATE";
 pub const WARN_AUBE_WORKSPACE_PACKAGE_MISSING_NAME: &str =
     "WARN_AUBE_WORKSPACE_PACKAGE_MISSING_NAME";
 
@@ -66,6 +85,9 @@ pub const WARN_AUBE_HTTP_RETRY_TRANSPORT: &str = "WARN_AUBE_HTTP_RETRY_TRANSPORT
 pub const WARN_AUBE_HTTP_RETRY_BODY_READ: &str = "WARN_AUBE_HTTP_RETRY_BODY_READ";
 pub const WARN_AUBE_HTTP_RETRY_BODY_DECODE: &str = "WARN_AUBE_HTTP_RETRY_BODY_DECODE";
 
+// ── store ───────────────────────────────────────────────────────────
+pub const WARN_AUBE_STORE_FALLBACK: &str = "WARN_AUBE_STORE_FALLBACK";
+
 // ── registry caching / perf ─────────────────────────────────────────
 pub const WARN_AUBE_PACKUMENT_CACHE_WRITE: &str = "WARN_AUBE_PACKUMENT_CACHE_WRITE";
 pub const WARN_AUBE_SLOW_METADATA: &str = "WARN_AUBE_SLOW_METADATA";
@@ -81,17 +103,28 @@ pub const WARN_AUBE_INVALID_CLIENT_CERT: &str = "WARN_AUBE_INVALID_CLIENT_CERT";
 
 // ── resolver ────────────────────────────────────────────────────────
 pub const WARN_AUBE_UNSUPPORTED_PLATFORM_INSTALL: &str = "WARN_AUBE_UNSUPPORTED_PLATFORM_INSTALL";
+#[rustfmt::skip] pub const WARN_AUBE_SKIPPED_OPTIONAL_NO_MATCHING_VERSION: &str = "WARN_AUBE_SKIPPED_OPTIONAL_NO_MATCHING_VERSION";
 pub const WARN_AUBE_EXOTIC_SUBDEP_SKIPPED: &str = "WARN_AUBE_EXOTIC_SUBDEP_SKIPPED";
 pub const WARN_AUBE_PEER_DEDUPE_COLLISION: &str = "WARN_AUBE_PEER_DEDUPE_COLLISION";
+#[rustfmt::skip] pub const WARN_AUBE_TRUST_DOWNGRADE_SKIPPED: &str = "WARN_AUBE_TRUST_DOWNGRADE_SKIPPED";
 
 // ── lockfile ────────────────────────────────────────────────────────
 pub const WARN_AUBE_LOCKFILE_MERGE_CONFLICT: &str = "WARN_AUBE_LOCKFILE_MERGE_CONFLICT";
 pub const WARN_AUBE_LOCKFILE_MERGE_CLEANUP_FAILED: &str = "WARN_AUBE_LOCKFILE_MERGE_CLEANUP_FAILED";
 pub const WARN_AUBE_LOCKFILE_CONFLICT_MARKERS: &str = "WARN_AUBE_LOCKFILE_CONFLICT_MARKERS";
 pub const WARN_AUBE_YARN_BERRY_UNSUPPORTED: &str = "WARN_AUBE_YARN_BERRY_UNSUPPORTED";
+#[rustfmt::skip] pub const WARN_AUBE_LOCKFILE_UNSUPPORTED_SOURCE: &str = "WARN_AUBE_LOCKFILE_UNSUPPORTED_SOURCE";
 pub const WARN_AUBE_LOCKFILE_MALFORMED_PEER_SUFFIX: &str =
     "WARN_AUBE_LOCKFILE_MALFORMED_PEER_SUFFIX";
 pub const WARN_AUBE_GLOBAL_OUTDATED_NO_LOCKFILE: &str = "WARN_AUBE_GLOBAL_OUTDATED_NO_LOCKFILE";
+pub const WARN_AUBE_LOCKFILE_LEGACY_INCOMPLETE_GRAPH: &str =
+    "WARN_AUBE_LOCKFILE_LEGACY_INCOMPLETE_GRAPH";
+pub const WARN_AUBE_PACKAGE_MANAGER_PIN_NOT_RECORDED: &str =
+    "WARN_AUBE_PACKAGE_MANAGER_PIN_NOT_RECORDED";
+
+// ── global installs ─────────────────────────────────────────────────
+pub const WARN_AUBE_GLOBAL_DIR_LEGACY_LOCATION: &str = "WARN_AUBE_GLOBAL_DIR_LEGACY_LOCATION";
+pub const WARN_AUBE_GLOBAL_BIN_DIR_NOT_ON_PATH: &str = "WARN_AUBE_GLOBAL_BIN_DIR_NOT_ON_PATH";
 
 // ── progress UI ─────────────────────────────────────────────────────
 pub const WARN_AUBE_PROGRESS_OVERFLOW: &str = "WARN_AUBE_PROGRESS_OVERFLOW";
@@ -101,10 +134,15 @@ pub const WARN_AUBE_WORKSPACE_TOPO_CYCLE: &str = "WARN_AUBE_WORKSPACE_TOPO_CYCLE
 
 // ── supply chain (add-time) ─────────────────────────────────────────
 pub const WARN_AUBE_LOW_DOWNLOAD_PACKAGE: &str = "WARN_AUBE_LOW_DOWNLOAD_PACKAGE";
+pub const WARN_AUBE_SIMILAR_PACKAGE_NAME: &str = "WARN_AUBE_SIMILAR_PACKAGE_NAME";
+pub const WARN_AUBE_NEW_PACKAGE_NAME: &str = "WARN_AUBE_NEW_PACKAGE_NAME";
 pub const WARN_AUBE_ADVISORY_CHECK_FAILED: &str = "WARN_AUBE_ADVISORY_CHECK_FAILED";
 pub const WARN_AUBE_OSV_MIRROR_REFRESH_FAILED: &str = "WARN_AUBE_OSV_MIRROR_REFRESH_FAILED";
 pub const WARN_AUBE_OSV_BLOOM_REFRESH_FAILED: &str = "WARN_AUBE_OSV_BLOOM_REFRESH_FAILED";
 pub const WARN_AUBE_SECURITY_SCANNER_FINDING: &str = "WARN_AUBE_SECURITY_SCANNER_FINDING";
+
+// ── linker ──────────────────────────────────────────────────────────
+#[rustfmt::skip] pub const WARN_AUBE_BIN_SHIM_NAME_IS_INTERPRETER: &str = "WARN_AUBE_BIN_SHIM_NAME_IS_INTERPRETER";
 
 // ── node runtime ────────────────────────────────────────────────────
 #[rustfmt::skip] pub const WARN_AUBE_RUNTIME_VERSION_MISMATCH: &str = "WARN_AUBE_RUNTIME_VERSION_MISMATCH";
@@ -116,6 +154,7 @@ pub const WARN_AUBE_RUNTIME_MISE_FALLBACK: &str = "WARN_AUBE_RUNTIME_MISE_FALLBA
 pub mod category {
     pub const PNPMFILE_HOOKS: &str = "pnpmfile / hooks";
     pub const INSTALL_LIFECYCLE: &str = "Install lifecycle";
+    pub const STORE: &str = "Store maintenance";
     pub const SETTINGS_CONFIG: &str = "Settings / config validation";
     pub const UPDATE_PRERELEASE: &str = "Update / prerelease";
     pub const AUDIT_NPMRC: &str = "Audit / npmrc";
@@ -128,7 +167,9 @@ pub mod category {
     pub const PROGRESS_UI: &str = "Progress UI";
     pub const WORKSPACE_RECURSION: &str = "Workspace recursion";
     pub const SUPPLY_CHAIN: &str = "Supply chain (add-time)";
+    pub const LINKER: &str = "Linker";
     pub const NODE_RUNTIME: &str = "Node runtime";
+    pub const GLOBAL_INSTALLS: &str = "Global installs";
 }
 
 /// Registry of every warning code with its category and description.
@@ -169,7 +210,7 @@ pub const ALL: &[CodeMeta] = &[
     CodeMeta {
         name: WARN_AUBE_HOOK_IDENTITY_REWRITTEN,
         category: category::PNPMFILE_HOOKS,
-        description: "A pnpmfile hook rewrote a package's `(name, version)` identity; aube reverted the edit.",
+        description: "A pnpmfile hook edited a package field that is fixed by resolution (`resolution`, `engines`, identity); aube applies only `dependencies` and `peerDependencies` and reverted the rest.",
         exit_code: None,
     },
     CodeMeta {
@@ -178,29 +219,71 @@ pub const ALL: &[CodeMeta] = &[
         description: "A pnpmfile hook added a wholly-new package entry; aube ignored it.",
         exit_code: None,
     },
+    CodeMeta {
+        name: WARN_AUBE_HOOK_PRE_RESOLUTION_MUTATED,
+        category: category::PNPMFILE_HOOKS,
+        description: "A pnpmfile `preResolution` hook edited the lockfile it was handed. pnpm runs the hook in-process, so such an edit reaches the resolver; aube runs it in a child and the edit is discarded. Move the change to `readPackage` or `afterAllResolved`.",
+        exit_code: None,
+    },
     // Install lifecycle
     CodeMeta {
         name: WARN_AUBE_IGNORED_BUILD_SCRIPTS,
         category: category::INSTALL_LIFECYCLE,
-        description: "Dep had `preinstall`/`install`/`postinstall` scripts but isn't on the `allowBuilds` allowlist. Run `aube approve-builds`.",
+        description: "Dep had `preinstall`/`install`/`postinstall` scripts but isn't on the build allowlist. Run `aube approve-builds`.",
         exit_code: None,
     },
     CodeMeta {
         name: WARN_AUBE_DEFAULT_TRUST_BUILDS,
         category: category::INSTALL_LIFECYCLE,
-        description: "The `defaultTrust` floor let listed packages run build scripts without an explicit `allowBuilds` entry. Disclosure, not an error — set `defaultTrust=false` or an explicit `allowBuilds: false` entry to opt out.",
+        description: "The `defaultTrust` floor let listed packages run build scripts without an explicit build-allowlist entry. Disclosure, not an error — set `defaultTrust=false` or an explicit `false` allowlist entry to opt out.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_BUILD_NOT_ATTEMPTED,
+        category: category::INSTALL_LIFECYCLE,
+        description: "A dependency the build policy allows could not have its build scripts attempted, because its directory in the virtual store was not on disk when the lifecycle phase ran. The install records this so the next one retries instead of reporting the tree up to date; `aube install --force` rebuilds immediately.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_OPTIONAL_BUILD_FAILED,
+        category: category::INSTALL_LIFECYCLE,
+        description: "A package reachable only through `optionalDependencies` failed to build. The install continues without it (npm and pnpm both treat an optional build failure as non-fatal). Anything importing it at runtime will fail — declare it a regular dependency if it is actually required. Emitted by the install that runs the build: a later up-to-date install skips the package and does not repeat this, so run `aube rebuild <pkg>` to attempt the build again.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_NODE_GYP_BOOTSTRAP_FAILED,
+        category: category::INSTALL_LIFECYCLE,
+        description: "Jailed builds were requested but node-gyp could not be prepared for them (a jailed script cannot bootstrap it itself). The install continues: builds that don't use node-gyp are unaffected, and one that does will fail with node-gyp's own error.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_DEPRECATED_PACKAGE,
+        category: category::INSTALL_LIFECYCLE,
+        description: "An installed package version is deprecated.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_DEPRECATED_PACKAGE_SUMMARY,
+        category: category::INSTALL_LIFECYCLE,
+        description: "One or more installed package versions have deprecation warnings.",
         exit_code: None,
     },
     CodeMeta {
         name: WARN_AUBE_SUSPICIOUS_LIFECYCLE_SCRIPT,
         category: category::INSTALL_LIFECYCLE,
-        description: "A dependency's lifecycle script matched a dangerous-shape heuristic (curl|sh, eval+atob, credential-file read, secret-env exfil, exfil endpoint, bare-IP HTTP). Advisory only; the `allowBuilds` allowlist still gates execution. Inspect the script before approving the build.",
+        description: "A dependency's lifecycle script matched a dangerous-shape heuristic (curl|sh, eval+atob, credential-file read, secret-env exfil, exfil endpoint, bare-IP HTTP). Advisory only; the build allowlist still gates execution. Inspect the script before approving the build.",
         exit_code: None,
     },
     CodeMeta {
         name: WARN_AUBE_WINDOWS_JOB_OBJECT_UNAVAILABLE,
         category: category::INSTALL_LIFECYCLE,
         description: "Windows: couldn't create or assign a kill-on-job-close job object for a lifecycle script. The script still runs, but on abort/failure its grandchildren (node-gyp / MSBuild / node) may be orphaned. Usually caused by a restrictive parent job or enterprise policy.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_ADD_ROLLBACK_FAILED,
+        category: category::INSTALL_LIFECYCLE,
+        description: "An `add` failed and a project file it had changed could not be put back.",
         exit_code: None,
     },
     CodeMeta {
@@ -224,7 +307,7 @@ pub const ALL: &[CodeMeta] = &[
     CodeMeta {
         name: WARN_AUBE_LTHASH_MISMATCH,
         category: category::INSTALL_LIFECYCLE,
-        description: "Incremental and full LtHash digests disagreed — homomorphic invariant broken. Real bug signal.",
+        description: "aube's incremental install digest disagreed with a full recomputation. This indicates a bug in aube — please report it at https://github.com/aubepkg/aube/discussions.",
         exit_code: None,
     },
     CodeMeta {
@@ -242,7 +325,25 @@ pub const ALL: &[CodeMeta] = &[
     CodeMeta {
         name: WARN_AUBE_GVS_MODE_CHANGED,
         category: category::INSTALL_LIFECYCLE,
-        description: "Switching between gvs-on and gvs-off; removing `node_modules` and reinstalling from scratch.",
+        description: "The global virtual store was switched on or off since the last install, so aube is removing `node_modules` and reinstalling from scratch.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_GVS_CROSS_VOLUME,
+        category: category::INSTALL_LIFECYCLE,
+        description: "The global virtual store (`globalVirtualStoreDir`, by default under `cacheDir`) and `storeDir` are on different volumes, so linking falls back to per-file copy.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_STORE_PRUNE_ENTRY_DISAPPEARED,
+        category: category::STORE,
+        description: "A global virtual-store entry disappeared while a prune plan was being built; the preview skipped it.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_QUARANTINE_STRIP_FAILED,
+        category: category::INSTALL_LIFECYCLE,
+        description: "macOS only: `com.apple.quarantine` could not be removed from a materialized native binary, so Gatekeeper may refuse to load or run it.",
         exit_code: None,
     },
     // Settings / config validation
@@ -259,6 +360,18 @@ pub const ALL: &[CodeMeta] = &[
         exit_code: None,
     },
     CodeMeta {
+        name: WARN_AUBE_INVALID_BUNDLED_PACKAGE_EXTENSION,
+        category: category::SETTINGS_CONFIG,
+        description: "A bundled package-extension entry was malformed and skipped.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_INVALID_MINIMUM_RELEASE_AGE_EXCLUDE,
+        category: category::SETTINGS_CONFIG,
+        description: "A `minimumReleaseAgeExclude` entry was malformed and skipped.",
+        exit_code: None,
+    },
+    CodeMeta {
         name: WARN_AUBE_OVERRIDE_MISSING_DEP,
         category: category::SETTINGS_CONFIG,
         description: "An `overrides` `$ref` pointed at a package not in any of the importer's dependency lists.",
@@ -268,6 +381,12 @@ pub const ALL: &[CodeMeta] = &[
         name: WARN_AUBE_OVERRIDE_DOLLAR_REF_DEPRECATED,
         category: category::SETTINGS_CONFIG,
         description: "An `overrides` entry used pnpm's deprecated `$` version reference syntax.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_UNUSED_PATCH,
+        category: category::SETTINGS_CONFIG,
+        description: "A declared `patchedDependencies` key matched no installed package, downgraded from an error by `allowUnusedPatches`.",
         exit_code: None,
     },
     CodeMeta {
@@ -288,11 +407,29 @@ pub const ALL: &[CodeMeta] = &[
         description: "The `AUBE_CONCURRENCY` env var was outside the `[floor, ceiling]` range or non-numeric.",
         exit_code: None,
     },
+    CodeMeta {
+        name: WARN_AUBE_MANAGED_CONFIG_ENFORCED,
+        category: category::SETTINGS_CONFIG,
+        description: "Managed hardening config enforced a stricter value than local config, env, or CLI requested.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_INVALID_NAMED_REGISTRY_URL,
+        category: category::SETTINGS_CONFIG,
+        description: "A `namedRegistries` alias mapped to a value that is not a valid http(s) URL. The alias was dropped.",
+        exit_code: None,
+    },
     // Update / prerelease
     CodeMeta {
         name: WARN_AUBE_PRERELEASE_CHECK_SKIPPED,
         category: category::UPDATE_PRERELEASE,
         description: "`aube update` couldn't fetch the packument or got a non-semver `latest` tag; preserved-prerelease check skipped for that package.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_MINIMUM_RELEASE_AGE_BLOCKED_UPDATE,
+        category: category::UPDATE_PRERELEASE,
+        description: "One or more newer package versions were hidden because they have not satisfied `minimumReleaseAge` yet.",
         exit_code: None,
     },
     CodeMeta {
@@ -389,6 +526,12 @@ pub const ALL: &[CodeMeta] = &[
         exit_code: None,
     },
     CodeMeta {
+        name: WARN_AUBE_STORE_FALLBACK,
+        category: category::LINKER,
+        description: "The default store is not writable; using a project-local store under node_modules for this run.",
+        exit_code: None,
+    },
+    CodeMeta {
         name: WARN_AUBE_HTTP_RETRY_BODY_READ,
         category: category::HTTP_RETRIES,
         description: "Retrying after a response-body read error (timeout, partial body).",
@@ -464,9 +607,21 @@ pub const ALL: &[CodeMeta] = &[
         exit_code: None,
     },
     CodeMeta {
+        name: WARN_AUBE_SKIPPED_OPTIONAL_NO_MATCHING_VERSION,
+        category: category::RESOLVER,
+        description: "No version of an optional dep matched its range, so the dep was skipped instead of failing the install.",
+        exit_code: None,
+    },
+    CodeMeta {
         name: WARN_AUBE_EXOTIC_SUBDEP_SKIPPED,
         category: category::RESOLVER,
         description: "An optional or peer dep used an exotic specifier and was skipped under `blockExoticSubdeps=true`.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_TRUST_DOWNGRADE_SKIPPED,
+        category: category::RESOLVER,
+        description: "`trustPolicy=no-downgrade` refused the version the range would otherwise resolve to, so an older satisfying version that keeps its trust evidence was installed instead.",
         exit_code: None,
     },
     CodeMeta {
@@ -501,6 +656,12 @@ pub const ALL: &[CodeMeta] = &[
         exit_code: None,
     },
     CodeMeta {
+        name: WARN_AUBE_LOCKFILE_UNSUPPORTED_SOURCE,
+        category: category::LOCKFILE,
+        description: "An OPTIONAL dependency's source (protocol) can't be resolved from the lockfile (e.g. a git or jsr source). It was skipped; the install continues. A non-optional such dependency is a hard error (ERR_AUBE_LOCKFILE_UNSUPPORTED_SOURCE) instead.",
+        exit_code: None,
+    },
+    CodeMeta {
         name: WARN_AUBE_LOCKFILE_MALFORMED_PEER_SUFFIX,
         category: category::LOCKFILE,
         description: "A pnpm dep_path peer suffix had unbalanced parentheses (a truncated or hand-corrupted lockfile entry). The key is preserved verbatim instead of silently dropping everything after the `(`, so a later install surfaces the bad entry rather than mis-resolving it.",
@@ -510,6 +671,31 @@ pub const ALL: &[CodeMeta] = &[
         name: WARN_AUBE_GLOBAL_OUTDATED_NO_LOCKFILE,
         category: category::LOCKFILE,
         description: "`aube outdated -g` found a global install without a lockfile and skipped that install.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_LOCKFILE_LEGACY_INCOMPLETE_GRAPH,
+        category: category::LOCKFILE,
+        description: "A legacy npm lockfile (lockfileVersion 1 / pre-2017 npm-shrinkwrap.json) hoists a package to the top level with no recorded dependency edge — pre-npm-5 shrinkwraps omit the `requires` links that record which package depends on it. The package is unreachable from the project's dependencies and will not be installed. Re-lock with npm 7+ (or `nub install` then commit the regenerated lockfile) for a complete graph.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_PACKAGE_MANAGER_PIN_NOT_RECORDED,
+        category: category::LOCKFILE,
+        description: "The project pins pnpm 11 or later (`devEngines.packageManager`, or a v12+ `packageManager` field) but the pinned pnpm could not be resolved, so `pnpm-lock.yaml` does not record it in `packageManagerDependencies`. pnpm's `--frozen-lockfile` refuses such a lockfile; the next install retries.",
+        exit_code: None,
+    },
+    // Global installs
+    CodeMeta {
+        name: WARN_AUBE_GLOBAL_DIR_LEGACY_LOCATION,
+        category: category::GLOBAL_INSTALLS,
+        description: "Global packages were found under the pnpm-named directory aube used before it owned its own global layout (`$PNPM_HOME`, `$XDG_DATA_HOME/pnpm`, `~/Library/pnpm`, `%LOCALAPPDATA%\\pnpm`), while the current global directory holds none. Those installs are no longer visible to `aube list -g` / `remove -g`; reinstall them with `aube add -g`, or point `AUBE_HOME` at the old directory.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_GLOBAL_BIN_DIR_NOT_ON_PATH,
+        category: category::GLOBAL_INSTALLS,
+        description: "`aube add -g` linked a bin into a directory that is not on `$PATH`, so the command it installed won't be found. Add the directory to `PATH`, or point `globalBinDir` / `AUBE_HOME` at one that already is.",
         exit_code: None,
     },
     // Progress UI
@@ -528,9 +714,21 @@ pub const ALL: &[CodeMeta] = &[
     },
     // Supply chain (add-time)
     CodeMeta {
+        name: WARN_AUBE_SIMILAR_PACKAGE_NAME,
+        category: category::SUPPLY_CHAIN,
+        description: "`aube add` flagged a package whose name closely resembles a top-100,000 npm package. Interactive sessions prompt for confirmation; non-interactive contexts fail with `ERR_AUBE_SIMILAR_PACKAGE_NAME` unless explicitly allowed.",
+        exit_code: None,
+    },
+    CodeMeta {
         name: WARN_AUBE_LOW_DOWNLOAD_PACKAGE,
         category: category::SUPPLY_CHAIN,
         description: "`aube add` flagged a package whose weekly downloads fall below `lowDownloadThreshold`. Interactive sessions prompt for confirmation; non-interactive contexts fail with `ERR_AUBE_LOW_DOWNLOAD_PACKAGE` unless `--allow-low-downloads` is passed.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: WARN_AUBE_NEW_PACKAGE_NAME,
+        category: category::SUPPLY_CHAIN,
+        description: "`aube add` flagged a package name first published within `minimumPackageAge`. Interactive sessions prompt for confirmation; non-interactive contexts fail with `ERR_AUBE_NEW_PACKAGE_NAME` unless explicitly allowed.",
         exit_code: None,
     },
     CodeMeta {
@@ -555,6 +753,13 @@ pub const ALL: &[CodeMeta] = &[
         name: WARN_AUBE_SECURITY_SCANNER_FINDING,
         category: category::SUPPLY_CHAIN,
         description: "User-configured `securityScanner` returned a `warn`-level advisory. Install continues — only `fatal`-level advisories block.",
+        exit_code: None,
+    },
+    // Linker
+    CodeMeta {
+        name: WARN_AUBE_BIN_SHIM_NAME_IS_INTERPRETER,
+        category: category::LINKER,
+        description: "A package declares a bin whose name is also the interpreter that bin needs, so no wrapper can be written for it. The bin is skipped; the rest of the package installs normally.",
         exit_code: None,
     },
     // Node runtime

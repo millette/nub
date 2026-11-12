@@ -26,6 +26,21 @@ pub enum LockfileKind {
     Bun,
 }
 
+/// Options that affect lockfile parsing without changing the graph
+/// shape. Defaults preserve the historic strict parser behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseOptions {
+    pub strict_store_integrity: bool,
+}
+
+impl Default for ParseOptions {
+    fn default() -> Self {
+        Self {
+            strict_store_integrity: true,
+        }
+    }
+}
+
 impl LockfileKind {
     pub fn filename(self) -> &'static str {
         match self {
@@ -113,6 +128,30 @@ pub fn write_lockfile_as(
     manifest: &aube_manifest::PackageJson,
     kind: LockfileKind,
 ) -> Result<PathBuf, Error> {
+    let no_churn = aube_util::embedder().no_churn_lockfile_write;
+    write_lockfile_with(project_dir, graph, manifest, kind, no_churn)
+}
+
+/// [`write_lockfile_as`] without the embedder's no-churn guard, for an explicit
+/// request to rewrite the file. The guard compares resolved graphs, and a graph
+/// does not carry everything a lockfile records (npm's `dev` / `optional` flags
+/// are derived on write), so a graph-equal file can still be wrong on disk.
+pub fn rewrite_lockfile_as(
+    project_dir: &Path,
+    graph: &LockfileGraph,
+    manifest: &aube_manifest::PackageJson,
+    kind: LockfileKind,
+) -> Result<PathBuf, Error> {
+    write_lockfile_with(project_dir, graph, manifest, kind, false)
+}
+
+fn write_lockfile_with(
+    project_dir: &Path,
+    graph: &LockfileGraph,
+    manifest: &aube_manifest::PackageJson,
+    kind: LockfileKind,
+    no_churn: bool,
+) -> Result<PathBuf, Error> {
     let _diag = aube_util::diag::Span::new(aube_util::diag::Category::Lockfile, "write")
         .with_meta_fn(|| {
             format!(
@@ -128,6 +167,23 @@ pub fn write_lockfile_as(
     };
     let path = project_dir.join(&filename);
 
+    // Pre-rename LEGACY files for nub's OWN canonical lockfile (a filename
+    // transition, e.g. `lock.yaml` → `nub.lock`). Only the canonical (Aube)
+    // kind carries them and the list is EMPTY for standalone aube, so every
+    // branch below is inert there — fork-discipline: the default path is
+    // byte-for-byte unchanged. A present legacy file is nub's not-yet-migrated
+    // lockfile; the migration to `path` rides the first REAL write below.
+    let legacy_present: Vec<PathBuf> = if kind == LockfileKind::Aube {
+        aube_util::embedder()
+            .lockfile_legacy_basenames
+            .iter()
+            .map(|name| project_dir.join(name))
+            .filter(|p| *p != path && p.is_file())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // No-churn write guard (embedder opt-in; default upstream = always
     // write). When the embedder enables it, skip the write if the graph
     // we'd serialize is identical (by engine-agnostic graph-identity
@@ -139,14 +195,41 @@ pub fn write_lockfile_as(
     // the comparison runs ONLY behind the embedder toggle, and any
     // failure to read/parse the existing file falls through to a normal
     // write (the feature is additive, never load-bearing).
-    if aube_util::embedder().no_churn_lockfile_write
-        && lockfile_write_is_noop(&path, kind, graph, manifest)
-    {
-        tracing::debug!(
-            "no-churn: resolved graph matches existing {}; skipping rewrite",
-            filename
-        );
-        return Ok(path);
+    //
+    // The comparison targets the CURRENT-name file when present, else nub's
+    // pre-rename LEGACY file. That legacy fallback is what keeps a no-op op on
+    // a not-yet-migrated project from writing anything: a graph-equal install /
+    // `--force` re-resolve leaves the old lockfile exactly as-is (no rename, no
+    // new file). The rename rides ONLY a real change (the write below).
+    if no_churn {
+        let compare_against = if path.exists() {
+            Some(path.clone())
+        } else {
+            legacy_present.first().cloned()
+        };
+        if let Some(existing) = compare_against
+            && lockfile_write_is_noop(&existing, kind, graph, manifest)
+        {
+            tracing::debug!(
+                "no-churn: resolved graph matches existing {}; skipping rewrite",
+                existing
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&filename)
+            );
+            // Never leave two canonical lockfiles: when the CURRENT-name file is
+            // the one we matched (it exists), a pre-rename dup beside it is
+            // redundant cruft (reads resolve to the current name) — prune it.
+            // When only the legacy exists, it stays untouched (the no-op
+            // contract: a no-op op on a not-yet-migrated project changes
+            // nothing).
+            if path.exists() {
+                for lp in &legacy_present {
+                    let _ = std::fs::remove_file(lp);
+                }
+            }
+            return Ok(path);
+        }
     }
 
     match kind {
@@ -155,6 +238,14 @@ pub fn write_lockfile_as(
         LockfileKind::Yarn => yarn::write_classic(&path, graph, manifest)?,
         LockfileKind::YarnBerry => yarn::write_berry(&path, graph, manifest)?,
         LockfileKind::Bun => bun::write(&path, graph, manifest)?,
+    }
+
+    // A real canonical write just landed under the CURRENT name; complete the
+    // one-time rename by removing any pre-rename LEGACY file so the project ends
+    // on exactly ONE lockfile. Reached only on a genuine change (the no-churn
+    // guard returned above otherwise), so this never fires on a no-op op.
+    for lp in &legacy_present {
+        let _ = std::fs::remove_file(lp);
     }
     Ok(path)
 }
@@ -178,9 +269,35 @@ fn lockfile_write_is_noop(
     if !path.exists() {
         return false;
     }
-    let Ok(existing) = parse_one(path, kind, manifest) else {
+    // Strict integrity is what this guard had unconditionally before
+    // jdx/aube#995 made it an option: a lockfile we cannot strictly parse falls
+    // through to `return false`, i.e. gets rewritten rather than suppressed.
+    let Ok(existing) = parse_one(path, kind, manifest, ParseOptions::default()) else {
         return false;
     };
+    // Under an enforcing embedder (nub), a differing `packageExtensionsChecksum`
+    // is a real config change that must be persisted — fold it into the no-op
+    // decision, exactly like the patch fingerprints below. Without this the
+    // guard suppresses the very write that would record the checksum whenever
+    // the resolved graph is otherwise unchanged (the mainline case: an existing
+    // lockfile that already applied the same extensions, just never stamped the
+    // checksum), leaving `--frozen-lockfile` permanently mismatched with no
+    // install-based remedy. Standalone aube never stamps the generic lock
+    // (posture off), so this is inert for it.
+    if aube_util::engine_context().enforce_package_extensions_checksum
+        && graph.package_extensions_checksum != existing.package_extensions_checksum
+    {
+        return false;
+    }
+    // The `catalogs` block is recorded config too, and the identity hash
+    // never sees it: a widened catalog range that keeps the same pick
+    // would otherwise leave the old specifier on disk, which our own
+    // `--frozen-lockfile` and pnpm's (ERR_PNPM_LOCKFILE_CONFIG_MISMATCH)
+    // both reject. Compare only what each writer persists, so a format
+    // that records no catalogs never looks changed.
+    if !recorded_catalogs_equal(kind, graph, &existing) {
+        return false;
+    }
     // `allow_build` doesn't affect the engine-agnostic identity hash
     // (the engine taint it would gate is computed with `engine: None`),
     // so a trivial policy is correct here.
@@ -194,17 +311,34 @@ fn lockfile_write_is_noop(
     // closure reads from its source graph's `patched_dependency_hashes`
     // (selector `name@version` → sha256 hex), matching how the link /
     // materialize paths derive their patch fingerprints.
+    // The declared keys carried into `patched_dependency_hashes` may be
+    // ranges / `*` / bare names (and an npm-aliased package matches under
+    // the registry name it shadows), so each graph is folded through
+    // `resolve_patched_by_version` — the one rule the linker, writer, and
+    // drift check share — rather than a direct `name@version` lookup or a
+    // second copy of the matching logic here. The result is keyed by
+    // `spec_key()`, which is exactly what the hasher hands the closure.
+    // An unresolvable set (invalid range, or a per-package conflict)
+    // means the graph is unwritable as-is — return `false` (treat as NOT
+    // equivalent) so the caller proceeds to the real write, which
+    // surfaces the branded error rather than silently suppressing it.
+    let Ok(graph_patches) = crate::patch_groups::resolve_patched_by_version(
+        &graph.patched_dependency_hashes,
+        &graph.packages,
+    ) else {
+        return false;
+    };
+    let Ok(existing_patches) = crate::patch_groups::resolve_patched_by_version(
+        &existing.patched_dependency_hashes,
+        &existing.packages,
+    ) else {
+        return false;
+    };
     let graph_patch = |name: &str, version: &str| -> Option<String> {
-        graph
-            .patched_dependency_hashes
-            .get(&format!("{name}@{version}"))
-            .cloned()
+        graph_patches.get(&format!("{name}@{version}")).cloned()
     };
     let existing_patch = |name: &str, version: &str| -> Option<String> {
-        existing
-            .patched_dependency_hashes
-            .get(&format!("{name}@{version}"))
-            .cloned()
+        existing_patches.get(&format!("{name}@{version}")).cloned()
     };
     crate::graph_hash::graph_identity_hash_with_patches(graph, &no_build, &graph_patch)
         == crate::graph_hash::graph_identity_hash_with_patches(
@@ -212,6 +346,32 @@ fn lockfile_write_is_noop(
             &no_build,
             &existing_patch,
         )
+}
+
+/// Whether `a` and `b` would write the same catalog block in a `kind`
+/// lockfile: pnpm-shaped files record specifier and version, `bun.lock`
+/// only the specifier, and the npm and yarn formats record none.
+fn recorded_catalogs_equal(kind: LockfileKind, a: &LockfileGraph, b: &LockfileGraph) -> bool {
+    match kind {
+        LockfileKind::Aube | LockfileKind::Pnpm => a.catalogs == b.catalogs,
+        LockfileKind::Bun => {
+            let specifiers = |g: &LockfileGraph| -> Vec<(String, String, String)> {
+                g.catalogs
+                    .iter()
+                    .flat_map(|(cat, entries)| {
+                        entries
+                            .iter()
+                            .map(|(pkg, e)| (cat.clone(), pkg.clone(), e.specifier.clone()))
+                    })
+                    .collect()
+            };
+            specifiers(a) == specifiers(b)
+        }
+        LockfileKind::Npm
+        | LockfileKind::NpmShrinkwrap
+        | LockfileKind::Yarn
+        | LockfileKind::YarnBerry => true,
+    }
 }
 
 /// Return the [`LockfileKind`] of the lockfile already on disk in
@@ -273,25 +433,43 @@ fn has_conflict_markers(content: &str) -> bool {
 /// YAML parse + a `git branch --show-current` subprocess just to
 /// recompute a value that can't change mid-process.
 pub fn aube_lock_filename(project_dir: &Path) -> String {
+    let basename = aube_util::embedder().lockfile_basename;
+    match resolved_branch(project_dir) {
+        // basename is "<stem>.<ext>" (e.g. "aube-lock.yaml"); branch lockfiles
+        // splice the branch in as "<stem>.<branch>.<ext>".
+        Some(branch) => {
+            let (stem, ext) = basename.rsplit_once('.').unwrap_or((basename, "yaml"));
+            format!("{stem}.{branch}.{ext}")
+        }
+        None => basename.to_string(),
+    }
+}
+
+/// The slash-encoded current branch when `gitBranchLockfile` is on and the
+/// project is on a branch; `None` otherwise. Memoized per `project_dir` for
+/// the process (an install resolves a lockfile name 3–5 times, and each
+/// resolution would otherwise pay a YAML parse + a `git branch --show-current`
+/// subprocess to recompute a value that can't change mid-process).
+///
+/// This is the single source of the branch suffix shared by
+/// [`aube_lock_filename`] and [`pnpm_lock_filename`] so the two filenames stay
+/// in lockstep WITHOUT one being string-derived from the other — the derivation
+/// must not assume the canonical and pnpm names share an extension (they don't
+/// once an embedder picks a basename like `package.lock`).
+fn resolved_branch(project_dir: &Path) -> Option<String> {
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, String>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, Option<String>>>> =
+        OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Ok(map) = cache.lock()
         && let Some(hit) = map.get(project_dir)
     {
         return hit.clone();
     }
-    let basename = aube_util::embedder().lockfile_basename;
-    // basename is "<stem>.<ext>" (e.g. "aube-lock.yaml"); branch lockfiles
-    // splice the branch in as "<stem>.<branch>.<ext>".
-    let (stem, ext) = basename.rsplit_once('.').unwrap_or((basename, "yaml"));
-    let resolved = if !git_branch_lockfile_enabled(project_dir) {
-        basename.to_string()
+    let resolved = if git_branch_lockfile_enabled(project_dir) {
+        current_git_branch(project_dir).map(|branch| branch.replace('/', "!"))
     } else {
-        match current_git_branch(project_dir) {
-            Some(branch) => format!("{stem}.{}.{ext}", branch.replace('/', "!")),
-            None => basename.to_string(),
-        }
+        None
     };
     if let Ok(mut map) = cache.lock() {
         map.insert(project_dir.to_path_buf(), resolved.clone());
@@ -301,19 +479,16 @@ pub fn aube_lock_filename(project_dir: &Path) -> String {
 
 /// Resolve the pnpm lockfile filename for `project_dir`.
 ///
-/// Mirrors [`aube_lock_filename`] for branch lockfiles, but keeps the
-/// pnpm filename prefix so projects with an existing `pnpm-lock.yaml`
-/// keep writing to pnpm's file.
+/// Mirrors [`aube_lock_filename`] for branch lockfiles, but keeps pnpm's own
+/// `pnpm-lock` stem and `.yaml` extension so a project with an existing
+/// `pnpm-lock.yaml` keeps writing pnpm's file. Computed from the shared
+/// [`resolved_branch`] rather than string-rewriting the canonical name — the
+/// canonical basename's extension may not be `.yaml` (e.g. `package.lock`).
 pub fn pnpm_lock_filename(project_dir: &Path) -> String {
-    let aube_name = aube_lock_filename(project_dir);
-    // `aube_lock_filename` always returns "<stem>.<rest>", so strip_prefix
-    // always succeeds. The fallback is purely defensive.
-    let basename = aube_util::embedder().lockfile_basename;
-    let stem = basename.rsplit_once('.').map_or(basename, |(s, _)| s);
-    aube_name
-        .strip_prefix(&format!("{stem}."))
-        .map(|rest| format!("pnpm-lock.{rest}"))
-        .unwrap_or_else(|| "pnpm-lock.yaml".to_string())
+    match resolved_branch(project_dir) {
+        Some(branch) => format!("pnpm-lock.{branch}.yaml"),
+        None => "pnpm-lock.yaml".to_string(),
+    }
 }
 
 fn git_branch_lockfile_enabled(project_dir: &Path) -> bool {
@@ -371,13 +546,23 @@ pub fn parse_lockfile_with_kind(
     project_dir: &Path,
     manifest: &aube_manifest::PackageJson,
 ) -> Result<(LockfileGraph, LockfileKind), Error> {
+    parse_lockfile_with_kind_and_options(project_dir, manifest, ParseOptions::default())
+}
+
+/// Like [`parse_lockfile_with_kind`] but lets callers opt into parser
+/// behavior driven by resolved install settings.
+pub fn parse_lockfile_with_kind_and_options(
+    project_dir: &Path,
+    manifest: &aube_manifest::PackageJson,
+    options: ParseOptions,
+) -> Result<(LockfileGraph, LockfileKind), Error> {
     reject_bun_binary(project_dir)?;
-    for (path, kind) in lockfile_candidates(project_dir, /*include_aube=*/ true) {
+    for (path, kind) in read_candidates(project_dir, /*include_aube=*/ true) {
         if !path.exists() {
             continue;
         }
         let kind = refine_yarn_kind(&path, kind);
-        let graph = parse_one(&path, kind, manifest)?;
+        let graph = parse_one(&path, kind, manifest, options)?;
         return Ok((graph, kind));
     }
     Err(Error::NotFound(project_dir.to_path_buf()))
@@ -394,15 +579,45 @@ pub fn parse_for_import(
     manifest: &aube_manifest::PackageJson,
 ) -> Result<(LockfileGraph, LockfileKind), Error> {
     reject_bun_binary(project_dir)?;
-    for (path, kind) in lockfile_candidates(project_dir, /*include_aube=*/ false) {
+    for (path, kind) in read_candidates(project_dir, /*include_aube=*/ false) {
         if !path.exists() {
             continue;
         }
         let kind = refine_yarn_kind(&path, kind);
-        let graph = parse_one(&path, kind, manifest)?;
+        let graph = parse_one(&path, kind, manifest, ParseOptions::default())?;
         return Ok((graph, kind));
     }
     Err(Error::NotFound(project_dir.to_path_buf()))
+}
+
+/// [`lockfile_candidates`] reordered so the lockfile the project's declaration
+/// resolves to leads, with raw filename precedence breaking every remaining tie.
+///
+/// A read and a write must land on the SAME file. The write path asks
+/// [`crate::resolve_project_lockfile_kind`], which honors
+/// `packageManager`/`devEngines`; filename precedence cannot see either. So a
+/// declared-npm project carrying a stray `bun.lock` resolved against bun's
+/// graph and wrote it back out as `package-lock.json`, dropping the `resolved`,
+/// `license` and `engines` that bun's format cannot carry.
+///
+/// Reorder rather than filter: when the declaration contradicts the disk, or
+/// several tools' lockfiles coexist undeclared, detection errors and the read
+/// falls back to today's precedence, leaving the write path to raise that error
+/// as it already does.
+///
+/// Order by FAMILY, not exact kind — [`crate::resolve_project_lockfile_kind`]
+/// applies [`refine_yarn_kind`], so it answers `YarnBerry` where this list says
+/// `Yarn`. The sort is stable, so npm's shrinkwrap-first precedence survives.
+fn read_candidates(project_dir: &Path, include_aube: bool) -> Vec<(PathBuf, LockfileKind)> {
+    let mut candidates = lockfile_candidates(project_dir, include_aube);
+    if let Some(resolved) = crate::detect::resolve_project_lockfile_kind(project_dir)
+        .ok()
+        .and_then(|r| r.kind())
+    {
+        let want = crate::detect::family(resolved);
+        candidates.sort_by_key(|(_, kind)| crate::detect::family(*kind) != want);
+    }
+    candidates
 }
 
 /// If only `bun.lockb` is present (without a text `bun.lock`), surface an
@@ -424,11 +639,13 @@ pub(crate) fn lockfile_candidates(
     include_aube: bool,
 ) -> Vec<(PathBuf, LockfileKind)> {
     let basename = aube_util::embedder().lockfile_basename;
-    let stem = basename.rsplit_once('.').map_or(basename, |(s, _)| s);
 
     // The canonical (Aube) candidates: the branch-specific lockfile (if
     // `gitBranchLockfile` is on and we resolve a branch) then the plain
     // canonical lockfile, so a freshly-enabled branch still picks up the base.
+    // Then any LEGACY basenames the embedder still honors on read (a rename
+    // transition) — appended after the primary so the current name always wins
+    // when both are present.
     let mut aube_entries: Vec<(PathBuf, LockfileKind)> = Vec::new();
     if include_aube {
         let branch_name = aube_lock_filename(project_dir);
@@ -436,6 +653,9 @@ pub(crate) fn lockfile_candidates(
             aube_entries.push((project_dir.join(&branch_name), LockfileKind::Aube));
         }
         aube_entries.push((project_dir.join(basename), LockfileKind::Aube));
+        for legacy in aube_util::embedder().lockfile_legacy_basenames {
+            aube_entries.push((project_dir.join(legacy), LockfileKind::Aube));
+        }
     }
 
     // The foreign candidates, in their fixed precedence order. Preserve pnpm
@@ -443,13 +663,7 @@ pub(crate) fn lockfile_candidates(
     // mirrors the aube branch naming so a project already on pnpm branch
     // lockfiles keeps writing through that file.
     let mut foreign: Vec<(PathBuf, LockfileKind)> = Vec::new();
-    let pnpm_branch = {
-        let mut s = aube_lock_filename(project_dir);
-        if let Some(rest) = s.strip_prefix(&format!("{stem}.")) {
-            s = format!("pnpm-lock.{rest}");
-        }
-        s
-    };
+    let pnpm_branch = pnpm_lock_filename(project_dir);
     if pnpm_branch != "pnpm-lock.yaml" {
         foreign.push((project_dir.join(&pnpm_branch), LockfileKind::Pnpm));
     }
@@ -482,6 +696,7 @@ fn parse_one(
     path: &Path,
     kind: LockfileKind,
     manifest: &aube_manifest::PackageJson,
+    options: ParseOptions,
 ) -> Result<LockfileGraph, Error> {
     let _diag = aube_util::diag::Span::new(aube_util::diag::Category::Lockfile, "parse_one")
         .with_meta_fn(|| {
@@ -502,14 +717,14 @@ fn parse_one(
         // now — same parser, same writer — so we piggyback on the pnpm
         // module. Keeping the variant distinct lets detection/import
         // treat the two differently even though the bytes are the same.
-        LockfileKind::Aube | LockfileKind::Pnpm => pnpm::parse(path),
+        LockfileKind::Aube | LockfileKind::Pnpm => pnpm::parse_with_options(path, options),
         // yarn.rs::parse peeks the file for `__metadata:` and
         // dispatches between classic (v1) and berry (v2+) internally,
         // so we can hand both kinds to the same entry point. The
         // caller keeps the kind label it resolved from
         // `refine_yarn_kind` for downstream write-back.
         LockfileKind::Yarn | LockfileKind::YarnBerry => yarn::parse(path, manifest),
-        LockfileKind::Npm | LockfileKind::NpmShrinkwrap => npm::parse(path),
+        LockfileKind::Npm | LockfileKind::NpmShrinkwrap => npm::parse(path, manifest),
         LockfileKind::Bun => bun::parse(path),
     }?;
     validate_resolution_shapes(path, &graph)?;
@@ -875,6 +1090,58 @@ pub enum Error {
         /// Comma-joined filenames of the conflicting lockfiles.
         found: String,
     },
+    #[error(
+        "lockfile {path} contains named-registry package `{dep_path}` from `{registry_name}:`, which aube does not support yet"
+    )]
+    #[diagnostic(
+        code(ERR_AUBE_UNSUPPORTED_NAMED_REGISTRY),
+        help(
+            "aube cannot install this lockfile yet; use pnpm 11.20 or newer instead for this project"
+        )
+    )]
+    UnsupportedNamedRegistry {
+        path: std::path::PathBuf,
+        dep_path: String,
+        registry_name: String,
+    },
+    /// pnpm lockfile formats older than v9 (`lockfileVersion` 5.x /
+    /// 6.0, written by pnpm 8.x and earlier) put direct deps in a
+    /// top-level `dependencies:` map and key packages as
+    /// `/name@version`, with no `importers:` or `snapshots:`. Those
+    /// parse into an *empty* graph rather than failing, so without
+    /// this guard an install would link nothing and still exit 0.
+    #[error("lockfile {path} declares lockfileVersion {version}, which aube does not support")]
+    #[diagnostic(
+        code(ERR_AUBE_UNSUPPORTED_PNPM_LOCKFILE_VERSION),
+        help(
+            "aube reads pnpm lockfile version 9 (pnpm v9 and newer). regenerate it with `npx pnpm@latest install`, or delete the lockfile and run `aube install` to resolve from package.json"
+        )
+    )]
+    UnsupportedPnpmLockfileVersion {
+        path: std::path::PathBuf,
+        version: String,
+    },
+    /// A lockfile whose declared `lockfileVersion` is v9 or newer but
+    /// whose body is pre-v9 (top-level `dependencies:`, no
+    /// `importers:`). Shares the code above: the cause the user has to
+    /// act on, and the remedy, are the same as a declared pre-v9
+    /// version.
+    #[error(
+        "lockfile {path} declares lockfileVersion {version} but its body uses the pre-v9 pnpm layout ({marker})"
+    )]
+    #[diagnostic(
+        code(ERR_AUBE_UNSUPPORTED_PNPM_LOCKFILE_VERSION),
+        help(
+            "aube reads pnpm lockfile version 9 (pnpm v9 and newer). regenerate it with `npx pnpm@latest install`, or delete the lockfile and run `aube install` to resolve from package.json"
+        )
+    )]
+    PnpmLockfileLegacyLayout {
+        path: std::path::PathBuf,
+        version: String,
+        /// Which pre-v9 shape was seen, rendered into the message so the
+        /// user can see what gave the file away.
+        marker: String,
+    },
     #[error("failed to read lockfile {0}: {1}")]
     Io(std::path::PathBuf, std::io::Error),
     /// Structural/serialization lockfile errors that have no source
@@ -892,6 +1159,46 @@ pub enum Error {
         )
     )]
     ResolutionShapeMismatch(std::path::PathBuf, String, &'static str),
+    /// A lockfile entry names a dependency source (protocol) the reader
+    /// can't resolve from that lockfile — a `git`/`jsr`/unknown source in
+    /// a yarn.lock or bun.lock that a registry fetch can't satisfy.
+    /// Reclassifying it to a registry `name@version` would 404 at fetch
+    /// time (a confusing mid-install error past the abort window) or, for
+    /// berry, silently drop the dependency — either way the installed tree
+    /// diverges from the incumbent's. Raised at PLAN time (before any
+    /// `node_modules` write) so the refusal is eager and precise. Fields
+    /// stay machine-readable so embedders can render their own surface,
+    /// matching [`Error::DeclarationMismatch`]. Only emitted under an
+    /// embedder whose profile sets `strict_unsupported_source` (nub);
+    /// standalone aube keeps its prior reclassify/drop default.
+    #[error("lockfile {path} entry `{key}` uses the unsupported `{protocol}` source")]
+    #[diagnostic(
+        code(ERR_AUBE_LOCKFILE_UNSUPPORTED_SOURCE),
+        help(
+            "aube can't resolve this source from the lockfile — install with the package manager that wrote it, or remove the dependency"
+        )
+    )]
+    UnsupportedSource {
+        /// The lockfile path (also identifies the reader kind for remedy wording).
+        path: std::path::PathBuf,
+        /// The offending lockfile block key / spec (e.g. `foo@user/repo#abc`).
+        key: String,
+        /// The unsupported protocol token (`git`, `jsr`, `exec`, …).
+        protocol: String,
+    },
+    /// Two `patchedDependencies` version ranges both match one resolved
+    /// package, so the patch is ambiguous. Mirrors pnpm's
+    /// `PATCH_KEY_CONFLICT`. `message`/`hint` are pre-rendered by
+    /// [`crate::patch_groups::PatchKeyConflict`] so the wording stays in
+    /// one place.
+    #[error("{message}")]
+    #[diagnostic(code(ERR_AUBE_PATCH_KEY_CONFLICT), help("{hint}"))]
+    PatchKeyConflict { message: String, hint: String },
+    /// A `patchedDependencies` key's non-`*` version selector is not a
+    /// valid semver range. Mirrors pnpm's `PATCH_NON_SEMVER_RANGE`.
+    #[error("{0}")]
+    #[diagnostic(code(ERR_AUBE_PATCH_NON_SEMVER_RANGE))]
+    PatchNonSemverRange(String),
     /// Deserialization failure with a byte offset into the source
     /// content, so miette's `fancy` handler can draw a pointer at the
     /// offending byte of the lockfile. Reuses `aube_manifest`'s
@@ -927,6 +1234,20 @@ pub fn parse_json<T: serde::de::DeserializeOwned>(
 impl Error {
     pub fn parse(path: &std::path::Path, msg: impl Into<String>) -> Self {
         Error::Parse(path.to_path_buf(), msg.into())
+    }
+
+    /// Build an [`Error::UnsupportedSource`] for a lockfile entry whose
+    /// dependency source the reader can't resolve from that lockfile.
+    pub fn unsupported_source(
+        path: &std::path::Path,
+        key: impl Into<String>,
+        protocol: impl Into<String>,
+    ) -> Self {
+        Error::UnsupportedSource {
+            path: path.to_path_buf(),
+            key: key.into(),
+            protocol: protocol.into(),
+        }
     }
 
     pub fn parse_json_err(

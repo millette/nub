@@ -14,8 +14,10 @@ fn ctx<'a>(
     env: &'a [(String, String)],
 ) -> ResolveCtx<'a> {
     ResolveCtx {
+        managed_aube_config: &[],
         project_aube_config: &[],
         project_npmrc: npmrc,
+        project_config: &[],
         user_aube_config: &[],
         user_npmrc: &[],
         workspace_yaml: ws,

@@ -7,6 +7,168 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.5](https://github.com/aubepkg/aube/compare/aube-workspace-v2.2.4...aube-workspace-v2.2.5) - 2026-09-03
+
+### Other
+
+- move routine workflows to GitHub-hosted runners ([#1469](https://github.com/aubepkg/aube/pull/1469))
+- move project to aubepkg and aube.sh ([#1460](https://github.com/aubepkg/aube/pull/1460))
+- refresh benchmarks for v2.2.4 ([#1434](https://github.com/aubepkg/aube/pull/1434))
+
+## [2.2.4](https://github.com/jdx/aube/compare/aube-workspace-v2.2.3...aube-workspace-v2.2.4) - 2026-08-31
+
+### Other
+
+- refresh benchmarks for v2.2.3 ([#1417](https://github.com/jdx/aube/pull/1417))
+
+## [2.2.1](https://github.com/jdx/aube/compare/aube-workspace-v2.2.0...aube-workspace-v2.2.1) - 2026-08-29
+
+### Other
+
+- refresh benchmarks for v2.2.0 ([#1384](https://github.com/jdx/aube/pull/1384))
+- *(sponsors)* replace 37signals with omacom foundation ([#1380](https://github.com/jdx/aube/pull/1380))
+
+## [2.2.0](https://github.com/jdx/aube/compare/aube-workspace-v2.1.0...aube-workspace-v2.2.0) - 2026-08-25
+
+### Other
+
+- refresh benchmarks for v2.1.0 ([#1372](https://github.com/jdx/aube/pull/1372))
+
+## [2.1.0](https://github.com/jdx/aube/compare/aube-workspace-v2.0.1...aube-workspace-v2.1.0) - 2026-08-23
+
+### Other
+
+- refresh benchmarks for v2.0.1 ([#1350](https://github.com/jdx/aube/pull/1350))
+
+## [1.41.0](https://github.com/jdx/aube/compare/aube-workspace-v1.40.0...aube-workspace-v1.41.0) - 2026-08-16
+
+### Other
+
+- refresh benchmarks for v1.40.0 ([#1290](https://github.com/jdx/aube/pull/1290))
+
+## [1.40.0](https://github.com/jdx/aube/compare/aube-workspace-v1.39.0...aube-workspace-v1.40.0) - 2026-08-13
+
+### Other
+
+- refresh benchmarks for v1.39.0 ([#1285](https://github.com/jdx/aube/pull/1285))
+- Update Star History chart links with sealed tokens
+
+## [1.39.0](https://github.com/jdx/aube/compare/aube-workspace-v1.38.1...aube-workspace-v1.39.0) - 2026-08-12
+
+### Other
+
+- refresh benchmarks for v1.38.1 ([#1257](https://github.com/jdx/aube/pull/1257))
+
+## [1.38.1](https://github.com/jdx/aube/compare/aube-workspace-v1.38.0...aube-workspace-v1.38.1) - 2026-08-10
+
+### Other
+
+- refresh benchmarks for v1.38.0 ([#1244](https://github.com/jdx/aube/pull/1244))
+
+## [1.38.0](https://github.com/jdx/aube/compare/aube-workspace-v1.37.0...aube-workspace-v1.38.0) - 2026-08-07
+
+### Other
+
+- refresh benchmarks for v1.37.0 ([#1211](https://github.com/jdx/aube/pull/1211))
+- refresh benchmarks for v1.37.0 ([#1206](https://github.com/jdx/aube/pull/1206))
+
+## [1.37.0](https://github.com/jdx/aube/compare/aube-workspace-v1.36.0...aube-workspace-v1.37.0) - 2026-07-31
+
+### Added
+
+- *(scripts)* use pnpm trusted dependency list ([#1199](https://github.com/jdx/aube/pull/1199))
+
+### Other
+
+- refresh benchmarks for v1.36.0 ([#1185](https://github.com/jdx/aube/pull/1185))
+
+## [1.36.0](https://github.com/jdx/aube/compare/aube-workspace-v1.35.0...aube-workspace-v1.36.0) - 2026-07-29
+
+### Other
+
+- refresh benchmarks for v1.35.0 ([#1172](https://github.com/jdx/aube/pull/1172))
+
+## [1.35.0](https://github.com/jdx/aube/compare/aube-workspace-v1.34.0...aube-workspace-v1.35.0) - 2026-07-28
+
+### Added
+
+- *(embed)* add configurable workspace discovery ([#1169](https://github.com/jdx/aube/pull/1169))
+
+### Other
+
+- refresh benchmarks for v1.34.0 ([#1124](https://github.com/jdx/aube/pull/1124))
+
+## [1.33.0](https://github.com/jdx/aube/compare/aube-workspace-v1.32.0...aube-workspace-v1.33.0) - 2026-07-25
+
+### Other
+
+- refresh benchmarks for v1.32.0 ([#1080](https://github.com/jdx/aube/pull/1080))
+
+## [1.32.0](https://github.com/jdx/aube/compare/aube-workspace-v1.31.0...aube-workspace-v1.32.0) - 2026-07-22
+
+### Other
+
+- refresh benchmarks for v1.31.0 ([#1072](https://github.com/jdx/aube/pull/1072))
+
+## [1.30.0](https://github.com/jdx/aube/compare/aube-workspace-v1.29.1...aube-workspace-v1.30.0) - 2026-07-20
+
+### Other
+
+- refresh benchmarks for v1.29.1 ([#1060](https://github.com/jdx/aube/pull/1060))
+
+## [1.29.0](https://github.com/jdx/aube/compare/aube-workspace-v1.28.0...aube-workspace-v1.29.0) - 2026-07-16
+
+### Other
+
+- refresh benchmarks for v1.28.0 ([#1050](https://github.com/jdx/aube/pull/1050))
+
+## [1.28.0](https://github.com/jdx/aube/compare/aube-workspace-v1.27.0...aube-workspace-v1.28.0) - 2026-07-16
+
+### Other
+
+- refresh benchmarks for v1.27.0 ([#1041](https://github.com/jdx/aube/pull/1041))
+
+## [1.27.0](https://github.com/jdx/aube/compare/aube-workspace-v1.26.0...aube-workspace-v1.27.0) - 2026-07-13
+
+### Other
+
+- refresh benchmarks for v1.26.0 ([#1002](https://github.com/jdx/aube/pull/1002))
+
+## [1.26.0](https://github.com/jdx/aube/compare/aube-workspace-v1.25.2...aube-workspace-v1.26.0) - 2026-07-06
+
+### Other
+
+- Update sponsor references for jdx.dev ([#978](https://github.com/jdx/aube/pull/978))
+- refresh benchmarks for v1.25.2 ([#975](https://github.com/jdx/aube/pull/975))
+
+## [1.25.2](https://github.com/jdx/aube/compare/aube-workspace-v1.25.1...aube-workspace-v1.25.2) - 2026-07-01
+
+### Other
+
+- refresh benchmarks for v1.25.1 ([#962](https://github.com/jdx/aube/pull/962))
+
+## [1.25.1](https://github.com/jdx/aube/compare/aube-workspace-v1.25.0...aube-workspace-v1.25.1) - 2026-06-25
+
+### Other
+
+- refresh benchmarks for v1.25.0 ([#947](https://github.com/jdx/aube/pull/947))
+
+## [1.25.0](https://github.com/jdx/aube/compare/aube-workspace-v1.24.0...aube-workspace-v1.25.0) - 2026-06-25
+
+### Added
+
+- *(runtime)* add shell-activated tool shims ([#945](https://github.com/jdx/aube/pull/945))
+
+### Other
+
+- refresh benchmarks for v1.24.0 ([#937](https://github.com/jdx/aube/pull/937))
+
+## [1.24.0](https://github.com/jdx/aube/compare/aube-workspace-v1.23.0...aube-workspace-v1.24.0) - 2026-06-23
+
+### Other
+
+- refresh benchmarks for v1.23.0 ([#922](https://github.com/jdx/aube/pull/922))
+
 ## [1.23.0](https://github.com/jdx/aube/compare/aube-workspace-v1.22.0...aube-workspace-v1.23.0) - 2026-06-21
 
 ### Other

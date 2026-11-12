@@ -4,9 +4,9 @@ import { baseOptions } from '@/lib/layout.shared';
 import { guidesSource } from '@/lib/source';
 
 export default function Layout({ children }: { children: ReactNode }) {
-  // Keep the nav title + GitHub link, but drop the "Docs"/"Blog" nav links
-  // from the guides sidebar — they only belong in the top home nav. Guides are
-  // a separate top-level section, distinct from the docs sidebar.
+  // Drop the "Docs"/"Blog" nav links AND the GitHub pill from the guides sidebar
+  // — the pill lives in the home nav only. Guides are a separate top-level
+  // section, distinct from the docs sidebar.
   const { links, ...base } = baseOptions();
 
   return (

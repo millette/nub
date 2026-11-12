@@ -6,14 +6,16 @@ name: Verify install scripts
 # no publish step required. Complements the release's `Test install` jobs, which
 # only exercise `npm install -g` and never touch the curl/irm script path.
 #
-# Three guarantees enforced here beyond a basic smoke:
+# Four guarantees enforced here beyond a basic smoke:
 #   1. drift-guard: site/public/install.{sh,ps1} must be byte-for-byte identical to
 #      root install.{sh,ps1} (catches stale site-served copies before they reach users).
 #   2. nubx: every job asserts nubx exists AND runs after install (argv[0] dispatch is
 #      historically the first thing to regress after a packaging change).
 #   3. macOS 403 fix: curl uses a token-auth header on raw.githubusercontent.com so the
 #      CI runner never hits the unauthenticated rate-limit that caused intermittent 403s
-#      on macos-14.
+#      on macos-15.
+#   4. checksum ordering: local fixtures prove malformed or mismatched sidecars fail
+#      before the existing install is removed or the archive is extracted.
 
 on:
   workflow_dispatch:
@@ -27,15 +29,31 @@ on:
         required: false
         default: "https://raw.githubusercontent.com/nubjs/nub/main"
   push:
+    # Trunk only — an unrestricted push ran this on every feature branch, around the
+    # opt-in gate. The pull_request trigger below keeps the pre-merge coverage.
+    branches: [main]
     paths:
       - install.sh
       - install.ps1
       - site/public/install.sh
       - site/public/install.ps1
+      - tests/installer/checksums.sh
+      - tests/installer/checksums.ps1
+      - .github/workflows/verify-install.yml
+  pull_request:
+    # PR CI is opt-in — request a run with `gh pr edit <n> --add-label ci`. Rationale: ci.yml.
+    types: [labeled]
+    paths:
+      - install.sh
+      - install.ps1
+      - site/public/install.sh
+      - site/public/install.ps1
+      - tests/installer/checksums.sh
+      - tests/installer/checksums.ps1
       - .github/workflows/verify-install.yml
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event.label.name != 'ci' && github.event.label.name != 'ci-full' && github.event.label.name || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -46,10 +64,13 @@ jobs:
   # A site deploy with a stale installer is a silent regression — users hit a broken
   # script while the root copy looks fine. This job catches that on every push.
   drift-guard:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full'
     name: drift-guard (root ↔ site/public)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
       - name: Assert install.sh in sync
         run: |
           if ! diff --unified install.sh site/public/install.sh; then
@@ -66,6 +87,7 @@ jobs:
           echo "install.ps1: in sync ✓"
 
   ps1:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full'
     name: install.ps1 · ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -73,14 +95,22 @@ jobs:
         os: [windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Verify checksum handling against local fixtures
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/installer/checksums.ps1
       - name: Install via install.ps1 (the real `irm | iex` path)
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INSTALL_SOURCE: ${{ github.event.inputs.source || 'https://raw.githubusercontent.com/nubjs/nub/main' }}
+          INSTALL_VERSION: ${{ github.event.inputs.version || 'latest' }}
         run: |
           $ErrorActionPreference = "Stop"
-          $src = "${{ github.event.inputs.source || 'https://raw.githubusercontent.com/nubjs/nub/main' }}"
-          $ver = "${{ github.event.inputs.version || 'latest' }}"
+          $src = $env:INSTALL_SOURCE
+          $ver = $env:INSTALL_VERSION
           $headers = @{}
           # Pass a token when fetching from raw.githubusercontent.com to avoid
           # the unauthenticated rate-limit (403) that bites CI runners.
@@ -104,6 +134,37 @@ jobs:
           $exex = "$env:USERPROFILE\.nub\bin\nubx.exe"
           if (-not (Test-Path $exex)) { throw "install.ps1 did not create nubx.exe at $exex" }
           & $exex --version
+      # `nub pm shim` hardlinks %USERPROFILE%\.nub\shims\<pm>.exe at nub.exe. The
+      # installer wipes and re-extracts bin\, so without a refresh those entries keep
+      # serving the pre-upgrade binary — silently, since a same-version reinstall
+      # leaves them byte-identical. Seeding them with sentinel content is what makes
+      # "did the refresh run" observable at all. Only two of the six names, so the
+      # refresh-only contract is testable: the other four must stay absent.
+      #
+      # Runs the CHECKED-OUT install.ps1, not the fetched one: every step above
+      # deliberately pulls from the source branch to prove the SERVED copy works,
+      # which on a pull request means it never executes the branch's own changes.
+      # A regression check has to run the artifact under review.
+      - name: Reinstall re-links existing PM shims
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $shims = "$env:USERPROFILE\.nub\shims"
+          New-Item -ItemType Directory -Force -Path $shims | Out-Null
+          Set-Content -LiteralPath "$shims\npm.exe" -Value "pre-upgrade sentinel"
+          Set-Content -LiteralPath "$shims\yarn.exe" -Value "pre-upgrade sentinel"
+
+          & "$env:GITHUB_WORKSPACE\install.ps1"
+
+          $nubHash = (Get-FileHash "$env:USERPROFILE\.nub\bin\nub.exe").Hash
+          foreach ($n in @('npm', 'yarn')) {
+            $h = (Get-FileHash "$shims\$n.exe").Hash
+            if ($h -ne $nubHash) { throw "$n.exe still holds the pre-upgrade bytes — the shim refresh did not run" }
+          }
+          foreach ($n in @('npx', 'pnpm', 'pnpx', 'yarnpkg')) {
+            if (Test-Path -LiteralPath "$shims\$n.exe") { throw "installer created $n.exe, a shim the user never opted into" }
+          }
+          if (Test-Path -LiteralPath "$env:USERPROFILE\.nub\shims.lock") { throw "shim lock left behind" }
       - name: PATH persisted for a brand-new shell
         shell: pwsh
         run: |
@@ -115,21 +176,24 @@ jobs:
           nub --version
 
   sh:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full'
     name: install.sh · ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15-intel, macos-14]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15-intel, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Install via install.sh (the real `curl | bash` path)
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INSTALL_SOURCE: ${{ github.event.inputs.source || 'https://raw.githubusercontent.com/nubjs/nub/main' }}
+          INSTALL_VERSION: ${{ github.event.inputs.version || 'latest' }}
         run: |
           set -euo pipefail
-          src="${{ github.event.inputs.source || 'https://raw.githubusercontent.com/nubjs/nub/main' }}"
-          ver="${{ github.event.inputs.version || 'latest' }}"
+          src="$INSTALL_SOURCE"
+          ver="$INSTALL_VERSION"
           # Pass a token when fetching from raw.githubusercontent.com to avoid
           # the unauthenticated rate-limit (403) that bites macOS CI runners.
           auth_arg=()
@@ -164,6 +228,7 @@ jobs:
             || { echo "install.sh did not add ~/.nub/bin to any shell rc"; exit 1; }
 
   musl:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full'
     name: install.sh · linux-${{ matrix.arch }}-musl
     strategy:
       fail-fast: false
@@ -184,10 +249,13 @@ jobs:
         # and the token is not injected by default. The musl leg exercises the exact
         # same curl path as a real user (unauthenticated) — rate-limit risk is low
         # because the container IP isn't shared with macOS runners that exhaust the limit.
+        env:
+          INSTALL_SOURCE: ${{ github.event.inputs.source || 'https://raw.githubusercontent.com/nubjs/nub/main' }}
+          INSTALL_VERSION: ${{ github.event.inputs.version || 'latest' }}
         run: |
           set -euo pipefail
-          src="${{ github.event.inputs.source || 'https://raw.githubusercontent.com/nubjs/nub/main' }}"
-          ver="${{ github.event.inputs.version || 'latest' }}"
+          src="$INSTALL_SOURCE"
+          ver="$INSTALL_VERSION"
           if [ "$ver" = "latest" ]; then curl -fsSL "$src/install.sh" | bash
           else curl -fsSL "$src/install.sh" | bash -s -- "$ver"; fi
       - name: Binary runs (direct path)
@@ -205,3 +273,32 @@ jobs:
             exit 1
           fi
           "$nubx_path" --version
+
+  # Exercises the REPO's install.sh (not the main-served copy) against sandbox
+  # HOMEs to assert the customization knobs: per-shell PATH lines, the .nub-receipt
+  # marker, NUB_INSTALL_DIR relocation, and the NUB_NO_MODIFY_PATH opt-out. This is
+  # the only job that validates the branch's own script changes end-to-end (the
+  # curl-based jobs above fetch from `source`, which defaults to main).
+  harness:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full'
+    name: install.sh harness · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Verify checksum handling against local fixtures
+        shell: bash
+        run: bash tests/installer/checksums.sh
+      - name: Run tests/installer/run.sh
+        shell: bash
+        env:
+          # The harness's install.sh authenticates the releases/latest API call to
+          # dodge the unauthenticated rate-limit (403) on shared CI IPs.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_COLOR: "0"
+        run: bash tests/installer/run.sh

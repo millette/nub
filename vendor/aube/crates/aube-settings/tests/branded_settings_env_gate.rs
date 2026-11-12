@@ -28,6 +28,7 @@ static MYTOOL_NO_BRANDED_ENV: Embedder = Embedder {
     self_names: &["mytool"],
     compatible_names: &["pnpm"],
     lockfile_basename: "lock.yaml",
+    lockfile_legacy_basenames: &[],
     workspace_yaml: Some("mytool-workspace.yaml"),
     manifest_namespace: "mytool",
     // Branded prefix is *still set* — proving the toggle is independent of
@@ -35,16 +36,29 @@ static MYTOOL_NO_BRANDED_ENV: Embedder = Embedder {
     // MYTOOL_* var: with the family disabled, no branded settings var is read.
     env_prefix: Some("MYTOOL"),
     config_env_prefix: Some("MYTOOL"),
+    diag_env_prefix: Some("MYTOOL"),
     cache_namespace: "mytool",
     data_namespace: "mytool",
+    virtual_store_subdir: "virtual-store",
+    managed_config_system_dir: Some("mytool"),
+    config_namespace: Some("mytool"),
     canonical_lockfile_always_wins: true,
     runtime_switching: true,
     self_engines_check: true,
     self_update_enabled: true,
     warm_store_verify: true,
     read_branded_settings_env: false,
+    gvs_incompatible_warning: true,
+    gvs_over_default_hoist: false,
     no_churn_lockfile_write: false,
     primer_ttl: None,
+    cpu_budget: None,
+    tty_progress: false,
+    rich_update_picker: false,
+    strict_unsupported_source: false,
+    trust_policy_ignore_after_default: None,
+    extra_settings_fingerprint: None,
+    unsupported_settings: &[],
 };
 
 fn ctx<'a>(
@@ -52,8 +66,10 @@ fn ctx<'a>(
     env: &'a [(String, String)],
 ) -> ResolveCtx<'a> {
     ResolveCtx {
+        managed_aube_config: &[],
         project_aube_config: &[],
         project_npmrc: &[],
+        project_config: &[],
         user_aube_config: &[],
         user_npmrc: &[],
         workspace_yaml: ws,

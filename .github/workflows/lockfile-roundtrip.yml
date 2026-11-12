@@ -28,12 +28,16 @@ name: Lockfile round-trip
 #             mutation differential, all PMs. The mutation leg is nightly-only
 #             (no per-PR gate) because it is heavier than a static round-trip.
 #
-# Real registry installs run, so these need network. Known-red scenarios live in
-# each harness's expected-failures.txt and must shrink (a stale entry fails the
-# run).
+# The per-PR tight set resolves from a pre-seeded offline Verdaccio registry
+# (tests/registry/) — zero registry.npmjs.org calls, fully hermetic. The nightly
+# full matrix (which includes git-dep + all conversion/mutation legs) still
+# needs network. Known-red scenarios live in each harness's expected-failures.txt
+# and must shrink (a stale entry fails the run).
 
 on:
   pull_request:
+    # Not part of plain `ci`: request a run with `gh pr edit <n> --add-label ci-full`. Rationale: ci.yml.
+    types: [labeled]
     branches: [main]
     paths:
       - "tests/conformance/**"
@@ -55,8 +59,14 @@ on:
     - cron: "0 7 * * *"
   workflow_dispatch: {}
 
+permissions: {}
+
+# The event name is part of the group so a trunk push cannot cancel the nightly
+# schedule run. rust-cache saves in a post-step that a cancelled job never reaches,
+# and 34 of the last 39 push:main runs were cancelled by the next push — so the
+# nightly is the one run guaranteed to refresh every trunk-scoped cache key.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{ github.event.label.name != 'ci-full' && github.event.label.name || '' }}
   cancel-in-progress: true
 
 env:
@@ -73,13 +83,20 @@ jobs:
   conformance-pr:
     name: drop-in round-trip, tight set (ubuntu)
     # Skip the scheduled run — the nightly job covers the full set.
-    if: github.event_name != 'schedule'
+    if: (github.event_name != 'pull_request' || github.event.label.name == 'ci-full') && (github.event_name != 'schedule')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable # zizmor: ignore[impostor-commit,ref-version-mismatch] dtolnay force-pushes its version tags, so pinned SHAs go unreachable; commit verified genuine upstream
+      # Trunk writes, pull requests read — see the note in daily-driver.yml.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: "24"
@@ -87,31 +104,66 @@ jobs:
         with:
           bun-version: ${{ env.BUN_PIN }}
       - name: Pin package managers on PATH
-        run: |
+        run: | # zizmor: ignore[adhoc-packages] versions pinned via workflow-level *_PIN env vars
           npm install -g "npm@${NPM_PIN}" "pnpm@${PNPM_PIN}"
           echo "npm:  $(npm --version)"
           echo "pnpm: $(pnpm --version)"
           echo "bun:  $(bun --version)"
       - name: Build nub
         run: cargo build -p nub-cli
+      - name: Start offline Verdaccio test registry
+        # Start the pre-seeded offline registry so the tight set resolves every
+        # package from localhost with zero registry.npmjs.org calls. The storage
+        # dir is committed under tests/registry/storage/ with the full transitive
+        # graph of every tight-set fixture (seeded via tests/registry/seed.mts).
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tests/registry
+          npm ci
+          npm test
+          node_modules/.bin/verdaccio --config config.yaml --listen "127.0.0.1:4874" > /tmp/nub-verdaccio.log 2>&1 &
+          cd "$GITHUB_WORKSPACE"
+          for _ in $(seq 1 50); do
+            if curl --silent --fail http://localhost:4874/is-positive >/dev/null 2>&1; then break; fi
+            sleep 0.2
+          done
+          curl --silent --fail http://localhost:4874/is-positive >/dev/null
       - name: Drop-in round-trip (tight fixture set, no yarn)
         # The tight set: table-stakes (simple, scoped) + the feature fixtures
         # that exercise the bug-prone diverging fields. yarn is skipped here to
         # keep the PR gate fast; the nightly job runs it.
+        #
+        # git-dep is excluded from the per-PR tight set — it resolves from
+        # github.com (not the npm registry), so it can't be served by the offline
+        # Verdaccio registry. The nightly full-matrix job covers it.
+        #
+        # NUB_TEST_REGISTRY steers every PM (via .npmrc / bunfig.toml written by
+        # run.sh's configure_offline_registry) + nub itself to the offline
+        # Verdaccio, so the tight set is fully hermetic.
         env:
           SKIP_YARN: "1"
-        run: tests/conformance/run.sh target/debug/nub simple scoped peers overrides-ref overrides-nested patched-deps catalog workspace workspace-dedup empty-root-importer git-dep platform-optional dist-tag-spec range-forms alias-scoped has-install-script injected-deps
+          NUB_TEST_REGISTRY: "http://localhost:4874"
+          NO_PROXY: "localhost,127.0.0.1"
+        run: tests/conformance/run.sh target/debug/nub simple scoped peers overrides-ref overrides-nested patched-deps catalog workspace workspace-dedup empty-root-importer platform-optional dist-tag-spec range-forms alias-scoped has-install-script injected-deps
 
   # ── Nightly: full conformance matrix + full conversion matrix ─────────────
   conformance-nightly:
     name: drop-in round-trip, full matrix (ubuntu)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name != 'pull_request' || github.event.label.name == 'ci-full') && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable # zizmor: ignore[impostor-commit,ref-version-mismatch] dtolnay force-pushes its version tags, so pinned SHAs go unreachable; commit verified genuine upstream
+      # Trunk writes, pull requests read — see the note in daily-driver.yml.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: "24"
@@ -119,7 +171,7 @@ jobs:
         with:
           bun-version: ${{ env.BUN_PIN }}
       - name: Pin package managers on PATH
-        run: |
+        run: | # zizmor: ignore[adhoc-packages] versions pinned via workflow-level *_PIN env vars
           npm install -g "npm@${NPM_PIN}" "pnpm@${PNPM_PIN}" "yarn@${YARN_PIN}"
           echo "npm:  $(npm --version)"
           echo "pnpm: $(pnpm --version)"
@@ -132,13 +184,20 @@ jobs:
 
   conversion-nightly:
     name: cross-format conversion, full matrix (ubuntu)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name != 'pull_request' || github.event.label.name == 'ci-full') && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable # zizmor: ignore[impostor-commit,ref-version-mismatch] dtolnay force-pushes its version tags, so pinned SHAs go unreachable; commit verified genuine upstream
+      # Trunk writes, pull requests read — see the note in daily-driver.yml.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: "24"
@@ -146,7 +205,7 @@ jobs:
         with:
           bun-version: ${{ env.BUN_PIN }}
       - name: Pin package managers on PATH
-        run: |
+        run: | # zizmor: ignore[adhoc-packages] versions pinned via workflow-level *_PIN env vars
           npm install -g "npm@${NPM_PIN}" "pnpm@${PNPM_PIN}" "yarn@${YARN_PIN}"
           echo "npm:  $(npm --version)"
           echo "pnpm: $(pnpm --version)"
@@ -166,13 +225,20 @@ jobs:
   # write-path mutation), so this matrix is npm/pnpm/bun and skips the yarn pin.
   mutation-nightly:
     name: lockfile mutation differential, full matrix (ubuntu)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name != 'pull_request' || github.event.label.name == 'ci-full') && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable # zizmor: ignore[impostor-commit,ref-version-mismatch] dtolnay force-pushes its version tags, so pinned SHAs go unreachable; commit verified genuine upstream
+      # Trunk writes, pull requests read — see the note in daily-driver.yml.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: "24"
@@ -180,7 +246,7 @@ jobs:
         with:
           bun-version: ${{ env.BUN_PIN }}
       - name: Pin package managers on PATH
-        run: |
+        run: | # zizmor: ignore[adhoc-packages] versions pinned via workflow-level *_PIN env vars
           npm install -g "npm@${NPM_PIN}" "pnpm@${PNPM_PIN}"
           echo "npm:  $(npm --version)"
           echo "pnpm: $(pnpm --version)"

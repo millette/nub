@@ -6,13 +6,17 @@
     "watch",
     "run",
     "nubx",
+    "standalone",
+    "compile",
+    "init",
     "install",
     "node",
     "pm",
-    "pm-shim",
+    "config",
+    "deployment",
+    "plugins",
     "faq",
     "---",
-    "setup-nub",
-    "docker"
+    "[Guides](/guides)"
   ]
 }

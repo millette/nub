@@ -4,8 +4,10 @@
 //!
 //! The lockfile-reading verbs are offline-testable against a handcrafted
 //! `pnpm-lock.yaml` (the engine reads the graph straight from the lockfile).
-//! `outdated`/`audit` need registry data and follow the `#[ignore]` +
-//! self-skip convention from `install_engine.rs` — run via
+//! `outdated`/`audit` need registry data and follow the two conventions from
+//! `install_engine.rs`: a test whose packages are seeded in the offline test
+//! registry runs under `NUB_TEST_REGISTRY` (`source tests/registry/start.bash`),
+//! and the rest are `#[ignore]` + self-skip — run via
 //! `cargo test -p nub-cli --test info_engine -- --ignored`.
 
 use std::path::{Path, PathBuf};
@@ -34,16 +36,48 @@ fn pm_tmpdir(tag: &str) -> PathBuf {
     dir
 }
 
+/// The Verdaccio offline test registry URL (set by `tests/registry/start.bash`
+/// via `NUB_TEST_REGISTRY`). When set, tests run against the pre-seeded
+/// offline registry instead of registry.npmjs.org.
+fn test_registry() -> Option<String> {
+    std::env::var("NUB_TEST_REGISTRY")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Point a `Command` at the offline Verdaccio registry when
+/// `NUB_TEST_REGISTRY` is set: writes a project `.npmrc` + bypasses any
+/// inherited HTTP_PROXY for localhost. No-op when the env var is unset.
+fn apply_test_registry(cmd: &mut Command, dir: &Path) {
+    if let Some(registry) = test_registry() {
+        let npmrc = dir.join(".npmrc");
+        let existing = std::fs::read_to_string(&npmrc).unwrap_or_default();
+        if !existing
+            .lines()
+            .any(|l| l.trim_start().starts_with("registry="))
+        {
+            let prefix = if existing.is_empty() || existing.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            std::fs::write(&npmrc, format!("{existing}{prefix}registry={registry}\n")).unwrap();
+        }
+        cmd.env("NO_PROXY", "localhost,127.0.0.1")
+            .env("no_proxy", "localhost,127.0.0.1");
+    }
+}
+
 /// Spawn `nub <args>` in `dir` with the engine store/cache isolated to fresh
 /// temp roots so tests never touch the dev box's real store.
 fn run_nub(dir: &Path, args: &[&str]) -> (String, String, i32) {
-    let out = Command::new(nub_binary())
-        .args(args)
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(args)
         .current_dir(dir)
         .env("XDG_DATA_HOME", pm_tmpdir("xdg-data"))
-        .env("XDG_CACHE_HOME", pm_tmpdir("xdg-cache"))
-        .output()
-        .expect("failed to spawn nub");
+        .env("XDG_CACHE_HOME", pm_tmpdir("xdg-cache"));
+    apply_test_registry(&mut cmd, dir);
+    let out = cmd.output().expect("failed to spawn nub");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
@@ -51,7 +85,8 @@ fn run_nub(dir: &Path, args: &[&str]) -> (String, String, i32) {
     )
 }
 
-/// Offline guard for the `#[ignore]` network tests.
+/// Offline guard for the `#[ignore]` network tests: true when the registry
+/// answers a TCP connect within 3s.
 fn registry_reachable() -> bool {
     use std::net::{TcpStream, ToSocketAddrs};
     "registry.npmjs.org:443"
@@ -453,10 +488,9 @@ fn audit_fix_update_refuses_to_touch_yarn_lock() {
 /// manifest range reports drift and exits 1 (pnpm-compat). is-positive's
 /// latest has been 3.1.0 for years — stable fixture data.
 #[test]
-#[ignore = "network: fetches the is-positive packument from the npm registry"]
 fn outdated_reports_registry_drift_and_exits_one() {
-    if !registry_reachable() {
-        eprintln!("skipping: registry.npmjs.org unreachable");
+    if test_registry().is_none() {
+        eprintln!("skipping: NUB_TEST_REGISTRY not set — run: source tests/registry/start.bash");
         return;
     }
     let dir = lockfile_fixture(
@@ -474,6 +508,55 @@ fn outdated_reports_registry_drift_and_exits_one() {
     assert!(
         stdout.contains("is-positive") && stdout.contains("3.0.0") && stdout.contains("3.1.0"),
         "the drift row must show current and wanted: {stdout}"
+    );
+    assert_no_engine_branding(&[("stdout", &stdout), ("stderr", &stderr)]);
+}
+
+/// `outdated` under a release-age window that admits nothing (#722).
+///
+/// The report used to offer an upgrade the resolver would then refuse, so it
+/// exited 1 forever and no `nub update` could clear it. The columns now agree
+/// with the resolver, and the window is honored SILENTLY — the same way
+/// `install` and `update` honor it — so a project with no installable upgrade
+/// reports nothing and exits 0.
+///
+/// This lives here rather than beside the implementation because it drives the
+/// `nub` binary end to end, which the unit tests beside `collect_rows` cannot.
+/// (`vendor/aube`'s own test targets do run in CI, via the `Aube parity`
+/// workflow — the root workspace is what never builds a path dependency's
+/// tests, not CI as a whole.)
+#[test]
+#[ignore = "network: fetches the is-positive packument from the npm registry"]
+fn outdated_honors_the_release_age_window_silently_and_exits_zero() {
+    if !registry_reachable() {
+        eprintln!("skipping: registry.npmjs.org unreachable");
+        return;
+    }
+    let dir = lockfile_fixture(
+        "outdated-age",
+        "is-positive",
+        "^3.0.0",
+        "3.0.0",
+        IS_POSITIVE_300,
+    );
+    // A century-wide window. is-positive's newest release went up in January
+    // 2016, so the window has to reach back past that to bite at all — a
+    // decade is NOT enough and leaves this test asserting on an ungated run.
+    std::fs::write(dir.join(".npmrc"), "minimumReleaseAge=52560000\n").unwrap();
+
+    let (stdout, stderr, code) = run_nub(&dir, &["outdated"]);
+    assert_eq!(
+        code, 0,
+        "an upgrade nub would refuse to install must not fail the command: \
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("3.1.0"),
+        "3.1.0 is inside the window, so the report must not offer it: {stdout}"
+    );
+    assert!(
+        !stdout.contains("minimumReleaseAge") && !stdout.contains('*'),
+        "the window is the project's own policy and is honored without remark: {stdout}"
     );
     assert_no_engine_branding(&[("stdout", &stdout), ("stderr", &stderr)]);
 }

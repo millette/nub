@@ -1,6 +1,6 @@
 {
   "name": "@nubjs/nub-linux-x64-musl",
-  "version": "0.1.14",
+  "version": "0.10.0",
   "description": "Nub binary for linux-x64-musl",
   "license": "MIT",
   "repository": "https://github.com/nubjs/nub",
@@ -11,8 +11,7 @@
     "x64"
   ],
   "files": [
-    "bin",
-    "runtime"
+    "bin"
   ],
   "libc": [
     "musl"

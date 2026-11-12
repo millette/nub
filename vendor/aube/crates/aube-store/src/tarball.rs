@@ -1,6 +1,161 @@
 use crate::{Error, PackageIndex, Store, StoredFile};
 use std::path::Path;
 
+/// Deterministic fingerprint of a directory imported as a `file:` package.
+///
+/// This deliberately mirrors [`Store::import_directory`]: `.git` and
+/// `node_modules` directories are skipped, non-files are ignored, and each
+/// relative path, content hash, and executable bit contributes to the result.
+/// The install freshness check uses it without writing the files to the CAS.
+pub fn directory_content_fingerprint(dir: &Path) -> Result<String, Error> {
+    let entries = collect_directory_fingerprints(dir, true)?;
+    Ok(content_fingerprint(&entries))
+}
+
+/// Metadata-only fingerprint for the same tree as
+/// [`directory_content_fingerprint`]. This stats every included file but does
+/// not read its contents, letting warm install checks avoid unbounded file I/O
+/// when the source tree is unchanged.
+pub fn directory_metadata_fingerprint(dir: &Path) -> Result<String, Error> {
+    let entries = collect_directory_fingerprints(dir, false)?;
+    Ok(metadata_fingerprint(&entries))
+}
+
+/// Compute content and metadata fingerprints in one directory walk.
+///
+/// State writes need both values. Combining them avoids a second traversal
+/// after reading the source files for the authoritative content fingerprint.
+pub fn directory_fingerprints(dir: &Path) -> Result<(String, String), Error> {
+    let entries = collect_directory_fingerprints(dir, true)?;
+    Ok((
+        content_fingerprint(&entries),
+        metadata_fingerprint(&entries),
+    ))
+}
+
+#[derive(Debug)]
+struct DirectoryFileFingerprint {
+    path: String,
+    content_hash: Option<String>,
+    executable: bool,
+    size: u64,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+}
+
+fn content_fingerprint(entries: &[DirectoryFileFingerprint]) -> String {
+    let mut entries: Vec<(&str, &str, bool)> = entries
+        .iter()
+        .filter_map(|entry| {
+            Some((
+                entry.path.as_str(),
+                entry.content_hash.as_deref()?,
+                entry.executable,
+            ))
+        })
+        .collect();
+    entries.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for (path, hex_hash, executable) in entries {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(hex_hash.as_bytes());
+        hasher.update(if executable { b"\x01" } else { b"\x00" });
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn metadata_fingerprint(entries: &[DirectoryFileFingerprint]) -> String {
+    let mut entries: Vec<&DirectoryFileFingerprint> = entries.iter().collect();
+    entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    let mut hasher = blake3::Hasher::new();
+    for entry in entries {
+        hasher.update(entry.path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&entry.size.to_le_bytes());
+        hasher.update(&entry.mtime_secs.to_le_bytes());
+        hasher.update(&entry.mtime_nanos.to_le_bytes());
+        hasher.update(if entry.executable { b"\x01" } else { b"\x00" });
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn collect_directory_fingerprints(
+    dir: &Path,
+    hash_content: bool,
+) -> Result<Vec<DirectoryFileFingerprint>, Error> {
+    let mut entries = Vec::new();
+    collect_directory_fingerprints_recursive(dir, dir, hash_content, &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_directory_fingerprints_recursive(
+    base: &Path,
+    current: &Path,
+    hash_content: bool,
+    entries: &mut Vec<DirectoryFileFingerprint>,
+) -> Result<(), Error> {
+    let dir_entries = std::fs::read_dir(current)
+        .map_err(|e| Error::Tar(format!("read_dir {}: {e}", current.display())))?;
+    for entry in dir_entries {
+        let entry = entry.map_err(|e| Error::Tar(format!("read_dir entry: {e}")))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| Error::Tar(format!("file_type: {e}")))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(name.as_ref(), ".git" | "node_modules") {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_directory_fingerprints_recursive(base, &path, hash_content, entries)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|e| Error::Tar(format!("metadata {}: {e}", path.display())))?;
+        let content_hash = if hash_content {
+            let content = std::fs::read(&path)
+                .map_err(|e| Error::Tar(format!("read {}: {e}", path.display())))?;
+            Some(blake3::hash(&content).to_hex().to_string())
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = false;
+        let rel = path
+            .strip_prefix(base)
+            .map_err(|e| Error::Tar(format!("strip_prefix: {e}")))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+        let (mtime_secs, mtime_nanos) = modified
+            .map(|duration| (duration.as_secs() as i64, duration.subsec_nanos()))
+            .unwrap_or((0, 0));
+        entries.push(DirectoryFileFingerprint {
+            path: rel,
+            content_hash,
+            executable,
+            size: metadata.len(),
+            mtime_secs,
+            mtime_nanos,
+        });
+    }
+    Ok(())
+}
+
 impl Store {
     /// Import every file under a directory into the store, producing a
     /// `PackageIndex` keyed by paths relative to `dir`. Used by `file:`
@@ -52,12 +207,12 @@ impl Store {
             };
             #[cfg(not(unix))]
             let executable = false;
-            let stored = self.import_bytes(&content, executable)?;
             let rel = path
                 .strip_prefix(base)
                 .map_err(|e| Error::Tar(format!("strip_prefix: {e}")))?
                 .to_string_lossy()
                 .replace('\\', "/");
+            let stored = self.import_bytes_gated(&rel, &content, executable)?;
             index.insert(rel, stored);
         }
         Ok(())
@@ -94,7 +249,7 @@ impl Store {
         &self,
         compressed_reader: R,
     ) -> Result<PackageIndex, Error> {
-        use std::io::Read;
+        use std::io::{Read, Write};
 
         let _diag =
             aube_util::diag::Span::new(aube_util::diag::Category::Store, "import_tarball_reader");
@@ -136,6 +291,7 @@ impl Store {
         let mut staged: Vec<(String, Vec<u8>, bool)> = Vec::new();
         let mut entries_seen: usize = 0;
         let mut total_uncompressed: u64 = 0;
+        let mut max_entry_bytes: u64 = 0;
         let mut decode_ns: u128 = 0;
         let mut cas_ns: u128 = 0;
         let mut index = PackageIndex::default();
@@ -151,7 +307,7 @@ impl Store {
             let chunk_t0 = std::time::Instant::now();
             if parallel_disabled || chunk.len() < PARALLEL_IMPORT_THRESHOLD {
                 for (rel_path, content, executable) in chunk {
-                    let stored = self.import_bytes(&content, executable)?;
+                    let stored = self.import_bytes_gated(&rel_path, &content, executable)?;
                     index.insert(rel_path, stored);
                 }
             } else {
@@ -172,7 +328,7 @@ impl Store {
                     .into_par_iter()
                     .with_min_len(RAYON_TASK_MIN_LEN)
                     .map(|(rel_path, content, executable)| {
-                        self.import_bytes(&content, executable)
+                        self.import_bytes_gated(&rel_path, &content, executable)
                             .map(|stored| (rel_path, stored))
                     })
                     .collect();
@@ -188,6 +344,7 @@ impl Store {
         for entry in archive.entries().map_err(|e| Error::Tar(e.to_string()))? {
             entries_seen += 1;
             if entries_seen > MAX_TARBALL_ENTRIES {
+                core::hint::cold_path();
                 return Err(Error::Tar(format!(
                     "tarball exceeds entry cap of {MAX_TARBALL_ENTRIES}"
                 )));
@@ -226,6 +383,7 @@ impl Store {
                 entry_type,
                 tar::EntryType::Regular | tar::EntryType::Continuous
             ) {
+                core::hint::cold_path();
                 return Err(Error::Tar(format!(
                     "tarball entry type {entry_type:?} is not allowed"
                 )));
@@ -240,6 +398,7 @@ impl Store {
                 .size()
                 .map_err(|e| Error::Tar(e.to_string()))?;
             if declared > MAX_TARBALL_ENTRY_BYTES {
+                core::hint::cold_path();
                 return Err(Error::Tar(format!(
                     "tarball entry exceeds per-entry cap: {declared} bytes > {MAX_TARBALL_ENTRY_BYTES}"
                 )));
@@ -254,6 +413,59 @@ impl Store {
                 // interior path after stripping. Nothing to store.
                 continue;
             };
+
+            let mode = entry.header().mode().unwrap_or(0o644);
+            let executable = mode & 0o111 != 0;
+
+            // Store compression may unwrap napi hybrids before hashing, which
+            // inherently needs the complete entry. Keep that opt-in path on
+            // the byte-buffered importer.
+            if declared >= LARGE_ENTRY_STREAM_THRESHOLD
+                && crate::cas::store_compression_gate().is_none()
+            {
+                // Keep small files on the staged/rayon path, but never retain
+                // an existing chunk while decoding a large entry. Large files
+                // are written once into a same-filesystem CAS tempfile and
+                // hashed during decompression, then atomically published.
+                if !staged.is_empty() {
+                    let chunk = std::mem::take(&mut staged);
+                    flush_chunk(chunk, &mut index, &mut cas_ns)?;
+                }
+
+                std::fs::create_dir_all(&self.root).map_err(|e| Error::Io(self.root.clone(), e))?;
+                let mut temp = tempfile::Builder::new()
+                    .prefix(&format!(".{}-stream-", aube_util::prog()))
+                    .tempfile_in(&self.root)
+                    .map_err(|e| Error::Io(self.root.clone(), e))?;
+                let mut hasher = blake3::Hasher::new();
+                let mut limited = (&mut entry).take(MAX_TARBALL_ENTRY_BYTES);
+                let mut buffer = [0u8; STREAM_COPY_BUFFER_SIZE];
+                let read_t0 = std::time::Instant::now();
+                let mut actual_len = 0u64;
+                loop {
+                    let n = limited
+                        .read(&mut buffer)
+                        .map_err(|e| Error::Tar(e.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    temp.write_all(&buffer[..n])
+                        .map_err(|e| Error::Io(self.root.clone(), e))?;
+                    hasher.update(&buffer[..n]);
+                    actual_len = actual_len.saturating_add(n as u64);
+                }
+                decode_ns += read_t0.elapsed().as_nanos();
+
+                let hex_hash = hasher.finalize().to_hex().to_string();
+                let cas_t0 = std::time::Instant::now();
+                let stored = self.import_hashed_tempfile(temp, hex_hash, actual_len, executable)?;
+                cas_ns += cas_t0.elapsed().as_nanos();
+                total_uncompressed = total_uncompressed.saturating_add(actual_len);
+                max_entry_bytes = max_entry_bytes.max(actual_len);
+                staged_count += 1;
+                index.insert(rel_path, stored);
+                continue;
+            }
 
             // Clamp upfront alloc so a lying header can't force a 512
             // MiB reservation before any byte has been read. read_to_end
@@ -270,15 +482,15 @@ impl Store {
             // non-empty stream. Synthetic-entry injection: header
             // claims empty file, real bytes go to disk.
             if declared == 0 && !content.is_empty() {
+                core::hint::cold_path();
                 return Err(Error::Tar(format!(
                     "tarball entry declared 0 bytes but yielded {} bytes",
                     content.len()
                 )));
             }
 
-            let mode = entry.header().mode().unwrap_or(0o644);
-            let executable = mode & 0o111 != 0;
             total_uncompressed = total_uncompressed.saturating_add(content.len() as u64);
+            max_entry_bytes = max_entry_bytes.max(content.len() as u64);
             staged.push((rel_path, content, executable));
             staged_count += 1;
 
@@ -292,7 +504,11 @@ impl Store {
             aube_util::diag::Category::Store,
             "tar_extract_complete",
             extract_t0.elapsed(),
-            || format!(r#"{{"entries":{staged_count},"bytes_uncompressed":{total_uncompressed}}}"#),
+            || {
+                format!(
+                    r#"{{"entries":{staged_count},"bytes_uncompressed":{total_uncompressed},"max_entry_bytes":{max_entry_bytes}}}"#
+                )
+            },
         );
         if aube_util::diag::enabled() {
             aube_util::diag::event_lazy(
@@ -324,6 +540,11 @@ impl Store {
                 )
             },
         );
+        // Extract point: the index is fully built, its CAS blobs are fresh and
+        // page-cache hot, and we're on the fetch/blocking fan-out thread — so an
+        // embedder-registered scanner overlaps ongoing downloads. No-op (one
+        // atomic load) for standalone aube, which never registers a hook.
+        crate::run_extract_hook(&index);
         Ok(index)
     }
 }
@@ -528,6 +749,16 @@ fn is_windows_reserved_name(name: &str) -> bool {
 /// past this ceiling when a legitimate larger file warrants it.
 const VEC_PREALLOC_CEILING: usize = 64 * 1024;
 
+/// Entries at least this large stream through a CAS tempfile instead of
+/// occupying a full growable `Vec`. Eight MiB keeps the hot path for normal
+/// npm files while bounding concurrent native-binary extraction memory.
+#[cfg(not(test))]
+const LARGE_ENTRY_STREAM_THRESHOLD: u64 = 8 << 20;
+#[cfg(test)]
+const LARGE_ENTRY_STREAM_THRESHOLD: u64 = 128 << 10;
+
+const STREAM_COPY_BUFFER_SIZE: usize = 256 * 1024;
+
 /// A `Read` wrapper that refuses to deliver more than `remaining`
 /// bytes. Unlike `std::io::Read::take`, exhaustion produces an
 /// explicit `io::Error` rather than a clean EOF. When the wrapped
@@ -602,3 +833,39 @@ pub(crate) const MAX_TARBALL_ENTRY_BYTES: u64 = 1 << 20;
 pub(crate) const MAX_TARBALL_ENTRIES: usize = 200_000;
 #[cfg(test)]
 pub(crate) const MAX_TARBALL_ENTRIES: usize = 64;
+
+#[cfg(test)]
+mod directory_fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn directory_fingerprint_matches_imported_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("lib")).unwrap();
+        std::fs::create_dir_all(source.join("node_modules/ignored")).unwrap();
+        std::fs::write(source.join("package.json"), br#"{"name":"local"}"#).unwrap();
+        std::fs::write(source.join("lib/index.js"), b"module.exports = 'v1';\n").unwrap();
+        std::fs::write(source.join("node_modules/ignored/index.js"), b"ignored\n").unwrap();
+
+        let store = Store::at(temp.path().join("store"));
+        let index = store.import_directory(&source).unwrap();
+        let (content_hash, metadata_hash) = directory_fingerprints(&source).unwrap();
+        assert_eq!(content_hash, crate::index_content_fingerprint(&index));
+        assert_eq!(
+            metadata_hash,
+            directory_metadata_fingerprint(&source).unwrap()
+        );
+
+        let before_content = content_hash;
+        std::fs::write(source.join("lib/index.js"), b"module.exports = 'v2';\n").unwrap();
+        let after_content = directory_content_fingerprint(&source).unwrap();
+        assert_ne!(before_content, after_content);
+
+        std::fs::write(source.join("lib/added.js"), b"added\n").unwrap();
+        assert_ne!(
+            metadata_hash,
+            directory_metadata_fingerprint(&source).unwrap()
+        );
+    }
+}

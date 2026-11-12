@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "lat": {
+      "command": "npx",
+      "args": ["--yes", "lat.md@0.12.2", "mcp"]
+    },
+    "chrome-devtools": {
+      "command": "node",
+      "args": ["scripts/chrome-devtools-mcp.mjs"]
+    }
+  }
+}

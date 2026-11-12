@@ -195,16 +195,9 @@ pub fn npm_env(
 
     env_vars.insert("npm_command".to_string(), "run-script".to_string());
 
-    // pnpm's UA shape (`<product tokens> <platform> <arch>`) so postinstall
-    // sniffers (which-pm-runs, only-allow, create-* scaffolders) parse it. The
-    // product tokens are ROLE-AWARE — composed by the PM engine and threaded in
-    // (incumbent-first in compat mode, e.g. `pnpm/9.1.0 nub/<v> node/v<ver>`;
-    // nub-first under nub identity / fresh). Platform tokens use Node's
-    // process.platform/process.arch vocabulary (darwin/win32, x64/arm64), not
-    // Rust's, so parsers see the same words npm/pnpm send.
     env_vars.insert(
         "npm_config_user_agent".to_string(),
-        format!("{user_agent_product} {} {}", node_platform(), node_arch()),
+        user_agent_string(user_agent_product),
     );
 
     if let Ok(exe) = env::current_exe() {
@@ -223,6 +216,16 @@ pub fn npm_env(
     );
 
     env_vars
+}
+
+/// The full `npm_config_user_agent` value: role-aware product tokens plus the
+/// `<platform> <arch>` tail in Node's `process.platform`/`process.arch`
+/// vocabulary (darwin/win32, x64/arm64) so postinstall sniffers (which-pm-runs,
+/// only-allow, create-* scaffolders) parse one shape regardless of which nub
+/// surface — `run`, lifecycle, or bin-exec — emitted it. The single source of
+/// truth for the UA format; callers supply only the composed product tokens.
+pub fn user_agent_string(product: &str) -> String {
+    format!("{product} {} {}", node_platform(), node_arch())
 }
 
 /// Node's `process.platform` vocabulary for the UA string (`darwin`, `win32`,
@@ -294,17 +297,19 @@ fn flatten_npm_package_env(
     }
 }
 
-/// Build the PATH with node_modules/.bin directories prepended.
-pub fn bin_path(project_root: &Path, workspace_root: Option<&Path>) -> String {
+/// The `node_modules/.bin` chain a script resolves its commands in: from the
+/// project root up to the workspace root (or the filesystem root), nearest first.
+///
+/// Every directory is added UNCONDITIONALLY — no existence check. npm
+/// (@npmcli/run-script/lib/set-path.js) and pnpm both prepend without stat'ing,
+/// so a `.bin` that a script creates mid-run (the install-then-invoke pattern,
+/// #281) is reachable. A missing PATH entry is harmless — the OS/shell silently
+/// skips it.
+pub fn bin_dirs(project_root: &Path, workspace_root: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-
-    // Walk from project root up, adding each node_modules/.bin.
     let mut dir = project_root.to_path_buf();
     for _ in 0..16 {
-        let bin_dir = dir.join("node_modules").join(".bin");
-        if bin_dir.is_dir() {
-            dirs.push(bin_dir.to_string_lossy().to_string());
-        }
+        dirs.push(dir.join("node_modules").join(".bin"));
         if workspace_root.is_some() && Some(dir.as_path()) == workspace_root {
             break;
         }
@@ -312,6 +317,15 @@ pub fn bin_path(project_root: &Path, workspace_root: Option<&Path>) -> String {
             break;
         }
     }
+    dirs
+}
+
+/// Build the PATH with node_modules/.bin directories prepended.
+pub fn bin_path(project_root: &Path, workspace_root: Option<&Path>) -> String {
+    let mut dirs: Vec<String> = bin_dirs(project_root, workspace_root)
+        .iter()
+        .map(|dir| dir.to_string_lossy().to_string())
+        .collect();
 
     let existing = env::var("PATH").unwrap_or_default();
     if dirs.is_empty() {
@@ -351,18 +365,15 @@ pub fn find_bin(name: &str, cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Read a single `key = value` setting from `.npmrc` (project-level, then
-/// user-level `~/.npmrc`), returning the first match's value with surrounding
-/// quotes stripped. The one `.npmrc` reader in the crate — `script_shell` and
-/// (P1) the PM registry lookup both go through it.
-pub fn npmrc_value(project_root: &Path, key: &str) -> Option<String> {
-    // Check project .npmrc first, then ~/.npmrc
-    let candidates = [
-        project_root.join(".npmrc"),
-        dirs_next::home_dir()
-            .map(|h| h.join(".npmrc"))
-            .unwrap_or_default(),
-    ];
+/// Read a single `key = value` setting from `.npmrc` — the project-scope files
+/// ([`crate::workspace::npmrc::project_npmrc_paths`]: the workspace root's, and
+/// per incumbent the invoking member's on top), then the user `~/.npmrc` —
+/// returning the most specific file's value with surrounding quotes stripped.
+/// `script-shell`, `ignore-scripts` and `node-mirror:release` read through it.
+pub(crate) fn npmrc_value(project_root: &Path, key: &str) -> Option<String> {
+    let mut candidates = crate::workspace::npmrc::project_npmrc_paths(project_root);
+    candidates.reverse();
+    candidates.extend(dirs_next::home_dir().map(|h| h.join(".npmrc")));
 
     for path in &candidates {
         if let Ok(content) = fs::read_to_string(path) {
@@ -391,7 +402,9 @@ pub fn script_shell(project_root: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScriptSelection, find_bin, npm_env, npmrc_value, script_shell, select_scripts};
+    use super::{
+        ScriptSelection, bin_path, find_bin, npm_env, npmrc_value, script_shell, select_scripts,
+    };
     use std::fs;
 
     #[test]
@@ -499,6 +512,26 @@ mod tests {
     }
 
     #[test]
+    fn npmrc_value_reads_the_workspace_root_npmrc_from_a_member() {
+        // `ignore-scripts`, `script-shell` and `node-mirror:release` set once in a
+        // monorepo's root `.npmrc` apply to every member.
+        let root = std::env::temp_dir().join(format!("nub-npmrc-ws-{}", std::process::id()));
+        let member = root.join("packages").join("a");
+        fs::create_dir_all(&member).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        fs::write(member.join("package.json"), r#"{"name":"a"}"#).unwrap();
+        fs::write(root.join(".npmrc"), "ignore-scripts=true\n").unwrap();
+
+        let value = npmrc_value(&member, "ignore-scripts");
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(value.as_deref(), Some("true"));
+    }
+
+    #[test]
     fn npmrc_value_reads_keys_and_script_shell_delegates() {
         let tmp = std::env::temp_dir().join(format!("nub-npmrc-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
@@ -551,5 +584,26 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn bin_path_includes_missing_dir() {
+        // Regression for #281: bin_path must prepend `<root>/node_modules/.bin`
+        // even when that directory does not exist at call time, so a script that
+        // creates its `.bin` mid-run (install-then-invoke) can still find it. npm
+        // and pnpm both prepend unconditionally.
+        let root = std::env::temp_dir().join(format!("nub-281-{}", std::process::id()));
+        // Deliberately do NOT create node_modules/.bin.
+        let expected = root
+            .join("node_modules")
+            .join(".bin")
+            .to_string_lossy()
+            .to_string();
+        let path = bin_path(&root, Some(&root));
+        assert!(
+            path.split(crate::PATH_LIST_SEPARATOR)
+                .any(|p| p == expected),
+            "expected PATH to contain the (non-existent) {expected:?}, got {path:?}"
+        );
     }
 }

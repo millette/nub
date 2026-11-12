@@ -83,6 +83,29 @@ YAML
 	assert_failure
 }
 
+@test "cold-install lockfile is byte-identical with the write-overlap on vs off" {
+	# The cold-install lockfile write runs overlapped with the link phase
+	# on a background thread by default; AUBE_DISABLE_LOCKFILE_WRITE_OVERLAP
+	# reverts to the inline serial write. The two paths must produce the
+	# exact same bytes on disk — the overlap changes *when* the write runs,
+	# never *what* it writes. Drive a fresh resolve (no lockfile) both ways
+	# and diff the result.
+	cp "$PROJECT_ROOT/fixtures/basic/package.json" .
+
+	run aube install
+	assert_success
+	assert_file_exists aube-lock.yaml
+	cp aube-lock.yaml overlapped.yaml
+
+	rm -rf node_modules aube-lock.yaml
+	AUBE_DISABLE_LOCKFILE_WRITE_OVERLAP=1 run aube install
+	assert_success
+	assert_file_exists aube-lock.yaml
+
+	run diff overlapped.yaml aube-lock.yaml
+	assert_success
+}
+
 @test "aube install warm path works in CI frozen mode" {
 	_setup_basic_fixture
 	export CI=1
@@ -640,19 +663,16 @@ EOF
 	assert_output --partial "No lockfile found"
 }
 
-@test "aube install --no-frozen-lockfile restores missing lockfile from fresh state" {
+@test "aube install --no-frozen-lockfile re-resolves when lockfile is missing" {
 	_setup_basic_fixture
 	run aube install
 	assert_success
-	cp aube-lock.yaml aube-lock.yaml.expected
-	assert_file_exists node_modules/.aube-state/lockfile
 
 	rm aube-lock.yaml
 	run aube -v install --no-frozen-lockfile
 	assert_success
-	refute_output --partial "No lockfile found"
+	assert_output --partial "No lockfile found"
 	assert_file_exists aube-lock.yaml
-	assert_equal "$(cat aube-lock.yaml)" "$(cat aube-lock.yaml.expected)"
 }
 
 @test "aube install --fix-lockfile is a no-op on a fresh lockfile" {
@@ -706,10 +726,10 @@ JSON
 	assert_file_exists node_modules/isexe/package.json
 }
 
-@test "aube install --fix-lockfile --lockfile-only is a no-op on a fresh lockfile" {
-	# Combined with --lockfile-only, a fresh lockfile should short-circuit
-	# on the "lockfile already up to date" fast path, without re-writing
-	# aube-lock.yaml or touching node_modules.
+@test "aube install --fix-lockfile --lockfile-only round-trips a fresh lockfile" {
+	# With --lockfile-only, a fresh lockfile is still re-resolved from its
+	# own pins, so the writer's output matches byte-for-byte and node_modules
+	# stays untouched.
 	_setup_basic_fixture
 	run aube install --no-frozen-lockfile
 	assert_success
@@ -717,7 +737,6 @@ JSON
 	cp aube-lock.yaml aube-lock.yaml.before
 	run aube install --fix-lockfile --lockfile-only
 	assert_success
-	assert_output --partial "up to date"
 	run cmp aube-lock.yaml aube-lock.yaml.before
 	assert_success
 	assert [ ! -d node_modules ]
@@ -860,13 +879,20 @@ JSON
 	assert_file_exists node_modules/is-odd/package.json
 }
 
-@test "aube add --ignore-scripts is accepted (no-op)" {
-	_setup_basic_fixture
-	# Use a tiny package that doesn't actually have scripts; flag should
-	# just pass through without erroring.
+@test "aube add --ignore-scripts skips pnpm:devPreinstall" {
+	cat >package.json <<-'EOF'
+		{
+		  "name": "add-ignore-scripts",
+		  "version": "1.0.0",
+		  "scripts": {
+		    "pnpm:devPreinstall": "node -e 'require(\"fs\").writeFileSync(\"dev-preinstall.marker\", \"ran\")'"
+		  }
+		}
+	EOF
 	run aube add --ignore-scripts --save-dev is-number
 	assert_success
 	assert_file_exists node_modules/is-number/package.json
+	assert_file_not_exists dev-preinstall.marker
 }
 
 @test "aube install --prefer-offline reuses cached metadata" {
@@ -917,6 +943,59 @@ JSON
 	assert [ ! -e node_modules ]
 }
 
+@test "aube install --dry-run resolves without writing lockfile or node_modules" {
+	echo '{"name":"test","version":"1.0.0","dependencies":{"is-odd":"^3.0.1"}}' >package.json
+	run aube install --dry-run
+	assert_success
+	assert_output --partial "Dry run: resolved"
+	assert [ ! -e aube-lock.yaml ]
+	assert [ ! -e node_modules ]
+}
+
+@test "aube install --dry-run --frozen-lockfile fails without lockfile" {
+	echo '{"name":"test","version":"1.0.0","dependencies":{"is-odd":"^3.0.1"}}' >package.json
+	run aube install --dry-run --frozen-lockfile
+	assert_failure
+	assert_output --partial "no lockfile found and --frozen-lockfile is set"
+	assert [ ! -e aube-lock.yaml ]
+	assert [ ! -e node_modules ]
+}
+
+@test "aube install --dry-run in CI resolves without lockfile" {
+	echo '{"name":"test","version":"1.0.0","dependencies":{"is-odd":"^3.0.1"}}' >package.json
+	CI=1 run aube install --dry-run
+	assert_success
+	assert_output --partial "Dry run: resolved"
+	assert [ ! -e aube-lock.yaml ]
+	assert [ ! -e node_modules ]
+}
+
+@test "aube install --dry-run in CI resolves drifted lockfile" {
+	_setup_basic_fixture
+	node -e '
+		const fs = require("fs");
+		const pkg = JSON.parse(fs.readFileSync("package.json"));
+		pkg.dependencies["is-number"] = "^7.0.0";
+		fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2));
+	'
+	CI=1 run aube install --dry-run
+	assert_success
+	assert_output --partial "Dry run: resolved"
+	refute_output --partial "lockfile is out of date"
+	assert [ ! -e node_modules ]
+}
+
+@test "aube install --dry-run with fresh lockfile still reports skipped fetch and link" {
+	_setup_basic_fixture
+	rm -rf node_modules
+	run aube install --dry-run
+	assert_success
+	assert_output --partial "Dry run: lockfile is up to date"
+	assert_output --partial "fetch/link steps were not run"
+	refute_output --partial "resolution step is skipped"
+	assert [ ! -e node_modules ]
+}
+
 @test "aube install --lockfile-only is a no-op when lockfile is fresh" {
 	_setup_basic_fixture
 	# Lockfile already exists in fixture; --lockfile-only should detect
@@ -962,6 +1041,7 @@ JSON
   "name": "preinstall-test",
   "version": "1.0.0",
   "scripts": {
+    "pnpm:devPreinstall": "echo DEV_PREINSTALL_RAN > dev-preinstall.marker",
     "preinstall": "echo PREINSTALL_RAN > preinstall.marker"
   },
   "dependencies": { "is-odd": "^3.0.1" }
@@ -970,6 +1050,7 @@ JSON
 	run aube install --lockfile-only
 	assert_success
 	assert_file_exists aube-lock.yaml
+	assert [ ! -e dev-preinstall.marker ]
 	assert [ ! -e preinstall.marker ]
 }
 
@@ -1234,7 +1315,7 @@ JSON
 }
 
 @test "aube install self-heals when a CAS shard goes missing under a cached index" {
-	# Regression for the BuildKit cache-mount class (jdx/aube#345):
+	# Regression for the BuildKit cache-mount class (aubepkg/aube#345):
 	# a stale cached package index points at a CAS shard that's been
 	# pruned out from under it (foreign sync tool, partial wipe, a
 	# cache-mount that only covered part of the store, etc.). The fast

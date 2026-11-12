@@ -57,6 +57,12 @@ fn global_cli_overrides() -> &'static [(String, String)] {
 /// outrank user-scope entries, and within a scope aube's own config
 /// outranks `.npmrc`. See the module-level docs for the full chain.
 pub struct ResolveCtx<'a> {
+    /// Managed hardening config (`/etc/aube/managed.toml` plus any
+    /// additive test/deployment override). This source is not part of
+    /// normal precedence: generated accessors resolve the ordinary
+    /// effective value first, then this managed source can only keep
+    /// or strengthen it for settings with an explicit managed policy.
+    pub managed_aube_config: &'a [(String, String)],
     /// Project-scope aube config (`<cwd>/.config/aube/config.toml`).
     /// Highest-precedence file source by default — a project may pin
     /// settings here as an alternative to committing them into the
@@ -65,6 +71,10 @@ pub struct ResolveCtx<'a> {
     /// Project-scope `.npmrc` (`<cwd>/.npmrc`) plus any
     /// `npmrcAuthFile` it points at, in load order.
     pub project_npmrc: &'a [(String, String)],
+    /// Project configuration supplied by an embedding host. This is a distinct
+    /// tier below CLI/environment and above the ordinary file/global sources.
+    /// Standalone aube leaves it empty.
+    pub project_config: &'a [(String, String)],
     /// User-scope aube config (`~/.config/aube/config.toml`). Aube's
     /// authoritative store for user-level settings written via
     /// `aube config set` — outranks `~/.npmrc` so leftover entries in
@@ -85,13 +95,11 @@ pub struct ResolveCtx<'a> {
     /// below the project-root `workspace_yaml` (a project
     /// `pnpm-workspace.yaml` overrides the user's global `config.yaml`,
     /// matching pnpm v11) and above the user `.npmrc` / aube config.
-    /// Populated under the GLOBAL-scope `read_pnpm_global_config` posture
-    /// — on-by-default for standalone aube (which IS a pnpm-compatible
-    /// PM), cleared UNCONDITIONALLY (cwd-independent) under the nub profile
-    /// (nub's global config is its own neutral home; it never reads a
-    /// pnpm-named global file); [`empty_yaml_map`] otherwise. This is a
-    /// global source, so it is NOT gated on the project-derived
-    /// `read_branded_pnpm_config`.
+    /// Populated under the separate `read_pnpm_global_config` posture —
+    /// on-by-default for standalone aube (which is a pnpm-compatible PM).
+    /// Embedders may derive that posture from project identity; Nub enables it
+    /// only for a provable pnpm-v11+ incumbent. [`empty_yaml_map`] is used
+    /// otherwise.
     pub global_config_yaml: &'a std::collections::BTreeMap<String, yaml_serde::Value>,
     /// Captured environment variables relevant to settings. In
     /// production this is populated by [`capture_env`]; tests build a
@@ -128,8 +136,10 @@ impl<'a> ResolveCtx<'a> {
         workspace_yaml: &'a std::collections::BTreeMap<String, yaml_serde::Value>,
     ) -> Self {
         Self {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: npmrc,
+            project_config: &[],
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml,
@@ -215,6 +225,7 @@ pub fn process_env() -> &'static [(String, String)] {
 ///
 /// ```text
 /// cli > env
+///     > project_config     (embedder-owned project settings)
 ///     > workspace_yaml      (pnpm-workspace.yaml / aube-workspace.yaml)
 ///     > global_config_yaml  (<configDir>/config.yaml, pnpm v11, pnpm-incumbent only)
 ///     > project_aube_config (<cwd>/.config/aube/config.toml)
@@ -223,11 +234,11 @@ pub fn process_env() -> &'static [(String, String)] {
 ///     > user_npmrc          (~/.npmrc + pnpm auth.ini)
 /// ```
 ///
-/// The file-source ordering matches pnpm's config precedence (v10.5+/v11):
-/// the YAML settings sources outrank the project `.npmrc`. pnpm reads
-/// `.npmrc` first and then merges the global `config.yaml` and project
-/// `pnpm-workspace.yaml` over it (last-write-wins), so both YAML sources
-/// beat `.npmrc`. Two principles fill in the rest:
+/// Managed config is deliberately not listed in this chain. It is a
+/// final hardening pass that can only strengthen settings marked with
+/// a `managedPolicy` in `settings.toml`; unmanaged settings ignore it.
+///
+/// Two principles drive the file-source ordering:
 ///
 /// - **YAML-over-`.npmrc` (pnpm parity)**: `workspace_yaml` and
 ///   `global_config_yaml` outrank `.npmrc`. A project
@@ -297,6 +308,22 @@ pub fn string_from_npmrc(setting: &str, entries: &[(String, String)]) -> Option<
     None
 }
 
+/// Whether the workspace-YAML source family is suppressed for this
+/// setting. The single choke point for the
+/// `read_layout_from_workspace_yaml` posture: an embedder that owns
+/// `node_modules` layout itself drops the YAML source for the
+/// `layout`-flagged settings, leaving every other source — and every
+/// other setting — untouched. The `meta.layout` test comes first so the
+/// non-layout majority never pays for the context read.
+///
+/// Public because `aube config`'s reporting path flattens the YAML map
+/// itself instead of going through the resolvers below; it must report
+/// what an install would actually use, so it shares this predicate
+/// rather than reimplementing the rule.
+pub fn workspace_yaml_suppressed(meta: &meta::SettingMeta) -> bool {
+    meta.layout && !aube_util::engine_context().read_layout_from_workspace_yaml
+}
+
 /// Resolve a `bool` setting from a raw `pnpm-workspace.yaml` map,
 /// walking the declared `sources.workspaceYaml` aliases. Returns
 /// `None` if no alias is present in the map, the setting isn't a
@@ -311,7 +338,7 @@ pub(crate) fn bool_from_workspace_yaml(
     raw: &std::collections::BTreeMap<String, yaml_serde::Value>,
 ) -> Option<bool> {
     let meta = meta::find(setting)?;
-    if meta.type_ != "bool" {
+    if meta.type_ != "bool" || workspace_yaml_suppressed(meta) {
         return None;
     }
     for key in meta.workspace_yaml_keys {
@@ -344,7 +371,7 @@ pub fn string_from_workspace_yaml(
     raw: &std::collections::BTreeMap<String, yaml_serde::Value>,
 ) -> Option<String> {
     let meta = meta::find(setting)?;
-    if !is_stringish(meta.type_) {
+    if !is_stringish(meta.type_) || workspace_yaml_suppressed(meta) {
         return None;
     }
     for key in meta.workspace_yaml_keys {
@@ -393,7 +420,7 @@ pub(crate) fn u64_from_workspace_yaml(
     raw: &std::collections::BTreeMap<String, yaml_serde::Value>,
 ) -> Option<u64> {
     let meta = meta::find(setting)?;
-    if meta.type_ != "int" {
+    if meta.type_ != "int" || workspace_yaml_suppressed(meta) {
         return None;
     }
     for key in meta.workspace_yaml_keys {
@@ -445,7 +472,7 @@ pub(crate) fn string_list_from_workspace_yaml(
     raw: &std::collections::BTreeMap<String, yaml_serde::Value>,
 ) -> Option<Vec<String>> {
     let meta = meta::find(setting)?;
-    if meta.type_ != "list<string>" {
+    if meta.type_ != "list<string>" || workspace_yaml_suppressed(meta) {
         return None;
     }
     for key in meta.workspace_yaml_keys {
@@ -484,6 +511,17 @@ pub fn workspace_yaml_value<'a>(
 }
 
 fn raw_from_env<'a>(meta: &meta::SettingMeta, env: &'a [(String, String)]) -> Option<&'a str> {
+    env_alias_hit(meta, env).map(|(_, raw)| raw)
+}
+
+/// Which declared `sources.env` alias supplies `meta`'s value, and the raw
+/// value it carries. The typed accessors want only the value; provenance
+/// reporters ([`env_source`]) want the alias as well, so both read the answer
+/// off this one walk rather than each keeping their own idea of the order.
+fn env_alias_hit<'a>(
+    meta: &meta::SettingMeta,
+    env: &'a [(String, String)],
+) -> Option<(&'static str, &'a str)> {
     for alias in meta.env_vars.iter().rev() {
         // Gate the tool-branded alias (`AUBE_<NAME>`) on the active embedder's
         // `env_prefix`: standalone aube (`Some("AUBE")`) reads it as before, an
@@ -496,11 +534,25 @@ fn raw_from_env<'a>(meta: &meta::SettingMeta, env: &'a [(String, String)]) -> Op
         }
         for (key, raw) in env.iter().rev() {
             if key == alias {
-                return Some(raw);
+                return Some((alias, raw));
             }
         }
     }
     None
+}
+
+/// The env alias currently supplying `setting`'s value, and that value.
+///
+/// Walks the declared aliases in the same order and under the same brand gate
+/// as the typed accessors, so a caller reporting where a value came from
+/// cannot disagree with the resolver about which variable won. `None` means
+/// the environment does not set this setting at all — an unknown setting name
+/// answers the same way.
+pub fn env_source<'a>(
+    setting: &str,
+    env: &'a [(String, String)],
+) -> Option<(&'static str, &'a str)> {
+    env_alias_hit(meta::find(setting)?, env)
 }
 
 /// Resolve a `bool` setting from a captured environment snapshot,
@@ -669,6 +721,182 @@ pub(crate) fn string_list_from_cli(setting: &str, cli: &[(String, String)]) -> O
         return None;
     }
     cli_raw_for(meta, cli, |_| true).map(parse_string_list)
+}
+
+fn managed_raw(setting: &str) -> Option<&'static str> {
+    meta::find(setting)
+        .and_then(|meta| (!meta.managed_policy.is_empty()).then_some(meta.managed_policy))
+}
+
+fn managed_values(setting: &str, entries: &[(String, String)]) -> Vec<String> {
+    let Some(meta) = meta::find(setting) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|(key, _)| key.as_str() == meta.name || meta.npmrc_keys.contains(&key.as_str()))
+        .map(|(_, raw)| raw.clone())
+        .collect()
+}
+
+pub(crate) fn apply_managed_bool(
+    setting: &str,
+    local: Option<bool>,
+    managed_entries_: &[(String, String)],
+) -> Option<bool> {
+    let Some(policy) = managed_raw(setting) else {
+        return local;
+    };
+    let valid_managed: Vec<bool> = managed_values(setting, managed_entries_)
+        .into_iter()
+        .filter_map(|raw| parse_bool(&raw))
+        .collect();
+    if valid_managed.is_empty() {
+        return local;
+    }
+    let enforced = match policy {
+        "trueWins" if valid_managed.iter().any(|v| *v) => true,
+        "falseWins" if valid_managed.iter().any(|v| !*v) => false,
+        _ => return local,
+    };
+    if local.is_some_and(|v| v != enforced) {
+        warn_managed_enforced(setting);
+    }
+    Some(enforced)
+}
+
+pub(crate) fn apply_managed_u64(
+    setting: &str,
+    local: Option<u64>,
+    managed_entries_: &[(String, String)],
+) -> Option<u64> {
+    let Some(policy) = managed_raw(setting) else {
+        return local;
+    };
+    let Some(managed) = managed_values(setting, managed_entries_)
+        .into_iter()
+        .filter_map(|raw| raw.trim().parse::<u64>().ok())
+        .max()
+    else {
+        return local;
+    };
+    let enforced = match policy {
+        "max" => local.map_or(managed, |v| v.max(managed)),
+        _ => return local,
+    };
+    if local.is_some_and(|v| v != enforced) {
+        warn_managed_enforced(setting);
+    }
+    Some(enforced)
+}
+
+pub(crate) fn apply_managed_string(
+    setting: &str,
+    local: Option<String>,
+    managed_entries_: &[(String, String)],
+) -> Option<String> {
+    let Some(policy) = managed_raw(setting) else {
+        return local;
+    };
+    let managed_values = managed_values(setting, managed_entries_);
+    if managed_values.is_empty() {
+        return local;
+    }
+    if policy == "managedWins" {
+        let managed = managed_values[0].clone();
+        if local.as_deref().is_some_and(|v| v != managed) {
+            warn_managed_enforced(setting);
+        }
+        return Some(managed);
+    }
+    let Some(rank_spec) = policy.strip_prefix("ranked:") else {
+        return local;
+    };
+    let Some((managed, managed_rank)) = managed_values
+        .into_iter()
+        .filter_map(|raw| ranked_value(rank_spec, &raw).map(|rank| (raw, rank)))
+        .max_by_key(|(_, rank)| *rank)
+    else {
+        return local;
+    };
+    let local_rank = local.as_deref().and_then(|v| ranked_value(rank_spec, v));
+    if local_rank.is_none_or(|rank| managed_rank > rank) {
+        if local.is_some() {
+            warn_managed_enforced(setting);
+        }
+        Some(managed)
+    } else {
+        local
+    }
+}
+
+pub(crate) fn apply_managed_string_list(
+    setting: &str,
+    local: Option<Vec<String>>,
+    managed_entries_: &[(String, String)],
+) -> Option<Vec<String>> {
+    let Some(policy) = managed_raw(setting) else {
+        return local;
+    };
+    if policy != "managedWins" {
+        return local;
+    }
+    let mut managed_lists = managed_values(setting, managed_entries_)
+        .into_iter()
+        .map(|raw| parse_string_list(&raw));
+    let Some(mut managed) = managed_lists.next() else {
+        return local;
+    };
+    for list in managed_lists {
+        managed.retain(|item| list.contains(item));
+    }
+    if local
+        .as_ref()
+        .is_some_and(|v| v.iter().any(|item| !managed.contains(item)))
+    {
+        warn_managed_enforced(setting);
+    }
+    Some(managed)
+}
+
+/// Apply managed hardening to a raw scalar/list setting value for dynamic
+/// callers such as `aube config get/list`.
+pub fn apply_managed_raw(
+    setting: &str,
+    local: Option<String>,
+    managed_entries: &[(String, String)],
+) -> Option<String> {
+    let meta = meta::find(setting)?;
+    match meta.type_ {
+        "bool" => {
+            let local = local.as_deref().and_then(parse_bool);
+            apply_managed_bool(setting, local, managed_entries).map(|v| v.to_string())
+        }
+        "int" => {
+            let local = local.and_then(|raw| raw.trim().parse::<u64>().ok());
+            apply_managed_u64(setting, local, managed_entries).map(|v| v.to_string())
+        }
+        "list<string>" => {
+            let local = local.map(|raw| parse_string_list(&raw));
+            apply_managed_string_list(setting, local, managed_entries).map(|v| v.join(","))
+        }
+        ty if is_stringish(ty) => apply_managed_string(setting, local, managed_entries),
+        _ => local,
+    }
+}
+
+fn ranked_value(rank_spec: &str, raw: &str) -> Option<usize> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    rank_spec
+        .split('<')
+        .position(|value| value.trim() == normalized)
+}
+
+fn warn_managed_enforced(setting: &str) {
+    tracing::warn!(
+        code = aube_codes::warnings::WARN_AUBE_MANAGED_CONFIG_ENFORCED,
+        "managed config enforced `{setting}` and ignored a weaker local/env/CLI value"
+    );
 }
 
 /// Parse a pnpm/npm-style stringified list. Accepts a JSON-ish array
@@ -1074,8 +1302,10 @@ mod tests {
         )];
         let cli = vec![("auto-install-peers".to_string(), "true".to_string())];
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &npmrc,
+            project_config: &[],
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: &ws,
@@ -1097,8 +1327,10 @@ mod tests {
             "true".to_string(),
         )];
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &aube_config,
             project_npmrc: &npmrc,
+            project_config: &[],
             user_aube_config: &aube_config,
             user_npmrc: &npmrc,
             workspace_yaml: &ws,
@@ -1120,8 +1352,10 @@ mod tests {
         let aube_config = entries(&[("minimumReleaseAge", "2880")]);
         let ws = raw_yaml("minimumReleaseAge: 1440\n");
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &[],
+            project_config: &[],
             user_aube_config: &aube_config,
             user_npmrc: &[],
             workspace_yaml: &ws,
@@ -1134,8 +1368,10 @@ mod tests {
 
         let ws = BTreeMap::new();
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &[],
+            project_config: &[],
             user_aube_config: &aube_config,
             user_npmrc: &[],
             workspace_yaml: &ws,
@@ -1145,6 +1381,213 @@ mod tests {
             embedder_defaults: &[],
         };
         assert_eq!(resolved::minimum_release_age(&ctx), 2880);
+    }
+
+    #[test]
+    fn minimum_package_age_defaults_to_thirty_days_and_honors_workspace() {
+        let ws = raw_yaml("minimumPackageAge: 86400\n");
+        let ctx = ResolveCtx {
+            managed_aube_config: &[],
+            project_aube_config: &[],
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(resolved::minimum_package_age(&ctx), 86_400);
+
+        let empty = BTreeMap::new();
+        let ctx = ResolveCtx {
+            managed_aube_config: &[],
+            project_aube_config: &[],
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &empty,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(resolved::minimum_package_age(&ctx), 43_200);
+    }
+
+    #[test]
+    fn managed_max_policy_enforces_larger_integer() {
+        let local = entries(&[("minimumReleaseAge", "0")]);
+        let managed = entries(&[("minimumReleaseAge", "1440")]);
+        let ws = BTreeMap::new();
+        let ctx = ResolveCtx {
+            managed_aube_config: &managed,
+            project_aube_config: &local,
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(resolved::minimum_release_age(&ctx), 1440);
+    }
+
+    #[test]
+    fn managed_bool_policies_keep_stricter_value() {
+        let managed_true = entries(&[("minimumReleaseAgeStrict", "true")]);
+        let managed_false = entries(&[("dangerouslyAllowAllBuilds", "false")]);
+        let managed_danger_true = entries(&[("dangerouslyAllowAllBuilds", "true")]);
+        let local_false = entries(&[("minimumReleaseAgeStrict", "false")]);
+        let ws = BTreeMap::new();
+        let ctx = ResolveCtx {
+            managed_aube_config: &managed_true,
+            project_aube_config: &local_false,
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert!(resolved::minimum_release_age_strict(&ctx));
+
+        let cli = entries(&[("dangerously-allow-all-builds", "true")]);
+        let ctx = ResolveCtx {
+            managed_aube_config: &managed_false,
+            project_aube_config: &[],
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &cli,
+            embedder_defaults: &[],
+        };
+        assert!(!resolved::dangerously_allow_all_builds(&ctx));
+        assert_eq!(
+            apply_managed_bool("dangerouslyAllowAllBuilds", None, &managed_danger_true),
+            None
+        );
+        assert_eq!(
+            apply_managed_raw("dangerouslyAllowAllBuilds", None, &managed_danger_true),
+            None
+        );
+    }
+
+    #[test]
+    fn managed_policies_cannot_weaken_defaults() {
+        let managed_age = entries(&[("minimumReleaseAge", "0")]);
+        let managed_advisory = entries(&[("advisoryCheck", "off")]);
+        let managed_exotic_subdeps = entries(&[("blockExoticSubdeps", "false")]);
+        let ws = BTreeMap::new();
+
+        let ctx = ResolveCtx {
+            managed_aube_config: &managed_age,
+            project_aube_config: &[],
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(resolved::minimum_release_age(&ctx), 1440);
+
+        let ctx = ResolveCtx {
+            managed_aube_config: &managed_advisory,
+            project_aube_config: &[],
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(resolved::advisory_check(&ctx), resolved::AdvisoryCheck::On);
+
+        let ctx = ResolveCtx {
+            managed_aube_config: &managed_exotic_subdeps,
+            project_aube_config: &[],
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert!(resolved::block_exotic_subdeps(&ctx));
+    }
+
+    #[test]
+    fn managed_ranked_policy_picks_strictest_enum() {
+        let local = entries(&[("advisoryCheck", "off")]);
+        let managed = entries(&[("advisoryCheck", "required")]);
+        let ws = BTreeMap::new();
+        let ctx = ResolveCtx {
+            managed_aube_config: &managed,
+            project_aube_config: &local,
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(
+            resolved::advisory_check(&ctx),
+            resolved::AdvisoryCheck::Required
+        );
+    }
+
+    #[test]
+    fn managed_list_policy_replaces_local_and_intersects_managed_sources() {
+        let local = entries(&[("minimumReleaseAgeExclude", "left-pad,is-odd")]);
+        let managed = entries(&[
+            ("minimumReleaseAgeExclude", "left-pad,is-even"),
+            ("minimumReleaseAgeExclude", "left-pad,is-number"),
+        ]);
+        let ws = BTreeMap::new();
+        let ctx = ResolveCtx {
+            managed_aube_config: &managed,
+            project_aube_config: &local,
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(
+            resolved::minimum_release_age_exclude(&ctx),
+            Some(vec!["left-pad".to_string()])
+        );
     }
 
     #[test]
@@ -1159,8 +1602,10 @@ mod tests {
         let user_aube_config = entries(&[("autoInstallPeers", "true")]);
         let ws = BTreeMap::new();
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &[],
+            project_config: &[],
             user_aube_config: &user_aube_config,
             user_npmrc: &user_npmrc,
             workspace_yaml: &ws,
@@ -1184,8 +1629,10 @@ mod tests {
         let user_aube_config = entries(&[("autoInstallPeers", "true")]);
         let ws = BTreeMap::new();
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &project_npmrc,
+            project_config: &[],
             user_aube_config: &user_aube_config,
             user_npmrc: &[],
             workspace_yaml: &ws,
@@ -1209,8 +1656,10 @@ mod tests {
         let project_aube_config = entries(&[("autoInstallPeers", "true")]);
         let ws = BTreeMap::new();
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &project_aube_config,
             project_npmrc: &project_npmrc,
+            project_config: &[],
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: &ws,
@@ -1237,8 +1686,10 @@ mod tests {
         let user_aube_config = entries(&[("autoInstallPeers", "true")]);
         let ws = raw_yaml("autoInstallPeers: false\n");
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &[],
+            project_config: &[],
             user_aube_config: &user_aube_config,
             user_npmrc: &user_npmrc,
             workspace_yaml: &ws,
@@ -1264,8 +1715,10 @@ mod tests {
         let project_npmrc = entries(&[("auto-install-peers", "true")]);
         let ws = raw_yaml("autoInstallPeers: false\n");
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &project_npmrc,
+            project_config: &[],
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: &ws,
@@ -1280,6 +1733,31 @@ mod tests {
         );
     }
 
+    /// `pnpm-workspace.yaml` is the file pnpm actually reads
+    /// `registrySupportsTimeField` from — never `.npmrc` — so the yaml source
+    /// is what mirroring a pnpm incumbent depends on. Asserts the value
+    /// RESOLVES, not merely that the metadata names a real struct field: the
+    /// `meta.rs` self-test covers the latter and would pass on a key nothing
+    /// ever reads.
+    #[test]
+    fn registry_supports_time_field_resolves_from_workspace_yaml() {
+        let ws = raw_yaml("registrySupportsTimeField: true\n");
+        let ctx = ResolveCtx {
+            managed_aube_config: &[],
+            project_aube_config: &[],
+            project_npmrc: &[],
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &[],
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert!(resolved::registry_supports_time_field(&ctx));
+    }
+
     #[test]
     fn global_config_yaml_wins_over_project_npmrc_by_default() {
         // pnpm v11 ranks the global `<configDir>/config.yaml` above the
@@ -1291,8 +1769,10 @@ mod tests {
         let global_yaml = raw_yaml("autoInstallPeers: false\n");
         let ws = BTreeMap::new();
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &project_npmrc,
+            project_config: &[],
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: &ws,
@@ -1314,8 +1794,10 @@ mod tests {
         let global_yaml = raw_yaml("autoInstallPeers: true\n");
         let ws = raw_yaml("autoInstallPeers: false\n");
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &[],
+            project_config: &[],
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: &ws,
@@ -1489,8 +1971,10 @@ mod tests {
         let ws = BTreeMap::new();
         let cfg = raw_yaml("storeDir: /tmp/from-global-config\n");
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &[],
+            project_config: &[],
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: &ws,
@@ -1506,6 +1990,68 @@ mod tests {
     }
 
     #[test]
+    fn embedder_project_config_sits_below_cli_env_and_above_global_sources() {
+        fn ctx<'a>(
+            project: &'a [(String, String)],
+            ws: &'a BTreeMap<String, yaml_serde::Value>,
+            cfg: &'a BTreeMap<String, yaml_serde::Value>,
+            env: &'a [(String, String)],
+            cli: &'a [(String, String)],
+        ) -> ResolveCtx<'a> {
+            ResolveCtx {
+                managed_aube_config: &[],
+                project_aube_config: &[],
+                project_npmrc: &[],
+                project_config: project,
+                user_aube_config: &[],
+                user_npmrc: &[],
+                workspace_yaml: ws,
+                global_config_yaml: cfg,
+                env,
+                cli,
+                embedder_defaults: &[],
+            }
+        }
+
+        let ws = BTreeMap::new();
+        let cfg = raw_yaml("storeDir: /tmp/from-global-config\n");
+        let project = entries(&[("storeDir", "/tmp/from-project-config")]);
+        let env = entries(&[("NPM_CONFIG_STORE_DIR", "/tmp/from-env")]);
+        let cli = entries(&[("--store-dir", "/tmp/from-cli")]);
+
+        assert_eq!(
+            resolved::store_dir(&ctx(&project, &ws, &cfg, &[], &[])),
+            Some("/tmp/from-project-config".to_string())
+        );
+
+        // The adjacent edge, and the one this test used to leave open by
+        // passing an EMPTY workspace map: `projectConfig` is pushed ahead of
+        // `workspaceYaml` in build.rs, and nothing failed if that order moved.
+        // It is live under a pnpm incumbent, where a `pnpm-workspace.yaml` and
+        // a `nub.jsonc` can both supply a value and the loser decides what
+        // lands in the tree.
+        let populated_ws = raw_yaml("storeDir: /tmp/from-workspace-yaml\n");
+        assert_eq!(
+            resolved::store_dir(&ctx(&project, &populated_ws, &cfg, &[], &[])),
+            Some("/tmp/from-project-config".to_string()),
+            "nub.jsonc outranks pnpm-workspace.yaml"
+        );
+        assert_eq!(
+            resolved::store_dir(&ctx(&entries(&[]), &populated_ws, &cfg, &[], &[])),
+            Some("/tmp/from-workspace-yaml".to_string()),
+            "and the control: with no project config, the yaml is what wins"
+        );
+        assert_eq!(
+            resolved::store_dir(&ctx(&project, &ws, &cfg, &env, &[])),
+            Some("/tmp/from-env".to_string())
+        );
+        assert_eq!(
+            resolved::store_dir(&ctx(&project, &ws, &cfg, &env, &cli)),
+            Some("/tmp/from-cli".to_string())
+        );
+    }
+
+    #[test]
     fn project_workspace_yaml_outranks_global_config_yaml() {
         // Precedence: the project-root `pnpm-workspace.yaml` overrides the
         // user's global `config.yaml` (matching pnpm v11, where the
@@ -1513,8 +2059,10 @@ mod tests {
         let ws = raw_yaml("storeDir: /tmp/from-project-ws\n");
         let cfg = raw_yaml("storeDir: /tmp/from-global-config\n");
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &[],
+            project_config: &[],
             user_aube_config: &[],
             user_npmrc: &[],
             workspace_yaml: &ws,
@@ -1538,8 +2086,10 @@ mod tests {
         let cfg = raw_yaml("storeDir: /tmp/from-global-config\n");
         let ws = BTreeMap::new();
         let ctx = ResolveCtx {
+            managed_aube_config: &[],
             project_aube_config: &[],
             project_npmrc: &[],
+            project_config: &[],
             user_aube_config: &[],
             user_npmrc: &user_npmrc,
             workspace_yaml: &ws,
@@ -1552,6 +2102,46 @@ mod tests {
             resolved::store_dir(&ctx),
             Some("/tmp/from-global-config".to_string()),
             "global config.yaml must win over user .npmrc"
+        );
+    }
+
+    #[test]
+    fn cache_dir_is_unset_until_configured() {
+        // `cacheDir` deliberately carries no baked-in default so the
+        // caller can tell "not configured" (fall back to the
+        // XDG_CACHE_HOME-aware platform path, which appends `/aube`)
+        // from "configured to a literal path". A default here would
+        // have every install read `~/.cache/aube` and ignore
+        // `XDG_CACHE_HOME`.
+        let npmrc: Vec<(String, String)> = Vec::new();
+        let ws: std::collections::BTreeMap<String, yaml_serde::Value> =
+            std::collections::BTreeMap::new();
+        let ctx = ResolveCtx::files_only(&npmrc, &ws);
+        assert_eq!(resolved::cache_dir(&ctx), None);
+    }
+
+    #[test]
+    fn cache_dir_reads_aube_env_alias() {
+        let npmrc: Vec<(String, String)> = Vec::new();
+        let ws: std::collections::BTreeMap<String, yaml_serde::Value> =
+            std::collections::BTreeMap::new();
+        let env = entries(&[("AUBE_CACHE_DIR", "/mnt/dev/cache/aube")]);
+        let ctx = ResolveCtx {
+            managed_aube_config: &[],
+            project_aube_config: &[],
+            project_npmrc: &npmrc,
+            project_config: &[],
+            user_aube_config: &[],
+            user_npmrc: &[],
+            workspace_yaml: &ws,
+            global_config_yaml: empty_yaml_map(),
+            env: &env,
+            cli: &[],
+            embedder_defaults: &[],
+        };
+        assert_eq!(
+            resolved::cache_dir(&ctx),
+            Some("/mnt/dev/cache/aube".to_string())
         );
     }
 

@@ -3,6 +3,7 @@ use super::spec::{ParsedPkgSpec, parse_pkg_spec};
 use crate::commands::catalogs::{
     CatalogRewrite, CatalogUpsert, decide_add_rewrite, range_compatible,
 };
+use aube_settings::resolved::CatalogMode;
 use miette::{Context, IntoDiagnostic, miette};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,6 +14,9 @@ pub(super) struct AddManifestOptions {
     pub(super) save_exact: bool,
     pub(super) save_optional: bool,
     pub(super) save_peer: bool,
+    /// `None` follows the `saveTypes` setting.
+    pub(super) save_types: Option<bool>,
+    pub(super) network_mode: aube_registry::NetworkMode,
     /// Target catalog for `--save-catalog` / `--save-catalog-name`.
     /// `None` means neither flag was passed and the catalog yaml is
     /// left untouched. `Some("default")` is `--save-catalog`;
@@ -25,6 +29,8 @@ pub(super) struct AddManifestOptions {
     /// forces a registry-style spec even when `linkWorkspacePackages`
     /// matched a sibling.
     pub(super) workspace_protocol_override: Option<bool>,
+    /// Highest-precedence settings supplied by an embedding host.
+    pub(super) setting_overrides: Vec<(String, String)>,
 }
 
 impl AddManifestOptions {
@@ -34,6 +40,8 @@ impl AddManifestOptions {
             save_exact: args.save_exact,
             save_optional: args.save_optional,
             save_peer: args.save_peer,
+            save_types: types_flag(args.save_types, args.no_save_types),
+            network_mode: aube_registry::NetworkMode::Online,
             save_catalog: args.save_catalog_name.clone().or_else(|| {
                 if args.save_catalog {
                     Some("default".to_string())
@@ -45,8 +53,30 @@ impl AddManifestOptions {
                 args.save_workspace_protocol,
                 args.no_save_workspace_protocol,
             ),
+            setting_overrides: Vec::new(),
         }
     }
+}
+
+fn package_not_found_error_for_registry(
+    client: &aube_registry::client::RegistryClient,
+    name: String,
+) -> miette::Report {
+    let corpus = aube_resolver::popular_package_names_are_ranked()
+        .then(aube_resolver::popular_package_names);
+    package_not_found_error_for_registry_with_corpus(client, name, corpus)
+}
+
+fn package_not_found_error_for_registry_with_corpus(
+    client: &aube_registry::client::RegistryClient,
+    name: String,
+    public_npm_corpus: Option<&str>,
+) -> miette::Report {
+    let corpus = client
+        .uses_default_npm_registry_for(&name)
+        .then_some(public_npm_corpus)
+        .flatten();
+    crate::commands::add_supply_chain::package_not_found_error_with_corpus(name, corpus)
 }
 
 /// Map the paired `--save-workspace-protocol` / `--no-save-workspace-protocol`
@@ -109,6 +139,70 @@ fn place_dep_in_manifest(
     }
 }
 
+/// `--save-types` / `--no-save-types`, or `None` to follow the setting.
+pub(super) fn types_flag(save_types: bool, no_save_types: bool) -> Option<bool> {
+    match (save_types, no_save_types) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// The name a local spec's package declares. pnpm saves a local dependency
+/// under this; the path's basename is only the fallback for a package with
+/// no readable name. `cwd` is the directory the spec is relative to.
+fn local_package_name(cwd: &Path, spec: &str) -> Option<String> {
+    let path = spec
+        .strip_prefix("file:")
+        .or_else(|| spec.strip_prefix("link:"))?;
+    let path = cwd.join(path);
+    let manifest = if path.is_dir() {
+        std::fs::read(path.join("package.json")).ok()?
+    } else {
+        aube_resolver::read_tarball_package_json(&std::fs::read(path).ok()?).ok()?
+    };
+    let name = serde_json::from_slice::<serde_json::Value>(&manifest).ok()?;
+    name["name"]
+        .as_str()
+        .filter(|n| !n.is_empty())
+        .map(String::from)
+}
+
+/// DefinitelyTyped's name for `name`: `@scope/pkg` → `@types/scope__pkg`.
+fn types_package_name(name: &str) -> String {
+    match name.strip_prefix('@') {
+        Some(scoped) => format!("@types/{}", scoped.replacen('/', "__", 1)),
+        None => format!("@types/{name}"),
+    }
+}
+
+/// Whether a version's registry manifest declares its own TypeScript types.
+/// A root `index.d.ts` with none of these fields is invisible here: the
+/// registry metadata doesn't list a tarball's files.
+fn has_bundled_types(version: &serde_json::Value) -> bool {
+    fn exports_have_types(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(conditions) => conditions.iter().any(|(key, target)| {
+                ((key == "types" || key.starts_with("types@")) && !target.is_null())
+                    || exports_have_types(target)
+            }),
+            serde_json::Value::Array(targets) => targets.iter().any(exports_have_types),
+            _ => false,
+        }
+    }
+    // `import "pkg"` sees only the root entry. A `.`-keyed object is a
+    // subpath map, any other object the root's own conditions.
+    let exports = &version["exports"];
+    let root = match exports.as_object() {
+        Some(map) if map.keys().any(|key| key.starts_with('.')) => &exports["."],
+        _ => exports,
+    };
+    ["types", "typings"]
+        .iter()
+        .any(|field| version[field].as_str().is_some_and(|path| !path.is_empty()))
+        || exports_have_types(root)
+}
+
 pub(super) async fn update_manifest_for_add(
     cwd: &Path,
     packages: &[String],
@@ -130,42 +224,82 @@ pub(super) async fn update_manifest_for_add(
     // own dir so a sub-project's `.npmrc` still wins — switching the
     // entire context to the workspace root would silently drop those
     // overrides, since `load_npmrc_entries` doesn't walk up.
-    let (default_tag, default_prefix, catalog_mode) =
-        crate::commands::with_settings_ctx(cwd, |ctx| {
-            let tag = aube_settings::resolved::tag(ctx);
-            // `--save-exact` (CLI) OR a resolved `.npmrc`/env `save-exact=true`
-            // both pin to the exact version (empty prefix). npm and pnpm both
-            // honor the `save-exact` config knob, so reading it here is the
-            // npm/pnpm-compatible behavior, not nub-specific.
-            let prefix = if opts.save_exact || aube_settings::resolved::save_exact(ctx) {
-                String::new()
-            } else {
-                let raw = aube_settings::resolved::save_prefix(ctx);
-                // Validate: only ^, ~, or empty are valid prefixes.
-                match raw.as_str() {
-                    "^" | "~" | "" => raw,
-                    _ => {
-                        tracing::warn!(
-                            code = aube_codes::warnings::WARN_AUBE_INVALID_SAVE_PREFIX,
-                            "ignoring invalid save-prefix={raw:?}, falling back to ^"
-                        );
-                        "^".to_string()
-                    }
+    let (
+        default_tag,
+        default_prefix,
+        catalog_mode,
+        minimum_release_age,
+        registry_supports_time,
+        cache_dir,
+        save_types,
+    ) = crate::commands::with_settings_ctx_and_cli(cwd, &opts.setting_overrides, |ctx| {
+        let tag = aube_settings::resolved::tag(ctx);
+        // `--save-exact` (CLI) OR a resolved `.npmrc`/env `save-exact=true`
+        // both pin to the exact version (empty prefix). npm and pnpm both
+        // honor the `save-exact` config knob, so reading it here is the
+        // npm/pnpm-compatible behavior, not nub-specific.
+        let prefix = if opts.save_exact || aube_settings::resolved::save_exact(ctx) {
+            String::new()
+        } else {
+            let raw = aube_settings::resolved::save_prefix(ctx);
+            // Validate: only ^, ~, or empty are valid prefixes.
+            match raw.as_str() {
+                "^" | "~" | "" => raw,
+                _ => {
+                    tracing::warn!(
+                        code = aube_codes::warnings::WARN_AUBE_INVALID_SAVE_PREFIX,
+                        "ignoring invalid save-prefix={raw:?}, falling back to ^"
+                    );
+                    "^".to_string()
                 }
-            };
-            let catalog_mode = aube_settings::resolved::catalog_mode(ctx);
-            (tag, prefix, catalog_mode)
-        });
+            }
+        };
+        let catalog_mode = aube_settings::resolved::catalog_mode(ctx);
+        // The version this function writes into the manifest must
+        // honor `minimumReleaseAge` the same way full resolution
+        // does: dist-tag adds and `--save-exact` pin a concrete
+        // version here, and a pinned fresh version would sail past
+        // the resolver's gate via its lenient exact-range fallback.
+        let minimum_release_age = crate::commands::install::resolve_minimum_release_age(ctx, None);
+        let registry_supports_time_field =
+            aube_settings::resolved::registry_supports_time_field(ctx);
+        let cache_dir = crate::commands::resolved_cache_dir_with_ctx(cwd, ctx);
+        let save_types = aube_settings::resolved::save_types(ctx);
+        (
+            tag,
+            prefix,
+            catalog_mode,
+            minimum_release_age,
+            registry_supports_time_field,
+            cache_dir,
+            save_types,
+        )
+    });
     let workspace_settings_cwd = crate::dirs::find_workspace_yaml_root(cwd)
         .or_else(|| crate::dirs::find_workspace_root(cwd))
         .unwrap_or_else(|| cwd.to_path_buf());
-    let (link_workspace_packages, save_workspace_protocol_setting) =
-        crate::commands::with_settings_ctx(&workspace_settings_cwd, |ctx| {
-            (
-                aube_settings::resolved::link_workspace_packages(ctx),
-                aube_settings::resolved::save_workspace_protocol(ctx),
-            )
-        });
+    let (
+        link_workspace_packages,
+        save_workspace_protocol_setting,
+        root_catalog_mode,
+        root_save_types,
+    ) = crate::commands::with_settings_ctx(&workspace_settings_cwd, |ctx| {
+        (
+            aube_settings::resolved::link_workspace_packages(ctx),
+            aube_settings::resolved::save_workspace_protocol(ctx),
+            aube_settings::resolved::catalog_mode(ctx),
+            aube_settings::resolved::save_types(ctx),
+        )
+    });
+    // The workspace yaml is read from the root, so a value set there has to
+    // reach a member; the member's own setting wins only when it turns it on.
+    // The flags beat both.
+    let save_types = opts.save_types.unwrap_or(save_types || root_save_types);
+    let catalog_mode = if matches!(catalog_mode, CatalogMode::Manual) {
+        root_catalog_mode
+    } else {
+        catalog_mode
+    };
     // Load the workspace catalog map up front — the resolver needs it
     // later, but `catalogMode` consults the default catalog while we
     // build the specifier below. Pass the same map to the resolver to
@@ -183,7 +317,8 @@ pub(super) async fn update_manifest_for_add(
     let mut catalog_upserts: Vec<CatalogUpsert> = Vec::new();
 
     // Parse all specs and fetch packuments concurrently.
-    let client = std::sync::Arc::new(crate::commands::make_client(cwd));
+    let client =
+        std::sync::Arc::new(crate::commands::make_client(cwd).with_network_mode(opts.network_mode));
     let mut parsed: Vec<_> = packages
         .iter()
         .map(|s| {
@@ -194,6 +329,14 @@ pub(super) async fn update_manifest_for_add(
             // or tag — `aube add lodash@latest` always means `latest`.
             if !spec.has_explicit_range && default_tag != "latest" {
                 spec.range = default_tag.clone();
+            }
+            if spec.alias.is_none()
+                && let Some(name) = spec
+                    .local_spec
+                    .as_deref()
+                    .and_then(|local| local_package_name(cwd, local))
+            {
+                spec.name = name;
             }
             Ok::<_, miette::Report>(spec)
         })
@@ -269,7 +412,16 @@ pub(super) async fn update_manifest_for_add(
     // also bypass the registry — the workspace is the source of
     // truth for those names. Without these guards the parallel
     // fetch below would 404 on the non-registry name.
-    let mut handles = Vec::new();
+    let mut handles = tokio::task::JoinSet::new();
+    // The age gate compares against the packument `time` map, which the
+    // abbreviated (corgi) payload omits — fetch full packuments when the
+    // gate is active. Same needs_time split the resolver makes.
+    // `registrySupportsTimeField` keeps the cheaper abbreviated path hot
+    // when the registry inlines `time` in corgi payloads.
+    let needs_time = minimum_release_age.is_some() && !registry_supports_time;
+    let corgi_cache_dir = cache_dir.join("packuments-v1");
+    let full_cache_dir = cache_dir.join("packuments-full-v1");
+    let offline = opts.network_mode == aube_registry::NetworkMode::Offline;
     for spec in &parsed {
         if aube_util::pkg::is_workspace_spec(&spec.range)
             || spec.git_spec.is_some()
@@ -279,26 +431,73 @@ pub(super) async fn update_manifest_for_add(
             continue;
         }
         let client = client.clone();
+        let corgi_dir = corgi_cache_dir.clone();
+        let full_dir = full_cache_dir.clone();
         let name = spec.name.clone();
-        let handle = tokio::spawn(async move {
-            let packument = client
-                .fetch_packument(&name)
-                .await
-                .map_err(|e| miette!("failed to fetch {name}: {e}"))?;
+        handles.spawn(async move {
+            let primary = if needs_time {
+                client
+                    .fetch_packument_with_time_cached(&name, &full_dir)
+                    .await
+            } else {
+                client.fetch_packument_cached(&name, &corgi_dir).await
+            };
+            // Offline adds serve whichever cache format holds the
+            // packument: the needs_time split writes online fetches to
+            // one cache only, so an add cached online under the gate
+            // lives in `packuments-full-v1` while an ungated one lives
+            // in the corgi cache — an offline retry must not fail on a
+            // package that's on disk in the other format. The full
+            // payload is a superset of corgi, so that direction always
+            // picks correctly.
+            //
+            // The corgi direction is WEAKER than it once was. A missing
+            // `time` map no longer keeps versions cutoff-eligible —
+            // #581 made an undeterminable publish age fail closed — so an
+            // offline add falling back to a corgi-cached packument
+            // resolves only what the document's `modified` timestamp
+            // proves mature, and otherwise reports the age gate instead
+            // of silently installing. Intended: an offline fallback must
+            // not be a way around the gate. But it does mean this
+            // fallback can now fail where it previously succeeded.
+            let packument = match primary {
+                Ok(packument) => Ok(packument),
+                Err(primary_err) if offline => {
+                    let fallback = if needs_time {
+                        client.fetch_packument_cached(&name, &corgi_dir).await
+                    } else {
+                        client
+                            .fetch_packument_with_time_cached(&name, &full_dir)
+                            .await
+                    };
+                    fallback.map_err(|_| primary_err)
+                }
+                Err(primary_err) => Err(primary_err),
+            }
+            .map_err(|e| match e {
+                aube_registry::Error::NotFound(missing) => {
+                    package_not_found_error_for_registry(&client, missing)
+                }
+                error => miette!("failed to fetch {name}: {error}"),
+            })?;
             Ok::<_, miette::Report>((name, packument))
         });
-        handles.push(handle);
     }
 
     let mut packuments = BTreeMap::new();
-    for handle in handles {
-        let (name, packument) = handle.await.into_diagnostic()??;
+    while let Some(handle) = handles.join_next().await {
+        let (name, packument) = handle.into_diagnostic()??;
         packuments.insert(name, packument);
     }
+    // `--save-types` candidates: (manifest key, registry name, installed version).
+    let mut types_candidates: Vec<(String, String, String)> = Vec::new();
 
     // Resolve each package and update manifest.
     for (spec, orig) in parsed.iter().zip(packages.iter()) {
         let pkg_name_for_manifest = spec.alias.as_deref().unwrap_or(&spec.name);
+        // A later spec for the same name replaces the dependency, so it also
+        // replaces (or drops) that name's `@types` candidate.
+        types_candidates.retain(|(key, ..)| key != pkg_name_for_manifest);
 
         // Workspace-protocol specs (`pkg@workspace:*`, `pkg@workspace:^`,
         // `pkg@workspace:1.2.0`) bypass the registry path entirely:
@@ -363,53 +562,118 @@ pub(super) async fn update_manifest_for_add(
             .get(&spec.name)
             .expect("packument missing for non-skipped registry spec");
 
-        eprintln!("Resolving {}@{}...", spec.name, spec.range);
+        crate::commands::install::control::output(
+            crate::commands::install::InstallOutputLevel::Info,
+            None,
+            format!("Resolving {}@{}...", spec.name, spec.range),
+        );
 
-        // Resolve "latest" and other dist-tags to a version range.
-        let effective_range = if let Some(tagged_version) = packument.dist_tags.get(&spec.range) {
+        // Resolve non-`latest` dist-tags to their tagged version: like
+        // exact pins, they're a deliberate user override (strict mode
+        // still refuses a gated one below). `latest` passes through
+        // verbatim so `pick_version` can widen it (#681): a gated
+        // `latest` steers to the newest release clearing the
+        // minimumReleaseAge cutoff at or below the tag, and a mature one
+        // keeps the plain dist-tag preference. A `latest` pointing at a
+        // prerelease is refused rather than widened, like any other
+        // channel tag.
+        let effective_range = if spec.range == "latest" {
+            spec.range.clone()
+        } else if let Some(tagged_version) = packument.dist_tags.get(&spec.range) {
             tagged_version.clone()
         } else {
             spec.range.clone()
         };
 
-        // Find highest matching version. Reused below when a
-        // `catalogMode` rewrite redirects resolution to the catalog's
-        // range — the display version should match what will actually
-        // get installed, not what the user's original range resolved
-        // to, so we call this twice when the rewrite fires.
-        //
-        // Parse every candidate version once (skipping invalid ones
-        // entirely) and sort the parsed pairs. Comparator-only parsing
-        // burned ~2N parses per add; pre-parse turns it into N + log N
-        // and lets the satisfies-scan reuse the parsed `Version`.
-        let mut parsed_versions: Vec<(&String, node_semver::Version)> = packument
-            .versions
-            .keys()
-            .filter_map(|v| node_semver::Version::parse(v).ok().map(|p| (v, p)))
-            .collect();
-        parsed_versions.sort_by(|a, b| b.1.cmp(&a.1));
+        // Version pick, shared with the `catalogMode` rewrite below — the
+        // display version must match what will actually get installed, so
+        // the same pick runs when the rewrite redirects resolution to the
+        // catalog's range. Delegates to the resolver's `pick_version` so
+        // `add` and full resolution cannot drift: dist-tag preference,
+        // `minimumReleaseAgeExclude` exemptions, and the strict/lenient
+        // age-gate fallback all behave identically.
         let highest_satisfying = |range_str: &str| -> Option<String> {
-            let range = node_semver::Range::parse(range_str).ok()?;
-            // Mirror `aube_resolver::pick_version`: prefer the
-            // `dist-tags.latest` version when it satisfies the range.
-            // npm and pnpm both pin toward the publisher's tagged
-            // build over the strictly-highest matching version, and
-            // the display line here must agree with what the
-            // resolver actually installs.
-            if let Some(latest) = packument.dist_tags.get("latest")
-                && let Ok(parsed_latest) = node_semver::Version::parse(latest)
-                && parsed_latest.satisfies(&range)
-                && packument.versions.contains_key(latest)
-            {
-                return Some(latest.clone());
+            match aube_resolver::pick_version_for_add(
+                packument,
+                &spec.name,
+                range_str,
+                minimum_release_age.as_ref(),
+            ) {
+                aube_resolver::PickResult::Found(meta) => Some(meta.version.clone()),
+                aube_resolver::PickResult::NoMatch | aube_resolver::PickResult::AgeGated(_) => None,
             }
-            parsed_versions
-                .iter()
-                .find(|(_, parsed)| parsed.satisfies(&range))
-                .map(|(raw, _)| (*raw).clone())
         };
-        let resolved_version = highest_satisfying(&effective_range)
-            .ok_or_else(|| miette!("no version of {} matches {effective_range}", spec.name))?;
+        let resolved_version = match aube_resolver::pick_version_for_add(
+            packument,
+            &spec.name,
+            &effective_range,
+            minimum_release_age.as_ref(),
+        ) {
+            aube_resolver::PickResult::Found(meta) => meta.version.clone(),
+            // An age the registry gave us no way to check is a different
+            // refusal from a release that is genuinely too new (#581), and
+            // `minimumReleaseAgeStrict=false` is not offered for it: loosening
+            // strictness would take the newest matching version with no age
+            // evidence at all. Mirrors the resolver's split so `add` and a
+            // full install report the same failure the same way.
+            aube_resolver::PickResult::AgeGated(aube_resolver::AgeGateCause::Undeterminable) => {
+                return Err(miette!(
+                    code = aube_codes::errors::ERR_AUBE_RELEASE_AGE_MISSING_TIME,
+                    help = format!(
+                        "the minimumReleaseAge window is checked against the registry's `time` \
+                         metadata, which omits these versions — no window would admit them\n\
+                         to proceed: unset `registry-supports-time-field` if it is on (it \
+                         suppresses the full-packument fetch that carries `time`), check the \
+                         registry config in .npmrc, add `{}` to `minimumReleaseAgeExclude`, or \
+                         set `minimumReleaseAge=0` to turn the window off for this project \
+                         (`--minimum-release-age=0` for this run alone)",
+                        spec.name
+                    ),
+                    "cannot check the publish age of {}@{effective_range} — the registry served no publish time for any matching version",
+                    spec.name,
+                ));
+            }
+            aube_resolver::PickResult::AgeGated(aube_resolver::AgeGateCause::TooNew) => {
+                // Only reachable in strict mode today (the lenient pick
+                // falls back instead), but derive the label anyway so a
+                // future lenient AgeGated path can't print a lie.
+                let (minutes, strict) = minimum_release_age
+                    .as_ref()
+                    .map_or((0, false), |m| (m.minutes, m.strict));
+                // Same remedies the resolver's `format_age_gate_help` offers on
+                // the install path — `add` used to send the user away with no
+                // way out at all.
+                return Err(miette!(
+                    code = aube_codes::errors::ERR_AUBE_NO_MATURE_MATCHING_VERSION,
+                    // `spec.name` is already the REGISTRY identity here — an
+                    // aliased add carries the user-facing key in `spec.alias`
+                    // and writes `npm:{spec.name}@…` to the manifest — so it is
+                    // the right thing to name in an exclude remedy, unlike the
+                    // resolver's `task.name` (see `AgeGateDetails::registry_name`).
+                    help = format!(
+                        "to bypass for this run: `--minimum-release-age=<duration>` to shorten \
+                         the window (`0` turns it off), or \
+                         `--minimum-release-age-exclude={0}` to exempt just this package\n\
+                         to bypass persistently: shorten `minimumReleaseAge` in .npmrc (`0` \
+                         turns it off), or add `{0}` to `minimumReleaseAgeExclude`",
+                        spec.name
+                    ),
+                    "no version of {} matching {effective_range} is older than {minutes} minute(s){}",
+                    spec.name,
+                    if strict {
+                        " (minimumReleaseAgeStrict=true)"
+                    } else {
+                        ""
+                    },
+                ));
+            }
+            aube_resolver::PickResult::NoMatch => {
+                return Err(miette!(
+                    "no version of {} matches {effective_range}",
+                    spec.name
+                ));
+            }
+        };
 
         // Build the specifier for package.json.
         // Dist-tags (including "latest") are written as ^version — this matches pnpm's behavior
@@ -424,7 +688,17 @@ pub(super) async fn update_manifest_for_add(
         // the name when the alias equals the JSR name (matching pnpm).
         let is_jsr = spec.jsr_name.is_some();
         let needs_npm_prefix = !is_jsr && (spec.alias.is_some() || orig.starts_with("npm:"));
-        let prefix = &default_prefix;
+        // A prerelease saves exact, as in pnpm: `^7.1.0-beta` also admits
+        // `7.1.0-dev.20261105.1`, because `dev` sorts after `beta`, and the
+        // install that follows re-resolves this range, so the caret would
+        // install a nightly the user never asked for.
+        let prefix = if node_semver::Version::parse(&resolved_version)
+            .is_ok_and(|version| version.is_prerelease())
+        {
+            ""
+        } else {
+            default_prefix.as_str()
+        };
         // npm-incumbent save-prefix convention: `npm install pkg@1.2.3` applies
         // its `save-prefix` default and writes `"^1.2.3"`, whereas pnpm/bun
         // preserve the bare version. The embedder turns this on
@@ -529,8 +803,11 @@ pub(super) async fn update_manifest_for_add(
                         .unwrap_or_default();
                     let catalog_version = highest_satisfying(&cat_range).unwrap_or_else(|| {
                         tracing::debug!(
-                            "catalog range {cat_range:?} for {} did not match any packument version; \
-                             falling back to user-resolved version for display",
+                            "catalog range {cat_range:?} for {} matched no packument version \
+                             (or, under minimumReleaseAgeStrict, none mature enough); falling \
+                             back to user-resolved version for display — the install that \
+                             follows resolves the catalog range itself and fails loudly if it \
+                             genuinely can't",
                             spec.name
                         );
                         resolved_version.clone()
@@ -551,10 +828,175 @@ pub(super) async fn update_manifest_for_add(
             }
         };
 
-        eprintln!("  + {pkg_name_for_manifest}@{display_version} (specifier: {specifier})");
+        crate::commands::install::control::output(
+            crate::commands::install::InstallOutputLevel::Info,
+            None,
+            format!("  + {pkg_name_for_manifest}@{display_version} (specifier: {specifier})"),
+        );
 
         place_dep_in_manifest(&mut manifest, pkg_name_for_manifest, specifier, &opts);
+        if save_types && !is_jsr && !spec.name.starts_with("@types/") {
+            types_candidates.push((
+                pkg_name_for_manifest.to_string(),
+                spec.name.clone(),
+                display_version,
+            ));
+        }
     }
+
+    // After the loop, so an `@types/*` named in this same command, or one the
+    // project already lists, is kept exactly as written.
+    let skipped = |types_name: &str, reason: String| {
+        crate::commands::install::control::output(
+            crate::commands::install::InstallOutputLevel::Info,
+            None,
+            format!("  skipped {types_name}: {reason}"),
+        );
+    };
+    // A name without a scope resolves to the default registry.
+    let default_registry = client.config_registry_for("");
+    for (key, name, version) in types_candidates {
+        // TypeScript finds an alias's types under the alias, so `renamed`
+        // for `npm:real` gets `@types/renamed` pointing at `npm:@types/real`.
+        let types_key = types_package_name(&key);
+        let types_name = types_package_name(&name);
+        if manifest.direct_dependency_range(&types_key).is_some()
+            || manifest.peer_dependencies.contains_key(&types_key)
+        {
+            continue;
+        }
+        // Abbreviated packuments drop `types`/`typings`/`exports`, so read
+        // the installed version from the full document.
+        let full = client
+            .fetch_packument_full_cached(&name, &full_cache_dir)
+            .await
+            .map_err(|e| miette!("failed to fetch {name}: {e}"))?;
+        if full["versions"].get(&version).is_none_or(has_bundled_types) {
+            continue;
+        }
+        // A catalog entry for the `@types` package is the project's own pin, so
+        // it is saved as written and the install resolves it, aliases included.
+        // An alias of the package can't be a catalog reference.
+        let aliased = types_key != types_name;
+        let catalog_range = match opts.save_catalog.as_deref() {
+            Some(target) => workspace_catalogs.get(target),
+            None if matches!(catalog_mode, CatalogMode::Manual) => None,
+            None => default_catalog,
+        }
+        .filter(|_| !aliased)
+        .and_then(|catalog| catalog.get(&types_name));
+        if let Some(range) = catalog_range {
+            let specifier = match opts.save_catalog.as_deref() {
+                Some(target) if target != "default" => format!("catalog:{target}"),
+                _ => "catalog:".to_string(),
+            };
+            crate::commands::install::control::output(
+                crate::commands::install::InstallOutputLevel::Info,
+                None,
+                format!("  + {types_key}@{range} (specifier: {specifier})"),
+            );
+            manifest.dev_dependencies.insert(types_key, specifier);
+            continue;
+        }
+        // A package from its scope's own registry (`@acme:registry=`) may be
+        // private, so its name is never sent to a different registry for
+        // `@types`. A package from the default registry is looked up wherever
+        // the `@types` scope points.
+        let registry = client.config_registry_for(&name);
+        if registry != default_registry && registry != client.config_registry_for(&types_name) {
+            skipped(
+                &types_name,
+                format!("{name} and @types use different registries"),
+            );
+            continue;
+        }
+        let fetched = if needs_time {
+            client
+                .fetch_packument_with_time_cached(&types_name, &full_cache_dir)
+                .await
+        } else {
+            client
+                .fetch_packument_cached(&types_name, &corgi_cache_dir)
+                .await
+        };
+        // Only a 404 means "no such package"; auth and network failures
+        // stop the add before package.json is written.
+        let types_packument = match fetched {
+            Ok(packument) => Some(packument),
+            Err(aube_registry::Error::NotFound(_)) => None,
+            Err(e) => return Err(miette!("failed to fetch {types_name}: {e}")),
+        };
+        // DefinitelyTyped versions follow the library's major.minor, so stay
+        // on the major just installed rather than taking `latest`. A `^N`
+        // range never admits a prerelease, so the save prefix always applies.
+        let Ok(major) = node_semver::Version::parse(&version).map(|v| v.major) else {
+            continue;
+        };
+        let picked = types_packument.as_ref().map(|packument| {
+            aube_resolver::pick_version_for_add(
+                packument,
+                &types_name,
+                &format!("^{major}"),
+                minimum_release_age.as_ref(),
+            )
+        });
+        let reason = match picked {
+            Some(aube_resolver::PickResult::Found(meta)) if meta.deprecated.is_none() => {
+                let manual_specifier = if aliased {
+                    format!("npm:{types_name}@{default_prefix}{}", meta.version)
+                } else {
+                    format!("{default_prefix}{}", meta.version)
+                };
+                let specifier = if let Some(target) = opts.save_catalog.as_deref() {
+                    decide_save_catalog(
+                        target,
+                        &workspace_catalogs,
+                        &parse_pkg_spec(&types_name)?,
+                        aliased,
+                        &manual_specifier,
+                        &meta.version,
+                        &mut catalog_upserts,
+                        |_| None,
+                    )
+                    .0
+                } else {
+                    manual_specifier
+                };
+                crate::commands::install::control::output(
+                    crate::commands::install::InstallOutputLevel::Info,
+                    None,
+                    format!("  + {types_key}@{} (specifier: {specifier})", meta.version),
+                );
+                manifest.dev_dependencies.insert(types_key, specifier);
+                continue;
+            }
+            None => "not found on the registry".to_string(),
+            // The pick only lands on a deprecated release when every match is
+            // deprecated, which on DefinitelyTyped marks a stub left behind
+            // once the library started shipping its own types.
+            Some(aube_resolver::PickResult::Found(_)) => "deprecated".to_string(),
+            Some(aube_resolver::PickResult::NoMatch) => format!("no release for {name} {major}.x"),
+            Some(aube_resolver::PickResult::AgeGated(_)) => {
+                format!("no release for {name} {major}.x is old enough for minimumReleaseAge")
+            }
+        };
+        skipped(&types_name, reason);
+    }
+
+    // Pre-flight the catalog write target BEFORE mutating the dependent
+    // manifest. Under nub identity the catalog cannot live in the
+    // pnpm-named workspace YAML (the next resolve refuses to read it),
+    // so it must land in `workspaces.catalog` in package.json; resolving
+    // + validating the target here means a `--save-catalog` that can't
+    // land its entry fails before rewriting the manifest to an
+    // unresolvable `catalog:` reference (issue #369).
+    let catalog_target = if catalog_upserts.is_empty() {
+        None
+    } else {
+        Some(crate::commands::catalogs::resolve_catalog_write_target(
+            cwd,
+        )?)
+    };
 
     // Write the updated package.json. Under `--no-save` callers still
     // write the mutated manifest to disk for the duration of the
@@ -562,20 +1004,20 @@ pub(super) async fn update_manifest_for_add(
     // restore the original bytes from their snapshot before returning.
     crate::commands::write_manifest_dep_sections(&manifest_path, &manifest)?;
     if print_updated {
-        eprintln!("Updated package.json");
+        crate::commands::install::control::output(
+            crate::commands::install::InstallOutputLevel::Info,
+            None,
+            "Updated package.json",
+        );
     }
 
-    // Apply queued `--save-catalog` upserts. Lands once at the end of
-    // the per-package loop so the workspace yaml is rewritten at most
-    // once per command — `edit_workspace_yaml` no-ops when nothing
-    // structural changes (preserving comments under filtered/recursive
-    // re-runs that all target the same catalog).
-    if !catalog_upserts.is_empty() {
-        let yaml_root = crate::dirs::find_workspace_yaml_root(cwd)
-            .or_else(|| crate::dirs::find_workspace_root(cwd))
-            .unwrap_or_else(|| cwd.to_path_buf());
-        let yaml_path = aube_manifest::workspace::workspace_yaml_target(&yaml_root);
-        crate::commands::catalogs::upsert_catalog_entries(&yaml_path, &catalog_upserts)?;
+    // Apply queued `--save-catalog` upserts to the pre-resolved target.
+    // Lands once at the end of the per-package loop so the target is
+    // rewritten at most once per command — the yaml/manifest writers
+    // no-op when nothing structural changes (preserving comments/format
+    // under filtered/recursive re-runs that all target the same catalog).
+    if let Some(target) = &catalog_target {
+        crate::commands::catalogs::apply_catalog_upserts(target, &catalog_upserts)?;
     }
 
     Ok(())
@@ -632,9 +1074,13 @@ fn apply_workspace_spec_to_manifest(
         ));
     };
 
-    eprintln!(
-        "  + {pkg_name_for_manifest}@{workspace_version} (specifier: {})",
-        spec.range
+    crate::commands::install::control::output(
+        crate::commands::install::InstallOutputLevel::Info,
+        None,
+        format!(
+            "  + {pkg_name_for_manifest}@{workspace_version} (specifier: {})",
+            spec.range
+        ),
     );
 
     place_dep_in_manifest(manifest, pkg_name_for_manifest, spec.range.clone(), opts);
@@ -725,7 +1171,11 @@ fn apply_linked_workspace_to_manifest(
         }
     };
 
-    eprintln!("  + {pkg_name_for_manifest}@{workspace_version} (specifier: {specifier})");
+    crate::commands::install::control::output(
+        crate::commands::install::InstallOutputLevel::Info,
+        None,
+        format!("  + {pkg_name_for_manifest}@{workspace_version} (specifier: {specifier})"),
+    );
 
     place_dep_in_manifest(manifest, pkg_name_for_manifest, specifier, opts);
 }
@@ -752,7 +1202,11 @@ fn apply_git_spec_to_manifest(
     verbatim_spec: &str,
     opts: &AddManifestOptions,
 ) {
-    eprintln!("  + {pkg_name_for_manifest} (specifier: {verbatim_spec})");
+    crate::commands::install::control::output(
+        crate::commands::install::InstallOutputLevel::Info,
+        None,
+        format!("  + {pkg_name_for_manifest} (specifier: {verbatim_spec})"),
+    );
 
     place_dep_in_manifest(
         manifest,
@@ -832,8 +1286,10 @@ fn decide_save_catalog(
             // for the same reason `decide_add_rewrite` does.
             let catalog_version = highest_satisfying(existing_range).unwrap_or_else(|| {
                 tracing::debug!(
-                    "catalog range {existing_range:?} for {} did not match any \
-                     packument version; falling back to user-resolved version for display",
+                    "catalog range {existing_range:?} for {} matched no packument version \
+                     (or, under minimumReleaseAgeStrict, none mature enough); falling back \
+                     to user-resolved version for display — the install that follows \
+                     resolves the catalog range itself and fails loudly if it genuinely can't",
                     spec.name
                 );
                 resolved_version.to_string()
@@ -868,9 +1324,12 @@ mod tests {
     fn opts(save_dev: bool, save_optional: bool, save_peer: bool) -> AddManifestOptions {
         AddManifestOptions {
             save_dev,
+            setting_overrides: Vec::new(),
             save_exact: false,
             save_optional,
             save_peer,
+            save_types: Some(false),
+            network_mode: aube_registry::NetworkMode::Online,
             save_catalog: None,
             workspace_protocol_override: None,
         }
@@ -948,5 +1407,531 @@ mod tests {
         assert!(m.dependencies.is_empty());
         assert!(m.peer_dependencies.contains_key("is-odd"));
         assert!(m.dev_dependencies.contains_key("is-odd"));
+    }
+
+    #[test]
+    fn missing_package_hints_use_only_the_registry_the_name_routes_through() {
+        let corpus = Some("react\nlodash\nexpress\n");
+        let public = aube_registry::client::RegistryClient::new("https://registry.npmjs.org");
+        let private = aube_registry::client::RegistryClient::new("https://packages.example.test");
+
+        let public_error = package_not_found_error_for_registry_with_corpus(
+            &public,
+            "lodaszh".to_string(),
+            corpus,
+        );
+        assert_eq!(
+            public_error.to_string(),
+            "package not found: lodaszh; did you mean lodash?"
+        );
+
+        let private_error = package_not_found_error_for_registry_with_corpus(
+            &private,
+            "lodaszh".to_string(),
+            corpus,
+        );
+        assert_eq!(private_error.to_string(), "package not found: lodaszh");
+    }
+
+    #[tokio::test]
+    async fn offline_add_resolves_from_packument_cache() {
+        let project = tempfile::tempdir().unwrap();
+        let cache_root = project.path().join("cache");
+        std::fs::write(project.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            project.path().join(".npmrc"),
+            format!("cache-dir={}\n", cache_root.display()),
+        )
+        .unwrap();
+
+        let packument: aube_registry::Packument = serde_json::from_value(serde_json::json!({
+            "name": "cached-only",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "cached-only",
+                    "version": "1.0.0"
+                }
+            }
+        }))
+        .unwrap();
+        let cache_dir = crate::commands::packument_cache_dir_for_cwd(project.path());
+        crate::commands::make_client(project.path()).seed_packument_cache(
+            "cached-only",
+            &cache_dir,
+            &packument,
+            None,
+            None,
+            true,
+        );
+
+        update_manifest_for_add(
+            project.path(),
+            &["cached-only".to_string()],
+            AddManifestOptions {
+                save_dev: false,
+                save_exact: false,
+                save_optional: false,
+                save_peer: false,
+                save_types: Some(false),
+                network_mode: aube_registry::NetworkMode::Offline,
+                save_catalog: None,
+                workspace_protocol_override: None,
+                setting_overrides: Vec::new(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        let manifest = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+        assert!(manifest.contains(r#""cached-only": "^1.0.0""#));
+    }
+
+    #[tokio::test]
+    async fn prerelease_dist_tag_saves_exact_so_a_later_prerelease_cannot_replace_it() {
+        let project = tempfile::tempdir().unwrap();
+        let cache_root = project.path().join("cache");
+        std::fs::write(project.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            project.path().join(".npmrc"),
+            format!("cache-dir={}\n", cache_root.display()),
+        )
+        .unwrap();
+
+        // `dev` sorts after `beta`, so `^7.1.0-beta` would admit the nightly.
+        let packument: aube_registry::Packument = serde_json::from_value(serde_json::json!({
+            "name": "tagged",
+            "dist-tags": { "latest": "7.0.2", "beta": "7.1.0-beta" },
+            "versions": {
+                "7.0.2": { "name": "tagged", "version": "7.0.2" },
+                "7.1.0-beta": { "name": "tagged", "version": "7.1.0-beta" },
+                "7.1.0-dev.20261105.1": { "name": "tagged", "version": "7.1.0-dev.20261105.1" }
+            }
+        }))
+        .unwrap();
+        let cache_dir = crate::commands::packument_cache_dir_for_cwd(project.path());
+        crate::commands::make_client(project.path())
+            .seed_packument_cache("tagged", &cache_dir, &packument, None, None, true);
+
+        let add = |spec: &'static str| {
+            let dir = project.path().to_path_buf();
+            async move {
+                update_manifest_for_add(
+                    &dir,
+                    &[spec.to_string()],
+                    AddManifestOptions {
+                        save_dev: false,
+                        save_exact: false,
+                        save_optional: false,
+                        save_peer: false,
+                        save_types: Some(false),
+                        network_mode: aube_registry::NetworkMode::Offline,
+                        save_catalog: None,
+                        workspace_protocol_override: None,
+                        setting_overrides: Vec::new(),
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
+                std::fs::read_to_string(dir.join("package.json")).unwrap()
+            }
+        };
+
+        assert!(
+            add("tagged@beta")
+                .await
+                .contains(r#""tagged": "7.1.0-beta""#)
+        );
+        // A stable tag keeps the configured prefix.
+        assert!(add("tagged@latest").await.contains(r#""tagged": "^7.0.2""#));
+    }
+
+    #[test]
+    fn bundled_types_come_from_types_typings_or_the_root_export_types_condition() {
+        use serde_json::json;
+        for declared in [
+            json!({ "types": "index.d.ts" }),
+            json!({ "typings": "index.d.ts" }),
+            json!({ "exports": { ".": { "import": { "types": "./index.d.mts" } } } }),
+            json!({ "exports": { "types": "./index.d.ts", "default": "./index.js" } }),
+            json!({ "exports": [{ "types@>=5": "./ts5.d.ts" }, "./index.js"] }),
+        ] {
+            assert!(has_bundled_types(&declared), "{declared}");
+        }
+        for untyped in [
+            json!({}),
+            json!({ "types": "" }),
+            json!({ "exports": { ".": { "types": null, "default": "./index.js" } } }),
+            // A typed subpath doesn't type `import "pkg"`.
+            json!({ "exports": { ".": "./index.js", "./feature": { "types": "./f.d.ts" } } }),
+        ] {
+            assert!(!has_bundled_types(&untyped), "{untyped}");
+        }
+        assert_eq!(types_package_name("express"), "@types/express");
+        assert_eq!(types_package_name("@babel/core"), "@types/babel__core");
+    }
+
+    /// A mock-registry document for `name`, every version carrying `fields`.
+    fn registry_doc(
+        name: &str,
+        versions: &[&str],
+        fields: serde_json::Value,
+    ) -> (String, u16, String) {
+        let docs: serde_json::Map<_, _> = versions
+            .iter()
+            .map(|version| {
+                let mut doc = fields.clone();
+                doc["name"] = name.into();
+                doc["version"] = (*version).into();
+                (version.to_string(), doc)
+            })
+            .collect();
+        let body = serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": versions.last() },
+            "versions": docs,
+        });
+        (name.to_string(), 200, body.to_string())
+    }
+
+    /// Serves `routes` as a registry: `@types/*` only under `/types/`, and
+    /// `/private/` as a second registry for `@private`.
+    async fn serve_registry(
+        routes: Vec<(String, u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registry = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request.split_whitespace().nth(1).unwrap_or_default();
+                let path = path.trim_start_matches("/private");
+                let (status, body) = routes
+                    .iter()
+                    .find(|(name, ..)| {
+                        let prefix = if name.starts_with("@types/") {
+                            "/types"
+                        } else {
+                            ""
+                        };
+                        path == format!("{prefix}/{}", name.replace('/', "%2F"))
+                    })
+                    .map_or((404, ""), |(_, status, body)| (*status, body.as_str()));
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (registry, server)
+    }
+
+    #[tokio::test]
+    async fn save_types_adds_types_only_for_untyped_packages_and_fails_on_a_lookup_error() {
+        use serde_json::json;
+
+        let routes = vec![
+            registry_doc("untyped", &["1.2.0"], json!({})),
+            registry_doc("@types/untyped", &["1.0.5", "2.0.0"], json!({})),
+            registry_doc("@scope/untyped", &["3.1.0"], json!({})),
+            registry_doc("@types/scope__untyped", &["3.0.1"], json!({})),
+            registry_doc("typed", &["2.0.0"], json!({ "types": "index.d.ts" })),
+            registry_doc("@types/typed", &["2.0.0"], json!({})),
+            registry_doc("no-dt", &["1.0.0"], json!({})),
+            registry_doc("kept", &["1.0.0"], json!({})),
+            registry_doc("@types/kept", &["1.0.0"], json!({})),
+            registry_doc("@private/lib", &["1.0.0"], json!({})),
+            registry_doc("@types/private__lib", &["1.0.0"], json!({})),
+            registry_doc("denied", &["1.0.0"], json!({})),
+            registry_doc("twice", &["4.0.0", "5.0.0"], json!({})),
+            registry_doc("@types/twice", &["4.0.0", "5.0.0"], json!({})),
+            ("@types/denied".to_string(), 401, String::new()),
+            registry_doc("stubbed", &["1.0.0"], json!({})),
+            registry_doc(
+                "@types/stubbed",
+                &["1.0.0"],
+                json!({ "deprecated": "stub types" }),
+            ),
+        ];
+        let (registry, server) = serve_registry(routes).await;
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".npmrc"),
+            format!(
+                "registry={registry}\n@private:registry={registry}private/\n\
+                 @types:registry={registry}types/\n\
+                 cache-dir={}\nminimumReleaseAge=0\n",
+                project.path().join("cache").display()
+            ),
+        )
+        .unwrap();
+        let manifest_path = project.path().join("package.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{ "dependencies": { "@types/kept": "~0.1.0" } }"#,
+        )
+        .unwrap();
+        let save_types = || AddManifestOptions {
+            save_types: Some(true),
+            ..opts(false, false, false)
+        };
+
+        #[derive(Default)]
+        struct RecordingReporter(std::sync::Mutex<Vec<String>>);
+        impl crate::commands::install::InstallReporter for RecordingReporter {
+            fn report(&self, event: crate::commands::install::InstallEvent) {
+                if let crate::commands::install::InstallEvent::Output { message, .. } = event {
+                    self.0.lock().unwrap().push(message);
+                }
+            }
+        }
+        let reporter = std::sync::Arc::new(RecordingReporter::default());
+        crate::commands::install::control::scope(
+            crate::commands::install::InstallControl::events(reporter.clone()),
+            update_manifest_for_add(
+                project.path(),
+                &[
+                    "untyped",
+                    "@scope/untyped",
+                    "typed",
+                    "no-dt",
+                    "kept",
+                    "@private/lib",
+                    "twice@4.0.0",
+                    "twice@5.0.0",
+                    "stubbed",
+                ]
+                .map(String::from),
+                save_types(),
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        let manifest = aube_manifest::PackageJson::from_path(&manifest_path).unwrap();
+        // `@types/untyped` stays on its library's major, not on `latest`, and
+        // comes from the `@types` registry although `untyped` doesn't.
+        // `@types/private__lib` is never asked of a registry `@private`
+        // doesn't use, and the add says so. The last spec for a name picks both
+        // the dependency and its `@types`.
+        assert_eq!(
+            manifest.dev_dependencies,
+            BTreeMap::from([
+                ("@types/scope__untyped".to_string(), "^3.0.1".to_string()),
+                ("@types/twice".to_string(), "^5.0.0".to_string()),
+                ("@types/untyped".to_string(), "^1.0.5".to_string()),
+            ]),
+        );
+        assert_eq!(manifest.dependencies["twice"], "5.0.0");
+        assert_eq!(manifest.dependencies["@types/kept"], "~0.1.0");
+        let output = reporter.0.lock().unwrap().clone();
+        let skip =
+            "  skipped @types/private__lib: @private/lib and @types use different registries";
+        assert!(output.iter().any(|line| line == skip), "{output:#?}");
+        let skip = "  skipped @types/stubbed: deprecated";
+        assert!(output.iter().any(|line| line == skip), "{output:#?}");
+
+        // Only a 404 is skipped: a 401 fails the add before package.json is written.
+        let written = std::fs::read_to_string(&manifest_path).unwrap();
+        let error =
+            update_manifest_for_add(project.path(), &["denied".to_string()], save_types(), false)
+                .await
+                .unwrap_err();
+        server.abort();
+        assert!(error.to_string().contains("@types/denied"), "{error}");
+        assert_eq!(std::fs::read_to_string(&manifest_path).unwrap(), written);
+    }
+
+    #[tokio::test]
+    async fn save_types_goes_through_the_workspace_catalog() {
+        use serde_json::json;
+
+        let (registry, server) = serve_registry(vec![
+            registry_doc("listed", &["2.0.0"], json!({})),
+            registry_doc("unlisted", &["1.0.0"], json!({})),
+            registry_doc("@types/unlisted", &["1.0.3"], json!({})),
+        ])
+        .await;
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".npmrc"),
+            format!(
+                "registry={registry}\n@types:registry={registry}types/\n\
+                 cache-dir={}\nminimumReleaseAge=0\n",
+                project.path().join("cache").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\ncatalogMode: strict\ncatalog:\n  '@types/listed': npm:@acme/listed-types@^2\n",
+        )
+        .unwrap();
+        std::fs::write(project.path().join("package.json"), "{}").unwrap();
+        let member = project.path().join("packages/member");
+        std::fs::create_dir_all(&member).unwrap();
+        let manifest_path = member.join("package.json");
+        std::fs::write(&manifest_path, "{}").unwrap();
+        let add = |name: &str, save_catalog: Option<&str>| {
+            let dir = member.as_path();
+            let packages = [name.to_string()];
+            let options = AddManifestOptions {
+                save_types: Some(true),
+                save_catalog: save_catalog.map(String::from),
+                ..opts(false, false, false)
+            };
+            async move { update_manifest_for_add(dir, &packages, options, false).await }
+        };
+
+        // The entry is saved as written: nothing serves `@types/listed`.
+        add("listed", None).await.unwrap();
+        add("unlisted", Some("default")).await.unwrap();
+        server.abort();
+        let manifest = aube_manifest::PackageJson::from_path(&manifest_path).unwrap();
+        assert_eq!(manifest.dev_dependencies["@types/listed"], "catalog:");
+        assert_eq!(manifest.dev_dependencies["@types/unlisted"], "catalog:");
+        let catalogs = crate::commands::load_workspace_catalogs(&member).unwrap();
+        assert_eq!(catalogs["default"]["@types/unlisted"], "^1.0.3");
+    }
+
+    #[tokio::test]
+    async fn save_types_setting_applies_unless_the_flag_turns_it_off() {
+        use serde_json::json;
+
+        let (registry, server) = serve_registry(vec![
+            registry_doc("one", &["1.0.0"], json!({})),
+            registry_doc("@types/one", &["1.0.0"], json!({})),
+            registry_doc("two", &["1.0.0"], json!({})),
+            registry_doc("@types/two", &["1.0.0"], json!({})),
+        ])
+        .await;
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".npmrc"),
+            format!(
+                "registry={registry}\n@types:registry={registry}types/\n\
+                 cache-dir={}\nminimumReleaseAge=0\n",
+                project.path().join("cache").display()
+            ),
+        )
+        .unwrap();
+        // Set only in the root yaml, so a member has to inherit it.
+        std::fs::write(
+            project.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\nsaveTypes: true\n",
+        )
+        .unwrap();
+        std::fs::write(project.path().join("package.json"), "{}").unwrap();
+        let member = project.path().join("packages/member");
+        std::fs::create_dir_all(&member).unwrap();
+        let manifest_path = member.join("package.json");
+        std::fs::write(&manifest_path, "{}").unwrap();
+        for (name, save_types) in [("one", None), ("two", Some(false))] {
+            let options = AddManifestOptions {
+                save_types,
+                ..opts(false, false, false)
+            };
+            update_manifest_for_add(&member, &[name.to_string()], options, false)
+                .await
+                .unwrap();
+        }
+        server.abort();
+        let manifest = aube_manifest::PackageJson::from_path(&manifest_path).unwrap();
+        assert_eq!(manifest.dev_dependencies["@types/one"], "^1.0.0");
+        assert!(!manifest.dev_dependencies.contains_key("@types/two"));
+    }
+
+    #[tokio::test]
+    async fn local_specs_are_saved_under_the_package_s_own_name() {
+        let project = tempfile::tempdir().unwrap();
+        for (dir, manifest) in [
+            ("named", r#"{ "name": "@acme/real-name" }"#),
+            ("unnamed", "{}"),
+        ] {
+            std::fs::create_dir(project.path().join(dir)).unwrap();
+            std::fs::write(project.path().join(dir).join("package.json"), manifest).unwrap();
+        }
+        let manifest_path = project.path().join("package.json");
+        std::fs::write(&manifest_path, "{}").unwrap();
+        update_manifest_for_add(
+            project.path(),
+            &["./named", "./unnamed", "picked@./named"].map(String::from),
+            opts(false, false, false),
+            false,
+        )
+        .await
+        .unwrap();
+        let manifest = aube_manifest::PackageJson::from_path(&manifest_path).unwrap();
+        assert_eq!(manifest.dependencies["@acme/real-name"], "link:./named");
+        assert_eq!(manifest.dependencies["unnamed"], "link:./unnamed");
+        assert_eq!(manifest.dependencies["picked"], "link:./named");
+    }
+
+    #[tokio::test]
+    async fn offline_add_falls_back_to_full_packument_cache() {
+        // Online adds under the age gate cache packuments in
+        // `packuments-full-v1` only. If the gate is later disabled, the
+        // primary offline lookup moves to the corgi cache — but the add
+        // must still serve the full packument already on disk instead of
+        // failing on the empty corgi cache.
+        let project = tempfile::tempdir().unwrap();
+        let cache_root = project.path().join("cache");
+        std::fs::write(project.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            project.path().join(".npmrc"),
+            format!("cache-dir={}\nminimumReleaseAge=0\n", cache_root.display()),
+        )
+        .unwrap();
+
+        let packument: aube_registry::Packument = serde_json::from_value(serde_json::json!({
+            "name": "full-cached-only",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "full-cached-only",
+                    "version": "1.0.0"
+                }
+            }
+        }))
+        .unwrap();
+        let full_cache_dir = crate::commands::packument_full_cache_dir_for_cwd(project.path());
+        crate::commands::make_client(project.path()).seed_full_packument_cache(
+            "full-cached-only",
+            &full_cache_dir,
+            &packument,
+            None,
+            None,
+            true,
+        );
+
+        update_manifest_for_add(
+            project.path(),
+            &["full-cached-only".to_string()],
+            AddManifestOptions {
+                save_dev: false,
+                save_exact: false,
+                save_optional: false,
+                save_peer: false,
+                save_types: Some(false),
+                network_mode: aube_registry::NetworkMode::Offline,
+                save_catalog: None,
+                workspace_protocol_override: None,
+                setting_overrides: Vec::new(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        let manifest = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+        assert!(manifest.contains(r#""full-cached-only": "^1.0.0""#));
     }
 }

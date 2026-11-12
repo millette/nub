@@ -1,7 +1,7 @@
 mod driver;
 mod fetch;
 mod seed;
-mod vulnerable;
+pub(crate) mod vulnerable;
 
 use crate::local_source::is_non_registry_specifier;
 use crate::semver_util::version_satisfies;
@@ -9,7 +9,7 @@ use crate::{
     Error, FxHashMap, PeerContextOptions, ReadPackageHook, Resolver, apply_peer_contexts, catalog,
     hoist_auto_installed_peers,
 };
-use aube_lockfile::{DirectDep, LockedPackage, LockfileGraph};
+use aube_lockfile::{DirectDep, LocalSource, LockedPackage, LockfileGraph};
 use aube_manifest::PackageJson;
 use aube_registry::VersionMetadata;
 use std::collections::{BTreeMap, HashMap};
@@ -103,6 +103,7 @@ impl Resolver {
     /// peer-context suffixes, then strips the hoisted importer entries
     /// again. Returns the post-peer-context graph ready for lockfile
     /// emission, with `importers` mirroring the manifests.
+    #[allow(clippy::too_many_arguments)]
     fn finalize_resolved_graph(
         &self,
         importers: BTreeMap<String, Vec<DirectDep>>,
@@ -111,9 +112,35 @@ impl Resolver {
         resolved_times: BTreeMap<String, String>,
         skipped_optional_dependencies: BTreeMap<String, BTreeMap<String, String>>,
         catalog_picks: BTreeMap<String, BTreeMap<String, String>>,
+        importer_member_links: &ImporterMemberLinks,
     ) -> Result<LockfileGraph, Error> {
         let resolved_catalogs =
             catalog::materialize_catalog_picks(catalog_picks, resolved_versions);
+        // pnpm stores catalog-expanded override values in its lockfile header,
+        // not the raw `catalog:` references from pnpm-workspace.yaml. Resolve
+        // every valid selector against the configured catalogs here so even an
+        // override that did not happen to match this graph is serialized in the
+        // same canonical form. Invalid/missing catalog references stay raw; a
+        // matching task reports the existing catalog diagnostic during resolve.
+        let mut lockfile_overrides = self.overrides.clone();
+        for rule in &self.override_rules {
+            let Some(catalog_name) = rule
+                .replacement
+                .strip_prefix("catalog:")
+                .map(|name| if name.is_empty() { "default" } else { name })
+            else {
+                continue;
+            };
+            let Some(real_range) = self
+                .catalogs
+                .get(catalog_name)
+                .and_then(|catalog| catalog.get(&rule.target.name))
+                .filter(|range| !aube_util::pkg::is_catalog_spec(range))
+            else {
+                continue;
+            };
+            lockfile_overrides.insert(rule.raw_key.clone(), real_range.clone());
+        }
 
         let canonical = LockfileGraph {
             importers,
@@ -126,10 +153,9 @@ impl Resolver {
                 // on after the graph is built when the setting is active.
                 lockfile_include_tarball_url: false,
             },
-            // Stamp the resolver's overrides into the output graph so the
-            // lockfile writer can round-trip them and the next install's
-            // drift check can compare them against the manifest.
-            overrides: self.overrides.clone(),
+            // Stamp the pnpm-canonical override values into the output graph so
+            // the writer and the next install's drift check see the same shape.
+            overrides: lockfile_overrides,
             ignored_optional_dependencies: self.ignored_optional_dependencies.clone(),
             times: resolved_times,
             skipped_optional_dependencies,
@@ -164,7 +190,7 @@ impl Resolver {
         // level of `node_modules/`. Skipped entirely when the setting is
         // off — matches pnpm, which leaves the importer's `dependencies`
         // untouched in that mode.
-        let (hoisted, auto_installed_peers) = if self.auto_install_peers {
+        let (hoisted, mut auto_installed_peers) = if self.auto_install_peers {
             hoist_auto_installed_peers(canonical)
         } else {
             (canonical, crate::AutoInstalledPeers::new())
@@ -180,14 +206,150 @@ impl Resolver {
         };
         let _diag_peer =
             aube_util::diag::Span::new(aube_util::diag::Category::Resolver, "peer_context_apply");
+        let database_peers = crate::peer_context::database_peer_targets(
+            &hoisted,
+            &self.dependency_policy.package_extensions,
+            &peer_options,
+            |graph| {
+                link_workspace_members(graph, importer_member_links);
+            },
+        );
+        // Gated as pnpm gates it (`hoistPeers`): either setting asks for it.
+        let mut hoisted = if self.auto_install_peers || self.dedupe_peer_dependents {
+            crate::hoist_missing_peers(
+                hoisted,
+                &mut auto_installed_peers,
+                &peer_options,
+                self.auto_install_peers,
+            )
+        } else {
+            hoisted
+        };
+        let member_links = link_workspace_members(&mut hoisted, importer_member_links);
         let mut contextualized = apply_peer_contexts(hoisted, &peer_options)?;
         crate::remove_auto_installed_peers(&mut contextualized, &auto_installed_peers);
+        crate::peer_context::bind_database_peers(&mut contextualized, &database_peers);
+        // After the repairs, which may be all that still reaches a linked member.
+        unlink_workspace_members(&mut contextualized, &member_links);
         drop(_diag_peer);
         tracing::debug!(
             "peer-context pass produced {} contextualized packages",
             contextualized.packages.len()
         );
+
+        // Named-registry tarball persistence (pnpm-compat). Frozen installs
+        // skip preprocess, so they'd reconstruct a tarball URL from the DEFAULT
+        // registry — which 404s for a package a `namedRegistries` alias routed
+        // elsewhere. Mark every registry package whose resolved tarball host
+        // differs from its config-derived registry host so the writer always
+        // emits `resolution.tarball`. Comparing against the config-derived host
+        // (not the named route) makes this robust across lockfile REUSE (the
+        // reused pkg's tarball_url round-trips through parse) and correctly
+        // leaves scoped/default-registry packages — whose tarball host already
+        // matches config — untouched. Gated on a populated alias map so
+        // standalone aube (empty map) is byte-identical.
+        if !self.named_registries.is_empty() {
+            for pkg in contextualized.packages.values_mut() {
+                if pkg.local_source.is_none()
+                    && let Some(url) = pkg.tarball_url.as_deref()
+                {
+                    let config_registry = self.client.config_registry_for(pkg.registry_name());
+                    if aube_registry::registry_host_key(url)
+                        != aube_registry::registry_host_key(&config_registry)
+                    {
+                        pkg.force_tarball_url = true;
+                    }
+                }
+            }
+        }
+
         Ok(contextualized)
+    }
+}
+
+/// Importer -> dependency name -> (member directory, member version), for each
+/// importer dependency the resolver bound to a workspace member.
+type ImporterMemberLinks = BTreeMap<String, BTreeMap<String, (String, String)>>;
+
+/// A workspace member is an importer, not a package, so an importer's
+/// dependency on one (`name@version`) has no graph entry. The peer pass then
+/// found nothing to link for a registry package whose peer the member
+/// satisfies, and that package could not load it. pnpm links it
+/// (`react: link:packages/react`). For the pass, each such dependency points at
+/// the linked package the member is. Returns `link key -> name@version`.
+fn link_workspace_members(
+    graph: &mut LockfileGraph,
+    importer_member_links: &ImporterMemberLinks,
+) -> BTreeMap<String, String> {
+    let LockfileGraph {
+        importers,
+        packages,
+        ..
+    } = graph;
+    let mut links = BTreeMap::new();
+    for (importer, dep) in importers
+        .iter_mut()
+        .flat_map(|(importer, deps)| deps.iter_mut().map(move |dep| (importer, dep)))
+    {
+        let Some((dir, version)) = importer_member_links
+            .get(importer)
+            .and_then(|deps| deps.get(&dep.name))
+        else {
+            continue;
+        };
+        if dep.dep_path != format!("{}@{version}", dep.name) {
+            continue;
+        }
+        let local = LocalSource::Link(dir.into());
+        let key = local.dep_path(&dep.name);
+        packages
+            .entry(key.clone())
+            .or_insert_with(|| LockedPackage {
+                name: dep.name.clone(),
+                version: version.clone(),
+                dep_path: key.clone(),
+                local_source: Some(local),
+                ..Default::default()
+            });
+        links.insert(key.clone(), dep.dep_path.clone());
+        dep.dep_path = key;
+    }
+    links
+}
+
+/// Undoes [`link_workspace_members`] for the importers, which the workspace
+/// linker links itself, and drops each linked member nothing else reaches.
+///
+/// The linkers read an importer's `name@version` as the member only while no
+/// package holds that key. When a registry package does, because something else
+/// depends on the registry copy at the member's own version, the importer keeps
+/// its link, or it would load the registry copy.
+fn unlink_workspace_members(graph: &mut LockfileGraph, links: &BTreeMap<String, String>) {
+    if links.is_empty() {
+        return;
+    }
+    let LockfileGraph {
+        importers,
+        packages,
+        ..
+    } = graph;
+    for dep in importers.values_mut().flatten() {
+        if let Some(original) = links.get(&dep.dep_path)
+            && !packages.contains_key(original)
+        {
+            dep.dep_path = original.clone();
+        }
+    }
+    let reached: std::collections::BTreeSet<String> = packages
+        .values()
+        .flat_map(|pkg| pkg.dependencies.iter())
+        .map(|(name, tail)| format!("{name}@{tail}"))
+        .chain(importers.values().flatten().map(|dep| dep.dep_path.clone()))
+        .collect();
+    for key in links.keys() {
+        if !reached.contains(key) {
+            packages.remove(key);
+        }
     }
 }
 

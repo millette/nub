@@ -24,7 +24,7 @@ pub(crate) fn load_graph(
     manifest: &aube_manifest::PackageJson,
     missing_hint: &str,
 ) -> miette::Result<aube_lockfile::LockfileGraph> {
-    match aube_lockfile::parse_lockfile(project_dir, manifest) {
+    match super::install::parse_project_lockfile(project_dir, manifest) {
         Ok(g) => Ok(g),
         Err(aube_lockfile::Error::NotFound(_)) => Err(miette!("{missing_hint}")),
         Err(e) => Err(miette::Report::new(e)).wrap_err("failed to parse lockfile"),
@@ -40,15 +40,24 @@ pub(crate) fn collect_dep_closure(
     filter: DepFilter,
     no_optional: bool,
 ) -> std::collections::BTreeMap<String, &aube_lockfile::LockedPackage> {
-    let mut out: std::collections::BTreeMap<String, &aube_lockfile::LockedPackage> =
-        std::collections::BTreeMap::new();
-    let mut stack: Vec<String> = graph
+    let roots = graph
         .root_deps()
         .iter()
         .filter(|d| filter.keeps(d.dep_type))
         .filter(|d| !(no_optional && matches!(d.dep_type, aube_lockfile::DepType::Optional)))
         .map(|d| d.dep_path.clone())
         .collect();
+    dep_closure_from(graph, roots, no_optional)
+}
+
+/// The transitive dep-path closure reachable from the dep paths in `stack`.
+pub(crate) fn dep_closure_from(
+    graph: &aube_lockfile::LockfileGraph,
+    mut stack: Vec<String>,
+    no_optional: bool,
+) -> std::collections::BTreeMap<String, &aube_lockfile::LockedPackage> {
+    let mut out: std::collections::BTreeMap<String, &aube_lockfile::LockedPackage> =
+        std::collections::BTreeMap::new();
     while let Some(dep_path) = stack.pop() {
         if out.contains_key(&dep_path) {
             continue;
@@ -58,7 +67,28 @@ pub(crate) fn collect_dep_closure(
         };
         out.insert(dep_path.clone(), pkg);
         for (name, version) in &pkg.dependencies {
-            stack.push(format!("{name}@{version}"));
+            // pnpm mirrors optional edges into `dependencies`; omit those
+            // mirrors when --no-optional is active.
+            if no_optional && pkg.optional_dependencies.contains_key(name) {
+                continue;
+            }
+            if let Some(child) = aube_lockfile::resolve_dep_edge(name, version, |key| {
+                graph.packages.contains_key(key)
+            }) {
+                stack.push(child);
+            }
+        }
+        if !no_optional {
+            // Yarn Berry records optional children only in this map, while
+            // pnpm's duplicate edges are harmless because `out` deduplicates
+            // the traversal by dep_path.
+            for (name, version) in &pkg.optional_dependencies {
+                if let Some(child) = aube_lockfile::resolve_dep_edge(name, version, |key| {
+                    graph.packages.contains_key(key)
+                }) {
+                    stack.push(child);
+                }
+            }
         }
     }
     out
@@ -116,7 +146,8 @@ pub(crate) fn resolution_mode_for_cwd(cwd: &Path) -> aube_resolver::ResolutionMo
     crate::commands::install::settings::resolve_resolution_mode(&ctx)
 }
 
-/// Write lockfile preserving existing format and log the file name.
+/// Write a lockfile preserving an existing format, or using the configured
+/// creation default, and log the file name.
 pub(crate) fn write_and_log_lockfile(
     cwd: &Path,
     graph: &aube_lockfile::LockfileGraph,
@@ -198,15 +229,123 @@ pub(crate) fn select_workspace_packages(
             cwd.display()
         ));
     }
-    let matched =
-        aube_workspace::selector::select_workspace_packages(&root, &workspace_pkgs, filter)
-            .map_err(|e| miette!("invalid --filter selector: {e}"))?;
-    if matched.is_empty() {
-        return Err(miette!(
-            "aube {command}: filter {filter:?} did not match any workspace package"
-        ));
-    }
+    let matched = select_projects(&root, &workspace_pkgs, filter, command)?;
     Ok((root, matched))
+}
+
+/// Settle a `--filter` that selects no project before `command` touches
+/// anything: report it as pnpm does and return `true`, so the caller
+/// skips the command and every step after it, or fail under
+/// `--fail-if-no-match`. `false` when there is no filter, no workspace,
+/// or a selection to act on.
+pub fn empty_selection_noop(
+    cwd: &Path,
+    filter: &aube_workspace::selector::EffectiveFilter,
+    command: &str,
+) -> miette::Result<bool> {
+    if filter.is_empty() {
+        return Ok(false);
+    }
+    let Some(root) = crate::dirs::find_workspace_root(cwd) else {
+        return Ok(false);
+    };
+    // A workspace whose globs match no member yet still has the root as
+    // a candidate, so the selection is evaluated with no members too.
+    let Ok(workspace_pkgs) = aube_workspace::find_workspace_packages(&root) else {
+        return Ok(false);
+    };
+    if !select_projects(&root, &workspace_pkgs, filter, command)?.is_empty() {
+        return Ok(false);
+    }
+    let report = match command {
+        "install" | "remove" | "update" => NoMatchReport::Scope,
+        "run" => NoMatchReport::ScopeAndNotice,
+        "exec" => NoMatchReport::Notice,
+        _ => NoMatchReport::Quiet,
+    };
+    no_projects_matched(&root, filter, report)?;
+    Ok(true)
+}
+
+/// What pnpm prints for a `--filter` that selects no project when that is
+/// not an error. Commands differ: `install`, `remove` and `update` report
+/// the scope, `run` reports the scope and the notice, `exec` the notice
+/// alone, and the rest print nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoMatchReport {
+    Quiet,
+    Notice,
+    Scope,
+    ScopeAndNotice,
+}
+
+/// pnpm's handling of a `--filter` that selects no project: the command
+/// does nothing and exits 0, which CI relies on for selectors like
+/// `...[origin/main]` that are empty on many commits. `--fail-if-no-match`
+/// turns it into an error carrying pnpm's notice.
+pub(crate) fn no_projects_matched(
+    workspace_root: &Path,
+    filter: &aube_workspace::selector::EffectiveFilter,
+    report: NoMatchReport,
+) -> miette::Result<()> {
+    let notice = format!(
+        "No projects matched the filters in \"{}\"",
+        workspace_root.display()
+    );
+    let scope = matches!(report, NoMatchReport::Scope | NoMatchReport::ScopeAndNotice);
+    // pnpm drops the scope line from a failing `run`, and keeps it for the
+    // install family.
+    if scope && !(filter.fail_if_no_match && report == NoMatchReport::ScopeAndNotice) {
+        let members = aube_workspace::find_workspace_packages(workspace_root).unwrap_or_default();
+        let root_counted = workspace_root.join("package.json").is_file()
+            && !members.iter().any(|dir| dir == workspace_root);
+        let total = members.len() + usize::from(root_counted);
+        eprintln!("Scope: 0 of {total} workspace projects");
+    }
+    if filter.fail_if_no_match {
+        return Err(miette!("{notice}"));
+    }
+    if matches!(
+        report,
+        NoMatchReport::Notice | NoMatchReport::ScopeAndNotice
+    ) {
+        eprintln!("{notice}");
+    }
+    Ok(())
+}
+
+/// The workspace projects `filter` selects for `command`, the way pnpm
+/// selects them: directory selectors resolve against the project the
+/// command was invoked in (the nearest `package.json` at or above the
+/// cwd, inside the workspace), and `run`, `exec`, `add` and `test` drop
+/// the root from a selection that names no project. Every `--filter`
+/// caller goes through here so none resolves paths against the
+/// workspace root.
+pub(crate) fn select_projects(
+    workspace_root: &Path,
+    workspace_pkgs: &[PathBuf],
+    filter: &aube_workspace::selector::EffectiveFilter,
+    command: &str,
+) -> miette::Result<Vec<aube_workspace::selector::SelectedPackage>> {
+    let cwd = crate::dirs::cwd()?;
+    let prefix = crate::dirs::find_project_root(&cwd)
+        .filter(|project| project.starts_with(workspace_root))
+        .unwrap_or(cwd);
+    let root = if matches!(command, "add" | "run" | "exec" | "test") {
+        aube_workspace::RootSelection::AutoExclude
+    } else {
+        aube_workspace::RootSelection::Keep
+    };
+    aube_workspace::selector::select_workspace_projects(
+        workspace_root,
+        workspace_pkgs,
+        filter,
+        aube_workspace::SelectOptions {
+            prefix: &prefix,
+            root,
+        },
+    )
+    .map_err(|e| miette!("invalid --filter selector: {e}"))
 }
 
 pub(crate) fn workspace_importer_path(workspace_root: &Path, dir: &Path) -> miette::Result<String> {
@@ -226,5 +365,49 @@ pub(crate) fn workspace_importer_path(workspace_root: &Path, dir: &Path) -> miet
         Ok(".".to_string())
     } else {
         Ok(rel.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dep_closure_follows_yarn_optional_only_edges() {
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph.importers.insert(
+            ".".to_string(),
+            vec![aube_lockfile::DirectDep {
+                name: "host".to_string(),
+                dep_path: "host@1.0.0".to_string(),
+                dep_type: aube_lockfile::DepType::Production,
+                specifier: Some("1.0.0".to_string()),
+            }],
+        );
+        graph.packages.insert(
+            "host@1.0.0".to_string(),
+            aube_lockfile::LockedPackage {
+                name: "host".to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: "host@1.0.0".to_string(),
+                optional_dependencies: [("native".to_string(), "1.0.0".to_string())].into(),
+                ..Default::default()
+            },
+        );
+        graph.packages.insert(
+            "native@1.0.0".to_string(),
+            aube_lockfile::LockedPackage {
+                name: "native".to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: "native@1.0.0".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let closure = collect_dep_closure(&graph, DepFilter::All, false);
+        assert!(closure.contains_key("native@1.0.0"));
+
+        let closure = collect_dep_closure(&graph, DepFilter::All, true);
+        assert!(!closure.contains_key("native@1.0.0"));
     }
 }

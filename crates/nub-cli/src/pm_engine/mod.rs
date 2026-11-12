@@ -6,7 +6,7 @@
 //!
 //! - [`install_family`] — dependency-graph mutation and linking (`install`,
 //!   `ci`, `add`, `remove`, `update`, `link`, `patch*`, …). All are wired to
-//!   the embedded engine; `install`/`ci` dispatch via live clap verbs.
+//!   the embedded engine; `install`/`ci` dispatch via live parser verbs.
 //! - [`info_family`] — read-only project/graph/registry queries (`list`,
 //!   `why`, `outdated`, `audit`, `view`, …).
 //! - [`publish_family`] — registry writes, packaging, and auth (`publish`,
@@ -39,7 +39,7 @@
 //!   [`run_node_gyp_bootstrap`], because the engine's lazy node-gyp shims
 //!   re-invoke `current_exe()` (= nub) with it mid-lifecycle-script.
 //!
-//! `install`/`i`/`ci` are *not* in the registry: they are live clap verbs
+//! `install`/`i`/`ci` are *not* in the registry: they are live parser verbs
 //! in `cli.rs` (SUBCOMMANDS) dispatching straight to
 //! [`install_family::run_install`] / [`install_family::run_ci`]. `init` is
 //! not in the registry either — the spelling is reserved for nub's own
@@ -52,21 +52,35 @@
 //! with honest per-verb messages in their family dispatchers.
 
 mod bun_config;
+mod compat_db;
 pub mod config_scope;
+mod duplicate_home;
+mod expo_compat;
 pub mod identity;
 pub mod info_family;
 pub mod install_family;
+mod install_report;
 pub mod log;
+pub mod min_release_age;
+pub mod output;
+pub mod phantom_closure;
+pub mod platform_flags;
 pub mod present;
 pub mod publish_family;
+mod remix_compat;
+use nub_core::resource_limits;
 pub mod store_config_family;
 pub mod unsupported_config;
 pub mod use_align;
 pub mod use_nub;
+pub mod vite_compat;
 
 pub use install_family::{
     CiFlags, InstallFlags, WorkspaceFilterFlags, run_ci, run_dlx_for_nubx, run_install,
 };
+pub use min_release_age::AgeGateFlags;
+pub use output::OutputFlags;
+pub use platform_flags::PlatformFlags;
 
 use std::path::{Path, PathBuf};
 
@@ -85,6 +99,37 @@ use aube_lockfile::LockfileKind;
 #[cfg(test)]
 pub(crate) static ENGINE_GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Environment a frontend adds to every lifecycle-script spawn of this
+/// process's one install, on top of the runtime-augmentation overlay
+/// [`apply_lifecycle_augmentation`] builds. Set once, before the engine
+/// session opens; the npm-routing shim fills it with npm's
+/// `NODE_ENV=production` under an effective `omit=dev`. Per child, never the
+/// process environment (A19).
+static LIFECYCLE_ENV_EXTRA: std::sync::OnceLock<Vec<(std::ffi::OsString, std::ffi::OsString)>> =
+    std::sync::OnceLock::new();
+
+pub fn set_lifecycle_env(pairs: Vec<(String, String)>) {
+    let _ = LIFECYCLE_ENV_EXTRA.set(
+        pairs
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+    );
+}
+
+/// Lifecycle scripts run under the Node on PATH — no pin lookup, no
+/// provisioning, no augmentation — which is npm's contract for them. Set by the
+/// npm-routing shim before the engine session opens: the user typed `npm ci` /
+/// `npm install` (or the npm-ci GitHub Action did), so a project's `.nvmrc`
+/// pointing at a Node the machine lacks must neither download one nor build
+/// native addons against a different Node than the one the job's `node` is.
+static LIFECYCLE_NODE_FROM_PATH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_lifecycle_node_from_path() {
+    LIFECYCLE_NODE_FROM_PATH.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The four engine verb families. One module per family; each family module
 /// owns the wiring (args parsing, options construction, output routing) for
 /// its verbs.
@@ -97,7 +142,7 @@ pub enum Family {
 }
 
 /// One registered engine verb: its canonical spelling, accepted aliases
-/// (mirroring aube's clap aliases), owning family, and — documentation for
+/// (mirroring aube's own aliases), owning family, and — documentation for
 /// the Surface phase — the aube args type the wired implementation parses.
 pub struct VerbSpec {
     pub canonical: &'static str,
@@ -226,9 +271,12 @@ pub const ENGINE_VERBS: &[VerbSpec] = &[
         family: Family::Install,
         aube_args: "commands::deploy::DeployArgs",
     },
+    // `x` is the short fetch-and-run spelling (the `x` in `nubx`/`bunx`; `bun x`
+    // == `bunx` == dlx). It aliases dlx — NOT exec — so `nub x <tool>` fetches a
+    // missing tool, matching the `nubx` standalone binary.
     VerbSpec {
         canonical: "dlx",
-        aliases: &[],
+        aliases: &["x"],
         family: Family::Install,
         aube_args: "commands::dlx::DlxArgs",
     },
@@ -238,10 +286,10 @@ pub const ENGINE_VERBS: &[VerbSpec] = &[
         family: Family::Install,
         aube_args: "commands::create::CreateArgs",
     },
-    // `init` is deliberately NOT registered: the spelling is reserved for
-    // nub's own project init (the maintainer owns the verb), not the engine's
-    // npm-style manifest scaffold. cli.rs answers `nub init` with a
-    // "nub's own init is coming" note instead of a PM redirect.
+    // `init` is deliberately NOT registered: the spelling belongs to nub's
+    // own project scaffold (src/init.rs, a native subcommand), not the engine's
+    // npm-style manifest write — the fourth deliberate pnpm-compat exception
+    // (AGENTS.md); design record in internal/commands/init.md.
     // Workspace fanout meta-verb. Registered so it errors with the honest
     // "use -r on the verb" message rather than the generic not-a-command
     // fallback (install_family::run_verb).
@@ -520,35 +568,62 @@ pub fn dispatch_verb(
 /// node-gyp and prints its executable path on stdout. The lazy shims the
 /// engine drops into a project's `.bin` re-invoke `current_exe()` with
 /// this verb mid-lifecycle-script — and under nub, `current_exe()` IS
-/// nub — so cli.rs intercepts the spelling before clap and lands here.
+/// nub — so cli.rs intercepts the spelling before the parser and lands here.
 /// The printed path is data for the shim (it lands under nub's own cache
-/// root via the `set_cache_root` registration), so stdout is passed
-/// through; failures route through the brand rewrite like every other
-/// engine report.
+/// root, which the identity profile's `cache_namespace` carries), so stdout
+/// is passed through; failures route through the brand rewrite like every
+/// other engine report.
 pub(crate) fn run_node_gyp_bootstrap(args: &[String]) -> Result<i32> {
     let [project_dir] = args else {
         anyhow::bail!("usage: nub __node-gyp-bootstrap <project-dir>");
     };
     // Register nub's static identity FIRST so the bootstrap's cache lands under
-    // nub's namespace (`$XDG_CACHE/nub/pm/tools/node-gyp`, via the `set_cache_root`
-    // the identity carries) rather than aube's. This re-entry runs as a fresh
+    // nub's namespace (`$XDG_CACHE/nub/pm/tools/node-gyp`, via the identity's
+    // `cache_namespace`) rather than aube's. This re-entry runs as a fresh
     // child process spawned by the engine's lazy shim (`AUBE_NODE_GYP_EXE
     // __node-gyp-bootstrap <dir>`, where `current_exe()` is nub) before any other
     // preflight, so the namespace registration has to happen here.
     engine_brand_preflight();
-    // The bootstrap entry (`pub`-widened in vendor/aube @ b1a90d5: `pub mod
-    // node_gyp_bootstrap` + `pub async fn {ensure_cached, print_bootstrapped_binary}`)
-    // resolves/bootstraps the cached node-gyp and prints its executable path on
-    // stdout for the shim to exec. Drive it on a fresh runtime; route any failure
-    // through the brand rewrite like every other engine report.
+    // The embed facade's bootstrap entry resolves/bootstraps the cached
+    // node-gyp and returns its executable, which is printed on stdout for the
+    // shim to exec. Drive it on a fresh runtime; route any failure through the
+    // brand rewrite like every other engine report.
     let rt = build_runtime()?;
     let project = std::path::Path::new(project_dir);
-    match rt
-        .block_on(aube::commands::install::node_gyp_bootstrap::print_bootstrapped_binary(project))
-    {
-        Ok(()) => Ok(0),
+    match rt.block_on(aube::embed::bootstrap_node_gyp(project)) {
+        Ok(binary) => {
+            // node-gyp runs next, under the project's Node, so put that Node's
+            // headers where node-gyp looks before it downloads them
+            // (`nub_core::node::headers`). Plain discovery, never provisioning:
+            // the version logic fires only where node-version-management puts
+            // it. Best effort, since node-gyp's own download stays the fallback.
+            if let Ok(node) = nub_core::node::discovery::discover_node(project) {
+                nub_core::node::headers::seed_node_gyp_cache(
+                    node.path.as_std_path(),
+                    &node.version.to_string(),
+                );
+            }
+            println!("{}", binary.display());
+            Ok(0)
+        }
         Err(report) => Ok(present::emit_report(&report)),
     }
+}
+
+/// Record the pnpm a project now pins in `pnpm-lock.yaml`'s env document —
+/// the last step of `nub pm use pnpm`, whose lockfile alignment (keep,
+/// convert, rename) writes only the project document. Returns the version
+/// recorded, `None` when the lockfile already pins it or the pin is one
+/// pnpm does not record (pnpm 10 and below).
+pub(crate) fn sync_pnpm_package_manager_pin(root: &Path) -> Result<Option<String>> {
+    let session = engine_session_quiet(Some(root))?;
+    session
+        .runtime
+        .block_on(aube::package_manager_pin::sync_pnpm_env_lockfile(
+            root,
+            aube_registry::NetworkMode::Online,
+        ))
+        .map_err(|report| anyhow::anyhow!("{}", present::render_report(&report)))
 }
 
 /// The shared stub error for registered-but-unwired verbs: names the verb
@@ -575,6 +650,19 @@ pub(crate) fn stub_error(typed: &str, args: &[String], pm_hint: &str) -> anyhow:
 pub(crate) struct EngineSession {
     pub(crate) detected: Option<DetectedLockfile>,
     pub(crate) runtime: tokio::runtime::Runtime,
+    /// No PM-preference lockfile signal at session-build time — no lockfile of
+    /// ANY package manager (npm/pnpm/yarn/bun, NOR nub's own canonical lockfile)
+    /// and no pnpm-named file (`is_truly_fresh_project` keys on those, not on the
+    /// manifest's declaration fields). Captured BEFORE the engine writes
+    /// anything, so it reflects the pre-install state: the FIRST install in a
+    /// virgin project sees `true`; every subsequent install (nub's lockfile now
+    /// present ⇒ `detected` is `Some`) sees `false`. The install family reads
+    /// this to stamp the `devEngines.packageManager` caret range exactly once,
+    /// on the virgin install (and never over an existing `devEngines` pin).
+    pub(crate) truly_fresh: bool,
+    /// The resolved working directory the session ran in (after `--dir`). The
+    /// install family writes the virgin `devEngines` stamp relative to it.
+    pub(crate) cwd: PathBuf,
 }
 
 /// Build the shared engine context for one verb invocation: apply `--dir`,
@@ -585,7 +673,7 @@ pub(crate) struct EngineSession {
 ///
 /// Identity resolution is the engine's declaration-aware policy
 /// (`aube_lockfile::resolve_project_lockfile_kind` — pin-over-inference per
-/// wiki/commands/pm/identity-policy.md, Axiom 1), so a declared PM outranks
+/// `identity-policy` (no such document), Axiom 1), so a declared PM outranks
 /// stray lockfiles, a declared-but-contradicted project errors loudly here
 /// (rendered through [`present`], with the `nub pm use` remedy), and an
 /// undeclared multi-lockfile project errors as ambiguous instead of
@@ -600,18 +688,118 @@ pub(crate) struct EngineSession {
 /// land after it (they feed settings resolution, which no detection-path
 /// code consults).
 pub(crate) fn engine_session(dir: Option<&Path>) -> Result<EngineSession> {
-    engine_session_inner(dir, ConfigScopeNoise::Warn)
+    engine_session_inner(
+        dir,
+        ConfigScopeNoise::Warn,
+        IdentityStrictness::Strict,
+        VirtualStoreLocality::Default,
+        ProjectInstallConfig::Apply,
+    )
 }
 
-/// [`engine_session`] for the read-only / non-graph-mutating families
-/// (info, publish, store-config). The config-scoping FILTER still applies —
-/// `why` / `outdated` should reflect the same effective override set a real
-/// install would — but the user-facing scoping *warnings* and the
-/// `catalog:`-under-the-wrong-PM hard error are suppressed: those are
-/// install-time UX, and surfacing them on a `nub why` would be noise. See
-/// the config-scoping policy ([`config_scope`]).
+/// [`engine_session`] for `nub ci` — identical resolution (Warn + Strict, it
+/// writes/reads the project lockfile) but forces a PROJECT-LOCAL virtual store
+/// (GVS off, isolation kept). `nub ci` is the frozen, ephemeral, deploy-oriented
+/// install; its `node_modules` is almost always COPY-relocated (multi-stage
+/// Docker) or thrown away, and a machine-global virtual store makes that tree
+/// non-relocatable — every `.store/<dep>` becomes an absolute symlink into
+/// `~/.cache/nub/pm/store` that a `COPY --from` leaves dangling (#241).
+/// Forcing the store project-local yields the self-contained, COPY-safe tree
+/// `CI=1 nub install` already produces, while keeping the isolated layout's
+/// phantom-dep protection. An explicit user `enableGlobalVirtualStore`/
+/// `nodeLinker` still wins — this is an embedder-tier default (mirrors how
+/// `aube dlx` defaults GVS off for its scratch installs).
+// @lat: [[research/gvs-in-ci#7. Recommendation]]
+pub(crate) fn engine_session_ci(dir: Option<&Path>) -> Result<EngineSession> {
+    engine_session_inner(
+        dir,
+        ConfigScopeNoise::Warn,
+        IdentityStrictness::Strict,
+        VirtualStoreLocality::ProjectLocal,
+        ProjectInstallConfig::Apply,
+    )
+}
+
+/// [`engine_session`] for the TRANSIENT-package families (`nubx`/`dlx`,
+/// plain `exec` dlx-fallback, `create`). These fetch-and-run a package into a
+/// throwaway store and never read or write the CWD project's lockfile, so the
+/// project's PM identity is irrelevant to them. Identity resolution therefore
+/// runs in LENIENT mode: a multi-lockfile / declaration-contradiction project
+/// degrades to no-identity (engine defaults) instead of hard-erroring with
+/// `ERR_NUB_LOCKFILE_AMBIGUOUS`. npm/pnpm/bun likewise run `npx`/`dlx`/`bunx`
+/// regardless of lockfile ambiguity — the ambiguity guard belongs only to the
+/// mutating install family that actually writes a lockfile. Config-scoping
+/// warnings are suppressed (Silent) for the same reason: the CWD project's
+/// config does not shape a transient run.
+pub(crate) fn engine_session_transient(dir: Option<&Path>) -> Result<EngineSession> {
+    engine_session_inner(
+        dir,
+        ConfigScopeNoise::Silent,
+        IdentityStrictness::Lenient,
+        VirtualStoreLocality::Default,
+        ProjectInstallConfig::Ignore,
+    )
+}
+
+/// [`engine_session`] for the read-only PROJECT-GRAPH families that resolve
+/// the project's dependency tree from its lockfile (`list`, `why`, `outdated`,
+/// `query`, `audit`, `licenses`, `deprecations`, `peers`, `check`). The
+/// config-scoping FILTER still applies — `why` / `outdated` should reflect the
+/// same effective override set a real install would — but the user-facing
+/// scoping *warnings* and the `catalog:`-under-the-wrong-PM hard error are
+/// suppressed: those are install-time UX, and surfacing them on a `nub why`
+/// would be noise. Identity resolution stays STRICT: these commands READ the
+/// project lockfile, so a multi-lockfile ambiguity must be a loud error — a
+/// silent degrade to no-identity would yield an empty/wrong graph. See the
+/// config-scoping policy ([`config_scope`]).
 pub(crate) fn engine_session_quiet(dir: Option<&Path>) -> Result<EngineSession> {
-    engine_session_inner(dir, ConfigScopeNoise::Silent)
+    engine_session_inner(
+        dir,
+        ConfigScopeNoise::Silent,
+        IdentityStrictness::Strict,
+        VirtualStoreLocality::Default,
+        ProjectInstallConfig::Apply,
+    )
+}
+
+/// [`engine_session_quiet`] for GLOBAL-SCOPE commands that never read or write
+/// the project's lockfile: the global store/cache forensics (`store`, `cache`,
+/// `cat-file`, `cat-index`, `find-hash`), config get/set, the registry/auth
+/// surface (`publish`, `pack`, `version`, `deprecate`/`undeprecate`,
+/// `dist-tag`, `unpublish`, `login`/`logout`, `whoami`, `owner`, `token`),
+/// package.json edits (`pkg`, `set-script`), and the pure registry-query /
+/// path-print verbs (`view`, `search`, `bin`, `root`). Because none of these
+/// consume the project's resolved PM identity, a multi-lockfile /
+/// declaration-contradiction project must NOT block them — identity resolution
+/// runs LENIENT (degrades to no-identity instead of hard-erroring
+/// `ERR_NUB_LOCKFILE_AMBIGUOUS`), exactly like the transient dlx path (#197).
+/// This is the same `IdentityStrictness` machinery, applied to the global-scope
+/// read class rather than the transient fetch-and-run class. The STRICT
+/// ambiguity guard remains for the mutating install family (writes the
+/// lockfile) and the project-graph readers above (see [`engine_session_quiet`]).
+pub(crate) fn engine_session_global(dir: Option<&Path>) -> Result<EngineSession> {
+    engine_session_inner(
+        dir,
+        ConfigScopeNoise::Silent,
+        IdentityStrictness::Lenient,
+        VirtualStoreLocality::Default,
+        ProjectInstallConfig::Ignore,
+    )
+}
+
+/// Whether an identity-resolution failure (multi-lockfile ambiguity, declared
+/// PM contradicted by the on-disk lockfile) is a HARD ERROR or degrades to
+/// no-identity. `Strict` — the default for every project-reading/-writing
+/// family — surfaces the loud diagnostic with the `nub pm use` remedy.
+/// `Lenient` — the transient-package families (dlx/create, see
+/// [`engine_session_transient`]) and the global-scope read class (store/cache/
+/// config/registry/path, see [`engine_session_global`]) — swallows it and
+/// proceeds with no resolved identity, because those commands never read or
+/// write the CWD project's lockfile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityStrictness {
+    Strict,
+    Lenient,
 }
 
 /// Whether [`engine_session_inner`] emits the config-scoping warnings and
@@ -623,15 +811,75 @@ enum ConfigScopeNoise {
     Silent,
 }
 
-fn engine_session_inner(dir: Option<&Path>, noise: ConfigScopeNoise) -> Result<EngineSession> {
-    // Initialize the diagnostics recorder from AUBE_DIAG_* env vars so that
-    // `AUBE_DIAG_SUMMARY=1 nub install` works the same as `AUBE_DIAG_SUMMARY=1
-    // aube install`. The OnceLock inside diag::init() makes this idempotent.
+/// Where the isolated layout's virtual store materializes. `Default` engages
+/// the machine-global virtual store (the shared, cross-project fast path) per
+/// the embedder default; `ProjectLocal` forces GVS off so the store lands
+/// inside `node_modules/.store` (real dirs + relative symlinks) — a self-
+/// contained, COPY-relocatable tree. Only `nub ci` requests `ProjectLocal`
+/// (see [`engine_session_ci`]); isolation/phantom-dep protection is preserved
+/// either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtualStoreLocality {
+    Default,
+    ProjectLocal,
+}
+
+/// Whether this command consumes the CWD project's nub-native `install` block.
+/// Transient and global commands have their own scratch/global state and must
+/// not inherit the project's layout or resolution preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectInstallConfig {
+    Apply,
+    Ignore,
+}
+
+fn engine_session_inner(
+    dir: Option<&Path>,
+    noise: ConfigScopeNoise,
+    strictness: IdentityStrictness,
+    store_locality: VirtualStoreLocality,
+    project_install_config: ProjectInstallConfig,
+) -> Result<EngineSession> {
+    // Register the embedder profile BEFORE initializing diagnostics: the diag
+    // recorder reads its toggles through the active profile's `diag_env_prefix`
+    // (`NUB` under nub), so it must see NUB — not the AUBE fallback — at init,
+    // or `NUB_DIAG_*` is missed and `AUBE_DIAG_*` wrongly read. `register()` is
+    // an idempotent set-once OnceLock, so the later `engine_brand_preflight()`
+    // (which calls it again as its first step, alongside the project-state-
+    // dependent config surface) is a no-op for the registration.
+    identity::register();
+    // Install nub's selective-subtree disk-materialize expansion hook
+    // (unconditionally on for users). It expands the disk-materialize seed to its
+    // ancestor-closure + phantom-target hoists at link time; under the internal A/B
+    // seam it's a no-op and the install path is byte-identical (pure symlink).
+    // Idempotent set-once, like `identity::register()`.
+    phantom_closure::register();
+    // Arm the dynamic per-version phantom PRODUCER: an extract-time store hook
+    // that scans each fetched package and writes a per-content verdict sidecar
+    // (`phantom_closure`, above, is the CONSUMER that reads those sidecars to seed
+    // the closure). On for users; a no-op only under the same internal A/B seam.
+    // Idempotent set-once.
+    crate::dynamic_phantom::register();
+    // Initialize the diagnostics recorder from NUB_DIAG_* env vars so that
+    // `NUB_DIAG_SUMMARY=1 nub install` surfaces the same per-phase/per-op
+    // spans + summary table that `AUBE_DIAG_SUMMARY=1 aube install` does. The
+    // OnceLock inside diag::init() makes this idempotent.
     aube_util::diag::init();
+    // Raise the open-file-descriptor soft limit toward the hard ceiling. The aube
+    // engine does this in its own startup, but nub dispatches the command impls
+    // directly and never runs that path — without this a large concurrent install
+    // exhausts macOS's stingy default soft limit (256) and dies with
+    // `Too many open files (os error 24)`.
+    resource_limits::raise_nofile_limit();
     apply_dir(dir)?;
+    // Install-family `-C/--dir` is verb-local, so this is the first point at
+    // which its final effective cwd is known. Initialize exactly one project
+    // snapshot here; the ordinary CLI routes have already initialized theirs,
+    // making this call an inert OnceLock read on those paths.
+    crate::cli::initialize_config_snapshot(false, false)?;
     engine_brand_preflight();
     let cwd = std::env::current_dir()?;
-    let detected = resolve_identity_walk_up(&cwd)?;
+    let detected = resolve_identity_walk_up(&cwd, strictness)?;
     // Role-first lifecycle UA (two-mode model, the maintainer 2026-06-10): in compat
     // mode nub plays the incumbent PM's role completely, so the UA dep
     // postinstalls sniff leads with that PM's token (`pnpm/<ver> nub/<ver>
@@ -648,40 +896,411 @@ fn engine_session_inner(dir: Option<&Path>, noise: ConfigScopeNoise) -> Result<E
     // when the resolver reads them. Filter applies in every family; warnings
     // + the catalog hard-error are install-family only (see `noise`).
     apply_config_scope(detected.as_ref(), &cwd, noise)?;
-    // Warn once at install time when the project requests Plug'n'Play
-    // (nodeLinker: pnp in .yarnrc.yml) but nub will install a node_modules
-    // tree instead — the embedder default below forces `hoisted` and the
-    // .yarnrc.yml is not re-read anywhere in the install path, so without this
-    // the divergence is entirely silent.
+    // Abort the install when the project requests Plug'n'Play (nodeLinker: pnp
+    // in .yarnrc.yml, or Yarn Berry's default): nub installs a node_modules
+    // tree, so honoring the lockfile under PnP would silently produce a
+    // materially different on-disk layout than yarn's. Install-family only
+    // (`noise == Warn`); read-only PM commands don't reach here.
     if noise == ConfigScopeNoise::Warn {
-        warn_if_pnp_requested(detected.as_ref(), &cwd);
+        pnp_fatal_if_requested(detected.as_ref(), &cwd)?;
     }
     // Truly-fresh = no PM-preference signal anywhere (no lockfile, no
     // declaration, no pnpm-named file). On this path nub claims identity via the
-    // neutral lockfile: the embedder default flips to `lock.yaml`, the quiet
+    // neutral lockfile: the embedder default flips to `nub.lock`, the quiet
     // identity marker the classifier reads back as nub. Any incumbent signal
-    // makes the project pnpm-shaped/compat and is respected untouched. nub does
-    // NOT auto-stamp `package.json` here — that exclusivity claim is reserved
-    // for the explicit `nub pm use nub` command.
+    // makes the project pnpm-shaped/compat and is respected untouched. On a
+    // virgin install the install family ALSO stamps the non-locking
+    // `devEngines.packageManager` caret range (see
+    // `install_family::stamp_virgin_dev_engines`) — safe ONLY because
+    // `truly_fresh` proves no other PM owns the project (the symmetric brand
+    // boundary). `nub pm use nub@<exact>` remains the explicit opt-in for the
+    // hard `packageManager: nub@<v>` pin.
     let truly_fresh = is_truly_fresh_project(&cwd, detected.as_ref());
     // Set-unless-user-set: ranks below CLI flags, env vars, and every
     // config file in the engine's settings precedence.
-    aube_settings::set_embedder_defaults(nub_setting_defaults(detected.as_ref(), truly_fresh));
+    let setting_defaults =
+        nub_setting_defaults(detected.as_ref(), truly_fresh, &cwd, store_locality);
+    let native_mode = native_pm_mode(detected.as_ref(), truly_fresh, &cwd);
+    // The `nub.jsonc` layout fields apply under every identity. Resolution
+    // fields remain Nub-identity-only in `scoped_install_settings`. Quiet
+    // project-graph readers apply the same split without warning;
+    // transient/global commands opt out because their scratch/global work must
+    // not be shaped by CWD.
+    let install = (project_install_config == ProjectInstallConfig::Apply)
+        .then(crate::project_config::effective_config)
+        .flatten()
+        .map(|config| &config.values.install);
+    let native_install = lower_native_install_settings_for_mode(install, &setting_defaults)?;
+    if !native_mode
+        && noise == ConfigScopeNoise::Warn
+        && let Some(install) = install
+    {
+        warn_install_config_scoped_out(install, detected.as_ref(), &cwd);
+    }
+    let scoped = scoped_install_settings(&native_install, native_mode, store_locality);
+    aube_settings::set_embedder_defaults(setting_defaults);
+    aube_util::update_engine_context(move |c| c.project_config_settings = scoped);
+    phantom_closure::set_native_config_seed(native_install.eject);
     // Route the engine's lifecycle scripts through nub's runtime augmentation
     // (project-pinned + augmented Node, shim on PATH, preload) — the SAME
     // augmentation `nub run` / `nub exec` apply, so run / exec / lifecycle
     // share one source. Closes the ABI bug where dep build scripts (node-gyp)
     // compiled against ambient Node instead of the project's. Default-empty
     // overlay when augmentation can't engage ⇒ behavior preserved.
-    apply_lifecycle_augmentation(&cwd);
+    apply_lifecycle_augmentation(&cwd)?;
+    if let Some(extra) = LIFECYCLE_ENV_EXTRA.get() {
+        let extra = extra.clone();
+        aube_util::update_engine_context(move |c| c.env_overlay.extend(extra));
+    }
+    apply_lifecycle_script_shell();
     Ok(EngineSession {
         detected,
         runtime: build_runtime()?,
+        truly_fresh,
+        cwd,
     })
 }
 
+/// The project `install` block, lowered into layout and resolution settings.
+/// Keeping the groups explicit lets CI override store locality and keeps the
+/// linker eject seed separate from ordinary engine settings.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NativeInstallSettings {
+    /// How `node_modules` is arranged.
+    layout: Vec<(String, String)>,
+    /// Which version a range selects. The compatibility guarantee.
+    resolution: Vec<(String, String)>,
+    /// `linker.eject` — layout, but also seeded into the phantom closure, which
+    /// is why it is carried out of band rather than only as a lowered setting.
+    eject: Vec<String>,
+}
+
+/// Compose the engine-visible settings, scoping the two groups differently.
+/// Layout applies under every identity, while release-age resolution settings
+/// apply only when Nub owns the project.
+/// `nub ci` additionally keeps its virtual store project-local so its frozen
+/// tree remains COPY-relocatable even when the project spells `linker: global`.
+fn scoped_install_settings(
+    lowered: &NativeInstallSettings,
+    native_mode: bool,
+    store_locality: VirtualStoreLocality,
+) -> Vec<(String, String)> {
+    // Release-age resolution follows the incumbent's lockfile and config, so a
+    // Nub-native resolution field applies only once Nub is the project's own
+    // manager. Layout applies under every identity, with `nub.jsonc` as its
+    // canonical project file. Gating layout on
+    // `native_mode` too would leave a pnpm 11 project with nowhere to write it,
+    // since pnpm 11's `.npmrc` allowlist drops the neutral spelling as well.
+    let mut settings = lowered.layout.clone();
+    if native_mode {
+        settings.extend(lowered.resolution.iter().cloned());
+    }
+    if store_locality == VirtualStoreLocality::ProjectLocal {
+        settings.retain(|(key, value)| !(key == "enableGlobalVirtualStore" && value == "true"));
+    }
+    settings
+}
+
+/// Announce a nub-native `install` field dropped because the project has an
+/// incumbent package manager. Named in nub's own vocabulary and dim-styled to
+/// sit alongside the config-scoping warnings.
+fn warn_install_config_scoped_out(
+    install: &crate::project_config::InstallConfig,
+    detected: Option<&DetectedLockfile>,
+    cwd: &Path,
+) {
+    let written = install_fields_written(install);
+    if written.is_empty() {
+        return;
+    }
+    let Some(pm) = active_role(detected, cwd).map(config_scope::Role::display) else {
+        return;
+    };
+    let dim = scope_warning_uses_dim();
+    for field in written {
+        let line = format!(
+            "nub: `{field}` ignored — it is nub-native install config, and this project resolves as \
+             {pm}. Run `nub pm use nub` to make nub the project's package manager."
+        );
+        if dim {
+            eprintln!("\x1b[2m{line}\x1b[0m");
+        } else {
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// Which nub-native `install` fields the project actually wrote, in nub's vocabulary.
+fn install_fields_written(install: &crate::project_config::InstallConfig) -> Vec<&'static str> {
+    // Layout fields are absent on purpose: `install.linker` and
+    // `install.publicHoist` apply under every identity, so announcing them as
+    // dropped would be false. Only the resolution half is nub-identity-scoped.
+    [
+        (
+            "install.minimumReleaseAge",
+            install.minimum_release_age.is_some(),
+        ),
+        (
+            "install.minimumReleaseAgeExclude",
+            install.minimum_release_age_exclude.is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(field, written)| written.then_some(field))
+    .collect()
+}
+
+/// The project's active-PM role, declaration-first (a declared PM outranks a
+/// stray lockfile), falling back to the detected lockfile kind.
+fn active_role(detected: Option<&DetectedLockfile>, cwd: &Path) -> Option<config_scope::Role> {
+    let declared = detected
+        .and_then(|detected| nub_core::pm::resolve::declared_pm_raw(&detected.dir))
+        .or_else(|| nub_core::pm::resolve::declared_pm_raw(cwd));
+    config_scope::role_of(
+        declared.as_ref().map(|(name, _)| name.as_str()),
+        detected.map(|detected| detected.kind),
+    )
+}
+
+/// Whether Nub owns this project. Release-age fields in the `install` block use
+/// this gate; layout fields apply under every identity.
+fn native_pm_mode(detected: Option<&DetectedLockfile>, truly_fresh: bool, cwd: &Path) -> bool {
+    if truly_fresh {
+        return true;
+    }
+    // A project with no lockfile at all is not Nub's unless `truly_fresh` above
+    // already said so — a lone `packageManager: nub` declaration does not make
+    // an otherwise-unresolved tree nub-identity.
+    detected.is_some() && active_role(detected, cwd) == Some(config_scope::Role::Nub)
+}
+
+/// The engine settings this project's own `nub.jsonc` supplies, plus whether
+/// nub owns the project.
+///
+/// The config surface needs both to decide where a write belongs, and it runs
+/// OUTSIDE the engine session that normally computes them — `nub config` builds
+/// no install context, so `engine_context().project_config_settings` is empty
+/// on that path and reading it would report "nothing is shadowed" for every
+/// project. Resolved from the same lowering the session uses, so the answer
+/// tracks the real injection instead of predicting it a second time.
+///
+/// The embedder defaults are resolved for real rather than passed empty. They
+/// are not value-only: under `linker: global` an injected dependency puts
+/// `hoist=true` in the defaults, and that SUPPRESSES the
+/// `enableGlobalVirtualStore` push entirely. Passing `&[]` therefore invented a
+/// supplied setting the real session never injects, and refused an `.npmrc`
+/// write the install would have honored — a false refusal, which is the worst
+/// failure this guard has, since it breaks a configuration that works.
+pub(crate) fn project_supplied_settings(cwd: &Path) -> (Vec<String>, bool) {
+    let detected = resolve_identity_walk_up(cwd, IdentityStrictness::Lenient).unwrap_or(None);
+    let truly_fresh = is_truly_fresh_project(cwd, detected.as_ref());
+    let native_mode = native_pm_mode(detected.as_ref(), truly_fresh, cwd);
+    let defaults = nub_setting_defaults(
+        detected.as_ref(),
+        truly_fresh,
+        cwd,
+        VirtualStoreLocality::Default,
+    );
+    // The config verbs dispatch through `lookup_verb` and RETURN before the
+    // parser match that initializes the snapshot for ordinary routes, so on this
+    // path `effective_config` is unset unless it is asked for here. Without
+    // this the whole check reported "nothing is shadowed" for every project —
+    // inert, and silently so, because failing to recognize a shadow just lets
+    // the write through.
+    //
+    // A failure reports "supplies nothing" rather than propagating: a
+    // malformed `nub.jsonc` means we cannot know what it supplies, and refusing
+    // every `config set` on the strength of an unparseable file would be a
+    // worse answer than the `.npmrc` write this project already gets today.
+    // Returning here rather than falling through also keeps that promise when
+    // some earlier path in the same process already populated the snapshot.
+    if crate::cli::initialize_config_snapshot(false, false).is_err() {
+        return (Vec::new(), native_mode);
+    }
+    let Some(config) = crate::project_config::effective_config() else {
+        return (Vec::new(), native_mode);
+    };
+    let mut supplied = Vec::new();
+    if let Ok(lowered) =
+        lower_native_install_settings_for_mode(Some(&config.values.install), &defaults)
+    {
+        supplied.extend(lowered.layout.iter().map(|(key, _)| key.clone()));
+        // Release-age settings reach the engine only under nub's own identity
+        // (`scoped_install_settings`), so under an incumbent they shadow
+        // nothing and the `.npmrc` value is the one that gets read.
+        if native_mode {
+            supplied.extend(lowered.resolution.iter().map(|(key, _)| key.clone()));
+        }
+    }
+    // `verifyDeps` is read by `crate::verify_deps` rather than through the
+    // settings tier, and only an explicit value from a nub CONFIG FILE outranks
+    // `.npmrc` there. `sources` also carries the CLI and environment overlays,
+    // so testing "not defaulted" would let `NUB_VERIFY_DEPS` masquerade as a
+    // `nub.jsonc` field: the write meant for runs WITHOUT that variable would be
+    // refused, and the advice would name a field that still loses to the env.
+    if config
+        .sources
+        .get(&crate::project_config::ConfigKey::VerifyDeps)
+        .is_some_and(|s| {
+            matches!(
+                s.kind,
+                crate::project_config::ConfigSourceKind::Project
+                    | crate::project_config::ConfigSourceKind::Global
+            )
+        })
+    {
+        supplied.push("verifyDepsBeforeRun".to_string());
+    }
+    (supplied, native_mode)
+}
+
+fn lower_native_install_settings(
+    install: &crate::project_config::InstallConfig,
+    embedder_defaults: &[(String, String)],
+) -> Result<NativeInstallSettings> {
+    use crate::project_config::{Hoist, LinkerConfig};
+
+    // Only `pnp` still bails here. The pairings the old flat trio rejected at
+    // install time — hoist under a shared store, eject under a project-local one
+    // — are now unrepresentable in `linker`, so they fail at the line the user
+    // wrote instead of after a resolve.
+    if matches!(install.linker, Some(LinkerConfig::Pnp)) {
+        anyhow::bail!(
+            "nub: `install.linker: \"pnp\"` is reserved and not supported yet [ERR_NUB_CONFIG_UNSUPPORTED]"
+        );
+    }
+
+    let mut layout: Vec<(String, String)> = Vec::new();
+    let mut push = |key: &str, value: &str| layout.push((key.to_string(), value.to_string()));
+    let mut eject_patterns: Option<Vec<String>> = None;
+    if let Some(linker) = install.linker.as_ref() {
+        // Both symlink layouts are aube's `isolated`; they differ only in where
+        // the store lives, which is `enableGlobalVirtualStore`.
+        push(
+            "nodeLinker",
+            match linker {
+                LinkerConfig::Global { .. } | LinkerConfig::Isolated { .. } => "isolated",
+                LinkerConfig::Hoisted => "hoisted",
+                LinkerConfig::Pnp => unreachable!("pnp rejected above"),
+            },
+        );
+        match linker {
+            LinkerConfig::Isolated { hoist } => {
+                push("enableGlobalVirtualStore", "false");
+                match hoist {
+                    Some(Hoist::Bool(enabled)) => {
+                        push("hoist", &enabled.to_string());
+                        if *enabled {
+                            push("hoistPattern", "*");
+                        }
+                    }
+                    Some(Hoist::Patterns(patterns)) => {
+                        push("hoist", "true");
+                        push("hoistPattern", &patterns.join(","));
+                    }
+                    None => {}
+                }
+            }
+            LinkerConfig::Global { eject } => {
+                // Injected dependencies require the hidden hoist tree, which in
+                // turn requires a project-local store. That unconditional engine
+                // default wins over a request for the ordinary global layout:
+                // never emit an explicit GVS=true that would turn the compatible
+                // combination into the engine's `hoist`/GVS contradiction.
+                let injected = embedder_defaults
+                    .iter()
+                    .any(|(key, value)| key == "hoist" && value == "true");
+                if !injected {
+                    // Written explicitly rather than left to the engine default.
+                    // The projectConfig tier outranks lower settings, so silence
+                    // here could quietly turn an explicit global request local.
+                    push("enableGlobalVirtualStore", "true");
+                }
+                eject_patterns = eject.clone();
+            }
+            LinkerConfig::Hoisted | LinkerConfig::Pnp => {}
+        }
+    }
+
+    // One nub knob, two aube settings — so write BOTH. Writing only the pattern
+    // leaves `shamefullyHoist` at whatever a lower tier resolved, which inverts
+    // the request: `.npmrc` `shamefully-hoist=true` under a `publicHoist`
+    // pattern list would hoist everything, the opposite of naming patterns.
+    // Naming patterns is always a narrowing, so the blanket flag goes off.
+    if let Some(patterns) = install.public_hoist.as_ref() {
+        push("shamefullyHoist", "false");
+        push("publicHoistPattern", &patterns.join(","));
+    }
+
+    // ADDITIVE, deliberately: the merge seeds from the embedder's own ejects —
+    // the packages known to break when their realpath is outside the project —
+    // and only appends. A project can grow that set, never shrink it, so an
+    // explicit `[]` writes the embedder's value back rather than clearing it.
+    if let Some(patterns) = eject_patterns.as_ref() {
+        for key in [
+            "disableGlobalVirtualStoreForPackages",
+            "diskMaterializePackages",
+        ] {
+            let mut merged = embedder_defaults
+                .iter()
+                .rev()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| {
+                    value
+                        .split(',')
+                        .filter(|entry| !entry.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for pattern in patterns {
+                if !merged.contains(pattern) {
+                    merged.push(pattern.clone());
+                }
+            }
+            push(key, &merged.join(","));
+        }
+    }
+
+    // Everything above shapes the TREE; everything below shapes the RESOLVE.
+    let mut resolution = Vec::new();
+    if let Some(age) = install.minimum_release_age {
+        let seconds = age.as_secs();
+        // Round UP: a sub-minute remainder must not weaken the configured gate.
+        let minutes = seconds / 60 + u64::from(seconds % 60 != 0);
+        resolution.push(("minimumReleaseAge".to_string(), minutes.to_string()));
+        resolution.push(("minimumReleaseAgeStrict".to_string(), "true".to_string()));
+    }
+    if let Some(exclude) = install.minimum_release_age_exclude.as_ref() {
+        resolution.push(("minimumReleaseAgeExclude".to_string(), exclude.join(",")));
+    }
+
+    Ok(NativeInstallSettings {
+        layout,
+        resolution,
+        eject: eject_patterns.unwrap_or_default(),
+    })
+}
+
+/// Lower the project `install` block under every identity. The downstream
+/// [`scoped_install_settings`] keeps layout everywhere and admits release-age
+/// settings only under Nub's own identity.
+///
+/// Lowering unconditionally also means a malformed layout value is now rejected
+/// in a compat project rather than silently skipped: a field Nub honors is a
+/// field Nub validates.
+fn lower_native_install_settings_for_mode(
+    install: Option<&crate::project_config::InstallConfig>,
+    embedder_defaults: &[(String, String)],
+) -> Result<NativeInstallSettings> {
+    match install {
+        Some(install) => lower_native_install_settings(install, embedder_defaults),
+        None => Ok(NativeInstallSettings::default()),
+    }
+}
+
 /// The config-derived install knobs the IMPLEMENT-wins resolve from the active
-/// PM's persistent config: a dependency-selection axis pin, a frozen-install
+/// PM's persistent config: a dependency-selection pin, a frozen-install
 /// request, and the yarn block-all-scripts opt-out. Composed onto the install
 /// args by [`install_family::run_install`] / `run_ci`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -729,6 +1348,29 @@ pub(crate) fn session_role_root(
     Some((role, detected.dir.clone()))
 }
 
+/// Per-process, mtime-validated cache of parsed `aube_manifest::PackageJson`
+/// keyed by file path. The PM-engine config phase parses the root manifest
+/// through aube's parser several times per command — `apply_config_scope`, the
+/// scan's `manifest_has_pnpm_overrides`, and `injected_deps_present`'s
+/// `manifest_has_injected` — and `first_catalog_specifier` parses every member
+/// manifest. This collapses repeat parses of one path to a single read. mtime
+/// validation keeps it stale-proof (a mid-command engine rewrite re-reads).
+///
+/// A parse ERROR (or missing file) yields `None` and is NOT cached, matching
+/// every call site's existing `let Ok(..) = .. else { skip }` handling exactly.
+static AUBE_MANIFEST_CACHE: nub_core::config_cache::MtimeCache<aube_manifest::PackageJson> =
+    nub_core::config_cache::MtimeCache::new();
+
+/// Read + parse `path` as an `aube_manifest::PackageJson` through
+/// [`AUBE_MANIFEST_CACHE`]. `None` on a missing/unparseable manifest (never
+/// cached) — behavior-identical to a direct `PackageJson::from_path(path).ok()`,
+/// just deduplicated across the repeat parses one command makes of the same path.
+pub(crate) fn cached_aube_manifest(
+    path: &Path,
+) -> Option<std::sync::Arc<aube_manifest::PackageJson>> {
+    AUBE_MANIFEST_CACHE.get_or_read(path, || aube_manifest::PackageJson::from_path(path).ok())
+}
+
 /// Apply the config-scoping policy for one verb invocation: resolve the
 /// active-PM role, scope the manifest's graph-shaping override fields to
 /// that role's dialect, register the scoped source + trusted-deps toggle on
@@ -750,7 +1392,7 @@ fn apply_config_scope(
 
     let root = detected.map(|d| d.dir.as_path()).unwrap_or(cwd);
     let manifest_path = root.join("package.json");
-    let Ok(manifest) = aube_manifest::PackageJson::from_path(&manifest_path) else {
+    let Some(manifest) = cached_aube_manifest(&manifest_path) else {
         return Ok(());
     };
 
@@ -762,26 +1404,41 @@ fn apply_config_scope(
     // Fresh, undeclared, no lockfile: nub identity (its un-branded
     // cross-tool fields), matching the brand-symmetric default.
     .unwrap_or(Role::Nub);
-    let (major, minor) = declared
-        .as_ref()
-        .and_then(|(_, v)| v.as_deref())
-        .map(parse_major_minor)
+    // The version declared for the role's own tool, so a multi-tool `devEngines`
+    // array (no single pin; the lockfile picked the role) still gives a major.
+    let (major, minor) = nub_core::pm::resolve::declared_pm_version(cwd, role.display())
+        .map(|v| parse_major_minor(&v))
         .unwrap_or((None, None));
 
     // Scope the override sources to the role's dialect.
     let tagged = config_scope::gather_tagged_overrides(&manifest);
     let (effective, ignored) = config_scope::scope_overrides(role, major, minor, &tagged);
+    // Scope packageExtensions the same way: the top-level home is nub's neutral
+    // surface, honored only under nub identity and dropped under a compat role
+    // whose incumbent ignores it (see `scope_package_extensions`).
+    let (effective_pe, pe_ignored) = config_scope::scope_package_extensions(role, &manifest);
 
-    // Register the scoped source as the engine's sole override source, and
-    // the trusted-deps toggle (only bun, only below the major that dropped
-    // it, honors `trustedDependencies`). Both are idempotent OnceLocks.
-    let trusted = config_scope::honors_trusted_dependencies(role, major);
+    // Register the scoped sources as the engine's sole override / packageExtensions
+    // sources, and the trusted-deps toggle (only bun honors `trustedDependencies`).
+    let trusted = config_scope::honors_trusted_dependencies(role);
     aube_util::update_engine_context(|c| {
         c.embedder_overrides = Some(effective);
         c.trusted_dependencies_honored = trusted;
+        c.embedder_package_extensions = Some(effective_pe);
     });
 
     if noise == ConfigScopeNoise::Warn {
+        // Renamed-field hard-error. The build allowlist moved from a top-level
+        // `allowBuilds` map to `allowScripts`, the field npm 12 gates its own
+        // install scripts on. Proceeding would silently drop every approval AND
+        // every explicit `false` denial the old map records — a security-
+        // relevant miss in the permissive direction for the denials — so refuse
+        // instead. Role-independent: the top-level map is nub's own key, read on
+        // every surface, and no other PM reads it either.
+        if manifest.has_legacy_root_allow_builds() {
+            return Err(legacy_allow_builds_error());
+        }
+        warn_dropped_root_install_fields(&manifest);
         // Catalog hard-error: a role that doesn't honor `catalog:` specifiers
         // (npm/yarn/bun, pnpm<9) must mirror the real PM and refuse, rather
         // than silently mis-resolve. nub-branded, role-named.
@@ -790,6 +1447,8 @@ fn apply_config_scope(
         {
             return Err(catalog_unsupported_error(role, &spec));
         }
+        let mut ignored = ignored;
+        ignored.extend(pe_ignored);
         emit_scope_warnings(role, &ignored);
 
         // Curated unsupported-config scan: FATAL-abort on the genuinely-hard
@@ -804,15 +1463,17 @@ fn apply_config_scope(
     Ok(())
 }
 
-/// Does the active PM honor `catalog:` specifiers? pnpm@9+ and bun@1.2+
-/// implement catalogs; npm and yarn do not. nub identity honors catalogs
-/// (an un-branded cross-tool field, like `workspaces`). aube resolves both
-/// dialects: pnpm's `pnpm.catalog(s)` / `pnpm-workspace.yaml` AND bun's
-/// `workspaces.catalog(s)` in `package.json` (see aube's `discover_catalogs`),
-/// so honoring bun here resolves the real catalog rather than mis-failing a
-/// project that works under bun.
+/// Does the active PM honor `catalog:` specifiers? pnpm@9+, bun@1.2+, and
+/// yarn-berry (v2+) implement catalogs; npm and yarn-classic (v1) do not. nub
+/// identity honors catalogs (an un-branded cross-tool field, like
+/// `workspaces`). aube resolves every dialect: pnpm's `pnpm.catalog(s)` /
+/// `pnpm-workspace.yaml`, bun's `workspaces.catalog(s)` in `package.json`, and
+/// yarn's `catalog(s)` in `.yarnrc.yml` (see aube's `discover_catalogs`), so
+/// honoring a PM here resolves the real catalog rather than mis-failing a
+/// project that works under that PM.
 fn role_honors_catalog(role: config_scope::Role, major: Option<u64>, minor: Option<u64>) -> bool {
     use config_scope::Role;
+    let _ = minor;
     match role {
         // pnpm gained catalogs in 9.0.
         Role::Pnpm => major.map(|m| m >= 9).unwrap_or(true),
@@ -823,8 +1484,18 @@ fn role_honors_catalog(role: config_scope::Role, major: Option<u64>, minor: Opti
             (Some(m), None) => m >= 2,
             _ => true,
         },
+        // yarn shipped catalogs in 4.10.0 (catalog plugin bundled by default).
+        // We honor them on ALL yarn-berry (v2+) rather than gating on a parsed
+        // 4.10: nub's yarn-minor detection isn't granular enough to reliably
+        // distinguish 4.10 from earlier berry, and resolving a `catalog:` on an
+        // older berry costs nothing — a project only carries `catalog:`
+        // specifiers (+ a `.yarnrc.yml` catalog block) if it's actually using
+        // the feature, so there is nothing to mis-resolve. Classic yarn v1 has
+        // no catalogs, so a `1.x` pin correctly refuses. Absent/unparseable
+        // version → assume modern berry and honor (the "assume modern" default).
+        Role::Yarn => major.map(|m| m >= 2).unwrap_or(true),
         Role::Nub => true,
-        Role::Npm | Role::Yarn => false,
+        Role::Npm => false,
     }
 }
 
@@ -860,8 +1531,7 @@ fn first_catalog_specifier(manifest: &aube_manifest::PackageJson, root: &Path) -
     // independently, so a member-only `catalog:` ref must refuse too.
     if let Ok(members) = aube_workspace::find_workspace_packages(root) {
         for dir in members {
-            let Ok(member) = aube_manifest::PackageJson::from_path(&dir.join("package.json"))
-            else {
+            let Some(member) = cached_aube_manifest(&dir.join("package.json")) else {
                 continue;
             };
             if let Some(hit) = first_catalog_in_dep_maps(&member) {
@@ -897,12 +1567,81 @@ fn first_catalog_in_dep_maps(manifest: &aube_manifest::PackageJson) -> Option<St
 
 /// Hard error mirroring the active PM's refusal of a `catalog:` specifier —
 /// nub-branded, role-named, with the remedy.
+/// The refusal for a project still carrying the pre-cutover top-level
+/// `allowBuilds` map. Names the mechanical fix, because that is the whole
+/// migration: the key is renamed and the entries are unchanged.
+fn legacy_allow_builds_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "nub: package.json sets a top-level `allowBuilds` map — that field was renamed to \
+         `allowScripts`, which is also the field npm reads. Rename the key in package.json; \
+         the entries are unchanged. (`pnpm.allowBuilds` and a `pnpm-workspace.yaml` \
+         `allowBuilds:` block are pnpm's own surface and still read as-is.) \
+         [ERR_NUB_ALLOW_BUILDS_RENAMED]"
+    )
+}
+
+/// Manifest-ROOT install keys nub used to read and no longer does, each with
+/// the surface that replaces it.
+///
+/// All three were nub-only. No package manager reads a top-level `auditConfig`,
+/// `allowUnusedPatches` or `allowNonAppliedPatches`: npm 12 ships
+/// `patchedDependencies` but makes its relax flag CLI-ONLY on purpose (ignored
+/// in `.npmrc` and env, rejected by `npm ci`, so it cannot become project
+/// policy) and has no audit-ignore mechanism at all; bun's is `bun audit
+/// --ignore <CVE>`; pnpm keeps both under `pnpm.*` or the workspace yaml, which
+/// nub still reads under a pnpm incumbent. So the root spellings were three
+/// un-namespaced `package.json` names held on the strength of nobody having
+/// claimed them yet — the position `allowBuilds` was in when npm 12 shipped
+/// `allowScripts` into the same slot.
+const DROPPED_ROOT_INSTALL_FIELDS: [(&str, &str); 3] = [
+    (
+        "auditConfig",
+        "pass `nub audit --ignore <id>`, which takes advisory numbers, GHSA ids and CVE ids",
+    ),
+    (
+        "allowUnusedPatches",
+        "remove the `patchedDependencies` entry that matches no installed package",
+    ),
+    (
+        "allowNonAppliedPatches",
+        "remove the `patchedDependencies` entry that matches no installed package",
+    ),
+];
+
+/// Tell a project still carrying one of those keys that it does nothing.
+///
+/// A warning rather than the hard error `allowBuilds` gets: both of these fail
+/// SAFE when unread — advisories the project had muted come back, and an
+/// unmatched patch fails an install that used to warn — where a dropped
+/// `allowBuilds: false` would RUN a script the project denied. Silence is still
+/// the wrong answer, because the key looks like it is doing something.
+///
+/// Says nothing about the branded `pnpm.*` spellings: those are pnpm's own
+/// surface, read under a pnpm incumbent exactly as before.
+fn warn_dropped_root_install_fields(manifest: &aube_manifest::PackageJson) {
+    let dim = scope_warning_uses_dim();
+    for (root, remedy) in DROPPED_ROOT_INSTALL_FIELDS {
+        if !manifest.extra.contains_key(root) {
+            continue;
+        }
+        let line = format!(
+            "nub: package.json sets a top-level `{root}` — no package manager reads that key \
+             there, and nub no longer does either. Instead, {remedy}."
+        );
+        if dim {
+            eprintln!("\x1b[2m{line}\x1b[0m");
+        } else {
+            eprintln!("{line}");
+        }
+    }
+}
+
 fn catalog_unsupported_error(role: config_scope::Role, spec: &str) -> anyhow::Error {
     let pm = role.display();
     anyhow::anyhow!(
         "nub: `catalog:` specifier ({spec}) is not supported — this project uses {pm}, \
-         which doesn't implement catalogs (pnpm@9+ and bun@1.2+ do). Inline the version, or switch \
-         the project to a PM that supports catalogs (`nub pm use pnpm`)."
+         which doesn't implement catalogs (pnpm@9+, bun@1.2+, and yarn-berry do). Inline the \
+         version, or switch the project to a PM that supports catalogs (`nub pm use pnpm`)."
     )
 }
 
@@ -922,6 +1661,71 @@ pub(crate) fn parse_major_minor(version: &str) -> (Option<u64>, Option<u64>) {
         digits.parse::<u64>().ok()
     });
     (major, minor)
+}
+
+/// Whether the project's incumbent pnpm is provably v11+, the major at which
+/// pnpm switched its env-var convention from `npm_config_*` to `pnpm_config_*`.
+/// Reads the declared `packageManager`/`devEngines` pin (`declared_pm_raw`,
+/// packageManager first) and requires the name to be LITERALLY "pnpm" — a
+/// non-pnpm or unknown declared name (or a fresh project with no declaration)
+/// yields `false`. An undeclared/unparseable version also yields `false`: the
+/// dominant v9/v10 base ignores `pnpm_config_*`, so off is the safe default.
+/// Mirrors `store_config_family::project_scalar_home`'s detection exactly.
+fn pnpm_incumbent_major_is_v11_plus() -> bool {
+    declared_pnpm_major().is_some_and(|major| major >= 11)
+}
+
+/// The declared incumbent pnpm major, or `None` when the project does not
+/// declare pnpm as its package manager (a non-pnpm/unknown/absent
+/// `packageManager`/`devEngines` name, or an undeclared/unparseable version).
+/// Reads the version declared for pnpm itself (`declared_pm_version`: the pin
+/// when it names pnpm, else the pnpm entry of a multi-tool `devEngines` array)
+/// — the shared major detection behind [`pnpm_incumbent_major_is_v11_plus`]
+/// and [`pnpm_npmrc_key_policy`], matching
+/// `store_config_family::project_scalar_home`.
+fn declared_pnpm_major() -> Option<u64> {
+    declared_pnpm_major_in(&std::env::current_dir().ok()?)
+}
+
+/// [`declared_pnpm_major`] for the project at `dir`.
+fn declared_pnpm_major_in(dir: &Path) -> Option<u64> {
+    nub_core::pm::resolve::declared_pm_version(dir, "pnpm").and_then(|v| parse_major_minor(&v).0)
+}
+
+/// Hand nub-core this crate's incumbent detection, so its own `.npmrc` readers
+/// and pnpm-named-file gates ask the same functions the engine posture is built
+/// from rather than a second detector. Called once from `main`; set-once.
+pub(crate) fn register_incumbent_probe() {
+    nub_core::incumbent::register(nub_core::incumbent::IncumbentProbe {
+        declared_pm_name: |dir| aube_lockfile::declared_package_manager(dir).map(|d| d.name),
+        member_npmrc: |dir| {
+            workspace_npmrc_model(&resolve_config_surface(dir), declared_pnpm_major_in(dir))
+        },
+    });
+}
+
+/// How a detected pnpm major reads project/user `.npmrc` for *settings*. pnpm
+/// reversed this at v11: v9/v10 (and the unknown-major default) read the open
+/// key space — every setting is readable from `.npmrc`; v11's base policy reads
+/// only the auth/registry/network allowlist there. Nub later re-admits layout
+/// keys because it does not take layout from branded YAML. Keyed on the major so
+/// a future major slots in as one more arm rather than a new special case.
+enum NpmrcKeyPolicy {
+    /// pnpm ≤10 / npm / unknown-major default: the open `.npmrc` key space.
+    Open,
+    /// pnpm 11+: the auth/registry/network allowlist only (pnpm 11's
+    /// `isNpmrcReadableKey`); layout/behavior keys are dropped.
+    Pnpm11Allowlist,
+}
+
+/// Map a detected incumbent pnpm major to its [`NpmrcKeyPolicy`]. An unknown
+/// major (`None`) defaults to `Open` — the dominant/most-compatible model per
+/// AGENTS ("unknown major → the v10 open-`.npmrc` model").
+fn pnpm_npmrc_key_policy(major: Option<u64>) -> NpmrcKeyPolicy {
+    match major {
+        Some(m) if m >= 11 => NpmrcKeyPolicy::Pnpm11Allowlist,
+        _ => NpmrcKeyPolicy::Open,
+    }
 }
 
 /// Emit one dim warning line per graph-shaping field nub ignored under the
@@ -947,14 +1751,12 @@ fn emit_scope_warnings(role: config_scope::Role, ignored: &[config_scope::Ignore
     }
 }
 
-/// Whether the scoping warning should be dim-styled: stderr is a terminal
-/// (or `FORCE_COLOR` is set) AND `NO_COLOR` is unset.
+/// Whether the scoping warning should be dim-styled. Delegates to the CLI's single
+/// color predicate so an explicit `--color`/`--no-color` governs the engine's
+/// warnings too, and so `FORCE_COLOR=0` reads as OFF rather than as merely set.
 pub(crate) fn scope_warning_uses_dim() -> bool {
     use std::io::IsTerminal;
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
-    }
-    std::io::stderr().is_terminal() || std::env::var_os("FORCE_COLOR").is_some()
+    crate::cli::color_enabled(std::io::stderr().is_terminal())
 }
 
 /// The pnpm version the role-first UA advertises for a pnpm-role project with
@@ -963,6 +1765,18 @@ pub(crate) fn scope_warning_uses_dim() -> bool {
 /// epics/v0.2-aube). A `packageManager`/`devEngines` pin always outranks this:
 /// the UA impersonates the pinned version when one exists.
 pub(crate) const PNPM_PARITY_VERSION: &str = "11.3.0";
+
+/// The project-local virtual-store directory leaf under `node_modules/`.
+/// `.store` is the vendor-neutral isolated-store convention (npm isolated-mode
+/// RFC-0042, Yarn-berry's pnpm-linker `pnpmStoreFolder`, cnpm), so tools that
+/// walk `node_modules` for a project root — simple-git-hooks and its class —
+/// recognize it as an install marker; the former `.nub` leaf was invisible to
+/// them. Single source of truth for the name: `nub_setting_defaults` sets
+/// `virtualStoreDir`/`stateDir` to `node_modules/<leaf>`, and vite_compat scans
+/// it. Standalone aube is unaffected — its default stays `.aube`; this is a
+/// nub-embedder value.
+// @lat: [[research/store-marker-hardcoding#Synthesis / recommendation (recommend-only)]]
+pub(crate) const PROJECT_VIRTUAL_STORE_LEAF: &str = ".store";
 
 /// Compose the lifecycle-script UA product tokens for the resolved role —
 /// everything before the `<os> <arch>` tail the engine appends. The dialect is
@@ -1000,7 +1814,9 @@ fn lifecycle_ua_product(detected: Option<&DetectedLockfile>, cwd: &Path) -> Stri
 /// (a malformed/ambiguous lockfile is surfaced loudly elsewhere; the UA must
 /// never panic a script spawn).
 pub(crate) fn run_lifecycle_ua_product(cwd: &Path, node_version: &str) -> String {
-    let detected = resolve_identity_walk_up(cwd).ok().flatten();
+    let detected = resolve_identity_walk_up(cwd, IdentityStrictness::Lenient)
+        .ok()
+        .flatten();
     compose_lifecycle_ua(
         nub_core::pm::resolve::declared_pm_raw(cwd),
         detected.map(|d| d.kind),
@@ -1009,6 +1825,12 @@ pub(crate) fn run_lifecycle_ua_product(cwd: &Path, node_version: &str) -> String
 }
 
 /// Pure core of [`lifecycle_ua_product`] (unit-tested without a fixture).
+///
+/// The leading token is the contested part: a `nub/`-first string is honest but
+/// unrecognized by the whitelist detectors (`package-manager-detector`,
+/// create-next-app), which fall back to npm and print npm commands. That cost
+/// was weighed against masquerading as the incumbent, and honesty won.
+// @lat: [[research/npm-config-user-agent#Current behavior]]
 fn compose_lifecycle_ua(
     declared: Option<(String, Option<String>)>,
     kind: Option<LockfileKind>,
@@ -1069,13 +1891,15 @@ fn compose_lifecycle_ua(
 fn augmentation_to_lifecycle_overlay(
     aug: &nub_core::node::spawn::AugmentationEnv,
     node_execpath: &str,
+    runtime_json: Option<&str>,
 ) -> (Vec<(std::ffi::OsString, std::ffi::OsString)>, Vec<PathBuf>) {
     use std::ffi::OsString;
     let mut overlay: Vec<(OsString, OsString)> = Vec::new();
     // $NODE → the shim (→ nub) so userland `$NODE child.js` / `spawn(env.NODE)`
     // in a build script stays augmented, exactly as build_script_command sets it.
-    if let Some(node_shim) = aug.node_shim_exe() {
-        overlay.push((OsString::from("NODE"), node_shim));
+    let node_shim = aug.node_shim_exe();
+    if let Some(node_shim) = &node_shim {
+        overlay.push((OsString::from("NODE"), node_shim.clone()));
     }
     if let Some(opts) = &aug.node_options {
         overlay.push((OsString::from("NODE_OPTIONS"), OsString::from(opts)));
@@ -1083,10 +1907,51 @@ fn augmentation_to_lifecycle_overlay(
     if let Some(node_path) = &aug.node_path {
         overlay.push((OsString::from("NODE_PATH"), node_path.clone()));
     }
+    let mut set_env = |key: &str, value: &std::ffi::OsStr| {
+        overlay.push((OsString::from(key), value.to_os_string()));
+    };
+    aug.apply_restore_markers(&mut set_env);
+    let ambient_node = std::env::var_os("NODE");
+    nub_core::node::spawn::apply_expected_augmentation_marker(
+        "NODE",
+        node_shim.as_deref().or(ambient_node.as_deref()),
+        &mut set_env,
+    );
+    // Aube composes its lifecycle `.bin` chain after this overlay, so the exact
+    // final PATH is not available here. Mark the ambient baseline: a fresh
+    // boundary will then remove only Nub's exact shim component and preserve
+    // both lifecycle `.bin` entries and any later user additions.
+    let ambient_path = std::env::var_os("PATH");
+    nub_core::node::spawn::apply_expected_augmentation_marker(
+        "PATH",
+        ambient_path.as_deref(),
+        &mut set_env,
+    );
+    if let Some(runtime_json) = runtime_json {
+        overlay.push((
+            OsString::from(crate::project_config::RUNTIME_CONFIG_ENV),
+            OsString::from(runtime_json),
+        ));
+    }
+    // The script's `node` re-enters nub and re-derives its options; this is what
+    // keeps it on the tolerant tsconfig gate the PM verb itself used.
+    overlay.push((
+        OsString::from(crate::cli::LIFECYCLE_ENV),
+        OsString::from("1"),
+    ));
+    // The build jail clears the environment before this overlay lands; without
+    // this, a chain through dependency scripts would restart nub's recursion
+    // count at every link.
+    if let Some(depth) = std::env::var_os(nub_core::node::nesting::NESTING_ENV) {
+        overlay.push((OsString::from(nub_core::node::nesting::NESTING_ENV), depth));
+    }
     // localStorage-neutralize signal for dependency build scripts' node children
     // (webstorage flag-needed band, no user --localstorage-file); preload reads + deletes.
     aug.apply_localstorage_env(|k, v| {
         overlay.push((OsString::from(k), OsString::from(v)));
+    });
+    aug.apply_threadpool_size(|k, v| {
+        overlay.push((OsString::from(k), v.to_os_string()));
     });
     // Pin npm_node_execpath to the provisioned Node — the ABI fix. Independent
     // of the shim: it flows even on the no-shim path so node-gyp never falls
@@ -1105,33 +1970,105 @@ fn augmentation_to_lifecycle_overlay(
     (overlay, prepends)
 }
 
+/// The directory lifecycle Node discovery is anchored at: the workspace root
+/// when `cwd` sits in a member, else the project root, else `cwd` itself.
+///
+/// aube keys its install state and virtual store at the workspace root
+/// (`dirs::workspace_or_project_root`), and an install from a member
+/// materializes the ONE shared tree for the whole workspace — so the Node its
+/// build scripts compile against, which is also the engine that keys the ABI
+/// caches, must be the root's pin rather than whichever member the shell sits
+/// in. Anchoring at the raw cwd instead lets a member's own `.nvmrc` flip the
+/// engine key against a root-anchored state file, thrashing the warm path.
+/// `detect_project` walks up by the same rule aube's root does.
+fn lifecycle_node_anchor(cwd: &Path) -> PathBuf {
+    nub_core::workspace::detect::detect_project(cwd)
+        .map(|p| p.workspace_root.unwrap_or(p.root))
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
 /// Install nub's runtime augmentation onto the engine's lifecycle-script spawn
 /// env (via aube's generic [`aube::set_script_settings`] overlay), so dependency
 /// build scripts run under the project's provisioned + augmented Node — the same
-/// env `nub run` / `nub exec` give scripts. No-op (overlay stays default-empty,
-/// behavior preserved) when augmentation can't be computed (compat / re-entrant
-/// / broken install). Called once per command from [`engine_session`].
-fn apply_lifecycle_augmentation(cwd: &Path) {
-    let Ok(nub_binary) = nub_core::node::spawn::current_nub_binary() else {
-        return;
-    };
+/// env `nub run` / `nub exec` give scripts. The overlay stays default-empty
+/// (behavior preserved) when augmentation can't be computed (compat /
+/// re-entrant / broken install); the resolved Node *version* is published to the
+/// engine either way. Called once per command from [`engine_session`].
+fn apply_lifecycle_augmentation(cwd: &Path) -> Result<()> {
+    if LIFECYCLE_NODE_FROM_PATH.load(std::sync::atomic::Ordering::Relaxed) {
+        return apply_lifecycle_path_node(cwd);
+    }
+    let anchor = lifecycle_node_anchor(cwd);
     // The project's Node — pin-aware (`.nvmrc`/`.node-version`/`engines`), NOT
     // the ambient PATH node. This resolved version drives flag injection and its
     // path pins npm_node_execpath. Mirrors build_script_command's discovery.
-    let node = nub_core::node::discovery::discover_node(cwd)
-        .unwrap_or_else(|_| nub_core::node::discovery::ResolvedNode::fallback());
+    let discovered = nub_core::node::discovery::discover_node(&anchor);
+    // Published ABOVE the early returns: the engine keys its GVS virtual-store
+    // paths — and validates `engines.node` — off this version, so it has to name
+    // the Node dependency build scripts actually compile against. That stays the
+    // project's pin under `--node` / NODE_COMPAT, which disable augmentation but
+    // not version provisioning. Otherwise aube probes the ambient PATH node and
+    // two majors silently share one store entry. Deliberately left unset when
+    // discovery FAILS: build scripts then fall back to a bare `node`, so the
+    // PATH probe is the honest answer and a fabricated version would not be.
+    if let Ok(node) = &discovered {
+        let version = node.version.to_string();
+        aube_util::update_engine_context(|c| c.runtime_node_version = Some(version));
+    }
+    let Ok(nub_binary) = nub_core::node::spawn::current_nub_binary() else {
+        return Ok(());
+    };
+    let node = discovered.unwrap_or_else(|_| nub_core::node::discovery::ResolvedNode::fallback());
+    let mut runtime = crate::project_config::runtime_config()?;
+    let runtime_node_options = crate::cli::lifecycle_node_options(&mut runtime, &node)?;
+    let runtime_json = crate::cli::runtime_config_json(&runtime)?;
     let pnp_ctx = nub_core::pnp::detect(cwd);
-    let Some(aug) = nub_core::node::spawn::compute_augmentation_env(
+    let Some(mut aug) = nub_core::node::spawn::compute_augmentation_env(
         &nub_binary,
-        node.version,
+        node.version.clone(),
         // Lifecycle scripts are never compat: PM verbs run augmented (there is
         // no `--node` lifecycle path).
         false,
         pnp_ctx.as_ref().map(|c| c.pnp_cjs.as_path()),
+        &runtime_node_options,
     ) else {
-        return;
+        return Ok(());
     };
-    let (env_overlay, path_prepends) = augmentation_to_lifecycle_overlay(&aug, node.path.as_str());
+    // npm/pnpm parity: `npm_config_node_options` seeds a lifecycle script's
+    // NODE_OPTIONS only when the ambient env carries none of its own.
+    if std::env::var_os("NODE_OPTIONS").is_none()
+        && let Some(configured) = std::env::var("NPM_CONFIG_NODE_OPTIONS")
+            .or_else(|_| std::env::var("npm_config_node_options"))
+            .ok()
+            .filter(|value| !value.is_empty())
+    {
+        match &mut aug.node_options {
+            Some(options) => {
+                options.push(' ');
+                options.push_str(&configured);
+            }
+            None => aug.node_options = Some(configured),
+        }
+    }
+    // Lifecycle scripts need nothing env-owner-specific here. A script's `node`
+    // resolves through nub's PATH shim and re-enters nub, which detects the owner
+    // and puts the loader in front of that Node itself — so the environment
+    // arrives by the same route as every other nub-launched process.
+    let (env_overlay, path_prepends) =
+        augmentation_to_lifecycle_overlay(&aug, node.path.as_str(), Some(&runtime_json));
+    // The shim dir + provisioned node for the engine's runtime spawn helpers —
+    // the boundary the transient bin-exec paths (dlx / create / `nubx <tool>`)
+    // read but the lifecycle overlay above never reaches. `runtime_switching`
+    // is off (nub owns provisioning), so aube's resolver stays inert and
+    // `runtime::path_entries()` / `apply_child_env` would otherwise surface no
+    // node — a fetched bin's `exec node` shebang then dies with `node: not
+    // found` on a machine with no system node (#303). Supplying the shim dir
+    // fronts PATH so `exec node` re-enters nub-as-node; pinning the real
+    // provisioned node keeps NODE / npm_node_execpath valid for node-gyp-style
+    // re-spawners. Both default to None for standalone aube, so its bin-exec
+    // paths are byte-identical.
+    let runtime_node_dir = aug.shim_dir.as_deref().map(PathBuf::from);
+    let runtime_node_bin = Some(PathBuf::from(node.path.as_str()));
     // Hand the overlay to the engine via the runtime context. aube copies
     // `env_overlay` / `path_prepends` from `engine_context()` into its
     // `ScriptSettings` at settings-resolution time (the spawn path composes them
@@ -1141,7 +2078,103 @@ fn apply_lifecycle_augmentation(cwd: &Path) {
     aube_util::update_engine_context(|c| {
         c.env_overlay = env_overlay;
         c.path_prepends = path_prepends;
+        c.runtime_node_dir = runtime_node_dir;
+        c.runtime_node_bin = runtime_node_bin;
     });
+    Ok(())
+}
+
+/// The npm-routed install's lifecycle Node ([`set_lifecycle_node_from_path`]):
+/// the `node` on PATH, as npm hands it to scripts. No shim dir goes on PATH, so
+/// a script's `node` is the same binary the shell's `node` is, and nothing is
+/// provisioned. The version is still published so the engine keys its build
+/// artifacts, and stamps the tree, on the Node that actually ran the scripts;
+/// `npm_node_execpath` names it as npm does. With no `node` on PATH at all the
+/// engine probes for itself, exactly as when pin discovery fails above.
+///
+/// When the shell's `node` is Nub's own persistent shim (`nub node shim`), PATH
+/// semantics are the project's pin — every `node` a script runs resolves it, as
+/// it does under npm on that machine — so what is recorded is what the shim
+/// resolves, never the real binary the shim hides. An unsatisfied pin then
+/// records nothing, and the engine's own probe through the shim is the truth.
+fn apply_lifecycle_path_node(cwd: &Path) -> Result<()> {
+    use nub_core::node::discovery;
+    let node = if discovery::shell_node_is_nub_shim() {
+        discovery::discover_node(&lifecycle_node_anchor(cwd))
+    } else {
+        discovery::discover_shell_node()
+    };
+    let Ok(node) = node else {
+        return Ok(());
+    };
+    let version = node.version.to_string();
+    let execpath = std::ffi::OsString::from(node.path.as_str());
+    aube_util::update_engine_context(move |c| {
+        c.runtime_node_version = Some(version);
+        c.env_overlay
+            .push((std::ffi::OsString::from("npm_node_execpath"), execpath));
+    });
+    Ok(())
+}
+
+/// Replace the engine's Windows default lifecycle shell with nub's bundled
+/// busybox-w32 `sh`, so a dependency's `postinstall` gets the same POSIX shell
+/// `nub run` already uses (`crate::cli::resolve_bundled_busybox`) instead of
+/// `cmd.exe`. No-op on Unix, where the engine default is already `sh`.
+///
+/// Three reasons:
+///
+/// 1. ONE SHELL. `nub run` already defaults to busybox on Windows, so leaving
+///    the lifecycle path on `cmd.exe` meant one POSIX script body behaved
+///    differently depending on which nub surface ran it. This removes a
+///    divergence rather than creating one.
+/// 2. NO COMPATIBILITY COST, AND TWO FIXES. A sweep of the 344 widely-used
+///    packages that run install scripts found ZERO of 363 script bodies using
+///    cmd-only syntax (no `%VAR%`, `%~dp0`, `if exist`, `copy`/`del`/`rd`,
+///    `>nul`, `call`, `set VAR=`, caret escapes, `.cmd`/`.bat` invocation) —
+///    `sh` parses all 363. Two (`detox-recorder`, `svf-lib`) invoke `./*.sh`
+///    and only work under `sh`.
+/// 3. ROBUSTNESS UNDER THE SANDBOX. Confined in an AppContainer with no
+///    ancestor repair at all, busybox's `cd`, globbing, redirection, reads and
+///    whole spawn battery are byte-identical to unconfined. `cmd.exe` instead
+///    depends on the sandbox's ancestor repair (`nub-sandbox`'s traverse ACEs
+///    plus the capability SIDs it harvests off each ancestor's DACL) to report
+///    the filesystem correctly — and that repair is best-effort BY DESIGN: a
+///    refused ACE write is skipped rather than fatal, and an ancestor whose
+///    DACL names no harvestable capability yields nothing to request. A shell
+///    that needs no repair cannot be degraded by one that partially failed.
+///
+/// A user's explicit `script-shell` still wins — aube consults this only when
+/// that is unset. A missing sidecar (a broken install; `nub run` is equally
+/// dead in that state) warns and leaves the engine on `cmd.exe` rather than
+/// failing read-only verbs like `nub list` that never spawn a script.
+fn apply_lifecycle_script_shell() {
+    if !cfg!(windows) {
+        return;
+    }
+    match crate::cli::resolve_bundled_busybox() {
+        Ok(busybox) => aube_util::update_engine_context(|c| {
+            c.default_script_shell = Some(busybox_script_shell(&busybox));
+        }),
+        Err(err) => tracing::warn!(
+            "{err:#}\ndependency lifecycle scripts will run under cmd.exe, which does not \
+             support POSIX script bodies"
+        ),
+    }
+}
+
+/// busybox is a multi-call binary: it dispatches on `argv[0]`, or on a leading
+/// applet name. Spawned as `busybox.exe` the applet name must LEAD, so a bare
+/// `-c` would not select `sh` at all. Split out of the Windows-gated caller so
+/// the form is pinned by a test on every platform — dropping `"sh"` breaks only
+/// Windows, where no other test in this suite would see it.
+fn busybox_script_shell(busybox: &str) -> aube_util::ScriptShell {
+    aube_util::ScriptShell {
+        program: PathBuf::from(busybox),
+        args: crate::cli::BUSYBOX_SH_ARGS.map(str::to_string).to_vec(),
+        // busybox-w32 up-cases every environment name it loads.
+        restore_env_casing: true,
+    }
 }
 
 /// `--dir` / `-C` (and the global `--cwd`, which dispatch applies earlier):
@@ -1173,8 +2206,27 @@ pub(crate) struct DetectedLockfile {
 /// engine's declaration-aware policy applies — declaration first, lockfile
 /// inference second; contradiction/ambiguity are loud errors carrying the
 /// `nub pm use` remedy.
-fn resolve_identity_walk_up(cwd: &Path) -> Result<Option<DetectedLockfile>> {
+fn resolve_identity_walk_up(
+    cwd: &Path,
+    strictness: IdentityStrictness,
+) -> Result<Option<DetectedLockfile>> {
     use aube_lockfile::ResolvedLockfileKind;
+    // The walk never escapes nub's own PM cache root. Installs running inside
+    // it are nub-internal by construction (the node-gyp bootstrap's recursive
+    // install, dlx scratch dirs) and must not inherit identity from whatever
+    // sits above the cache — unbounded, a first-run bootstrap dir (manifest,
+    // no lockfile yet) walked into $HOME and hard-failed the outer install on
+    // unrelated-lockfile ambiguity (#489). The root is kept in whichever
+    // spelling is an ancestor of `cwd` (raw, or canonicalized for the
+    // symlinked-temp-dir case) so the containment test stays consistent as
+    // `dir` pops.
+    let clamp = aube_store::dirs::cache_dir().and_then(|root| {
+        if cwd.starts_with(&root) {
+            return Some(root);
+        }
+        let canon = std::fs::canonicalize(&root).ok()?;
+        cwd.starts_with(&canon).then_some(canon)
+    });
     let mut dir = cwd.to_path_buf();
     for _ in 0..16 {
         match aube_lockfile::resolve_project_lockfile_kind(&dir) {
@@ -1194,9 +2246,20 @@ fn resolve_identity_walk_up(cwd: &Path) -> Result<Option<DetectedLockfile>> {
             }
             // Nothing at this level decides the identity — keep walking.
             Ok(ResolvedLockfileKind::Fresh) => {}
+            // An ambiguity / declaration-contradiction is a HARD error only
+            // for the project-touching families (Strict). The transient
+            // fetch-and-run families (Lenient) never read or write the CWD
+            // lockfile, so the ambiguity is irrelevant — degrade to
+            // no-identity and let the engine's fresh-project defaults stand.
+            Err(_) if strictness == IdentityStrictness::Lenient => return Ok(None),
             Err(err) => return Err(identity_error(err)),
         }
         if !dir.pop() {
+            break;
+        }
+        if let Some(root) = &clamp
+            && !dir.starts_with(root)
+        {
             break;
         }
     }
@@ -1210,9 +2273,21 @@ fn resolve_identity_walk_up(cwd: &Path) -> Result<Option<DetectedLockfile>> {
 /// `nub pm use` is the one-command fix for both states). Exit code is the
 /// generic 1 (the session-build path has no per-code exit channel); the
 /// stable code string in the output is the contract scripts can branch on.
+///
+/// The two states get DIFFERENT remedies because "set the declaration" is a
+/// dead end for one of them. A declaration naming nub is a self-name: the
+/// engine reads it as "preserve whatever format this project already uses"
+/// (`aube-lockfile`'s `is_self_name` carve-out), which resolves nothing when
+/// two candidate lockfiles are present. Since `nub install` WRITES that
+/// declaration itself, telling an ambiguous project to declare its manager
+/// sends the common case in a circle — the state a hosted builder manufactures
+/// when it runs its own install beside nub's lockfile.
 fn identity_error(err: aube_lockfile::Error) -> anyhow::Error {
     use aube_lockfile::Error as E;
-    const REMEDY: &str = "set the declaration: nub pm use <pm> — or remove the stale lockfile";
+    const MISMATCH_REMEDY: &str =
+        "set the declaration: nub pm use <pm> — or remove the stale lockfile";
+    const AMBIGUITY_REMEDY: &str =
+        "remove the stale lockfile, or run nub pm use <pm> naming a specific manager";
     let report = match &err {
         E::DeclarationMismatch {
             declared,
@@ -1221,13 +2296,13 @@ fn identity_error(err: aube_lockfile::Error) -> anyhow::Error {
             found,
         } => miette::miette!(
             code = aube_codes::errors::ERR_AUBE_LOCKFILE_DECLARATION_MISMATCH,
-            help = REMEDY,
+            help = MISMATCH_REMEDY,
             "package.json declares `{declared}` (via `{field}`), but {expected} is missing — \
              found {found} instead"
         ),
         E::AmbiguousLockfiles { found } => miette::miette!(
             code = aube_codes::errors::ERR_AUBE_LOCKFILE_AMBIGUOUS,
-            help = REMEDY,
+            help = AMBIGUITY_REMEDY,
             "multiple lockfiles found: {found} — cannot tell which package manager owns this \
              project"
         ),
@@ -1246,7 +2321,7 @@ fn identity_error(err: aube_lockfile::Error) -> anyhow::Error {
 /// [`engine_session`]). Every seam is idempotent.
 pub(crate) fn engine_brand_preflight() {
     // Static identity FIRST, before anything reads project state or branding.
-    // The whole compile-time profile — name, `nub/<ver>` UA, `lock.yaml`
+    // The whole compile-time profile — name, `nub/<ver>` UA, `nub.lock`
     // canonical lockfile, `["nub"]`/`["pnpm"]` detection names, and the five
     // embedder-fixed toggles (engines-self check OFF, runtime-switching OFF,
     // warm-store-verify OFF, canonical-lockfile-always-wins OFF, self-update
@@ -1280,20 +2355,60 @@ pub(crate) fn engine_brand_preflight() {
     // own branded YAML/namespace are `None`/`""` so they never apply). In compat
     // mode (any other role, incl. fresh) nub plays the incumbent completely:
     // `pnpm-workspace.yaml` + `pnpm.*` stay live. The pnpm-branded read-sites now
-    // move together behind ONE EngineContext posture: `read_branded_pnpm_config`
-    // gates the `pnpm-workspace.yaml` candidate, the `pnpm` package.json
-    // namespace, AND pnpm's global `~/.config/pnpm/auth.ini` — true only in the
-    // PnpmOrFresh arm. `read_manifest_root_config` is true only under nub
-    // identity, where root-level config migrated by `nub pm use nub` is the
-    // native surface. `pnpmfile_default_enabled` gates the cwd-default
-    // `.pnpmfile`; true only in the PnpmOrFresh arm. The probe
+    // move together behind the same ConfigSurface decision: `read_branded_pnpm_config`
+    // gates the project-local `pnpm-workspace.yaml` candidate and `pnpm`
+    // package.json namespace; `read_pnpm_global_config` separately gates pnpm's
+    // global `config.yaml` and `~/.config/pnpm/auth.ini`. The project-local gate
+    // remains true on the conservative PnpmOrFresh surface, while the global
+    // gate additionally requires a provable pnpm-v11+ incumbent because both
+    // global files were introduced by pnpm 11; an unknown major follows the
+    // dominant v10 model and leaves them unread.
+    // `read_manifest_root_config` is true only under nub identity, where
+    // root-level config migrated by `nub pm use nub` is the native surface.
+    // `pnpmfile_default_enabled` gates the cwd-default `.pnpmfile`; true only in
+    // the PnpmOrFresh arm. The probe
     // is engine-free (plain manifest/lockfile-presence reads): ONE walk up the
     // tree, ONE `current_dir()` read (see [`resolve_config_surface`]).
-    let surface = std::env::current_dir()
-        .ok()
-        .map(|cwd| resolve_config_surface(&cwd))
+    let cwd = std::env::current_dir().ok();
+    let surface = cwd
+        .as_deref()
+        .map(resolve_config_surface)
         .unwrap_or(ConfigSurface::PnpmOrFresh);
     let read_branded_pnpm_config = matches!(surface, ConfigSurface::PnpmOrFresh);
+    let pnpm_v11_incumbent = cwd
+        .as_deref()
+        .is_some_and(|cwd| pnpm_v11_surface(&surface, cwd));
+    // pnpm REVERSED its env-var convention at v11: pnpm ≤10 reads `npm_config_*`
+    // registry-client env vars and IGNORES `pnpm_config_*`; pnpm 11 reads
+    // `pnpm_config_*` / `PNPM_CONFIG_*` and IGNORES `npm_config_*`. Honor bare
+    // `pnpm_config_<registry-client-key>` (registry, proxies, TLS knobs) only
+    // under a provable pnpm-v11+ incumbent, so nub mirrors the project's actual
+    // pnpm. Detection matches `store_config_family::project_scalar_home`: the
+    // declared `packageManager`/`devEngines` pin, name LITERALLY "pnpm", major
+    // ≥ 11. Unknown/undeclared version → off (the dominant v9/v10 base ignores
+    // `pnpm_config_*`); the installed-PM `--version` probe and lockfile signal
+    // are intentionally not consulted (they'd only move an unknown off its
+    // already-correct default). `npm_config_*` keeps working universally.
+    let read_pnpm_config_env_registry =
+        read_branded_pnpm_config && pnpm_incumbent_major_is_v11_plus();
+    // Start from pnpm 11's project/user `.npmrc` allowlist; pnpm ≤10 reads the
+    // open key space. The layout exception is paired below through
+    // `read_layout_from_workspace_yaml = false`, which makes the loader retain
+    // `.npmrc` layout keys. Mirror the detected pnpm major (the per-major compat rule),
+    // architected as the `major → policy` map in [`pnpm_npmrc_key_policy`].
+    // Gated on `read_branded_pnpm_config` so it engages only under a pnpm
+    // incumbent — a fresh/unknown-major project keeps the open v10 model.
+    let npmrc_settings_allowlist = read_branded_pnpm_config
+        && matches!(
+            pnpm_npmrc_key_policy(declared_pnpm_major()),
+            NpmrcKeyPolicy::Pnpm11Allowlist
+        );
+    let workspace_npmrc = match workspace_npmrc_model(&surface, declared_pnpm_major()) {
+        nub_core::workspace::npmrc::MemberNpmrc::Ignored => aube_util::WorkspaceNpmrc::RootOnly,
+        nub_core::workspace::npmrc::MemberNpmrc::Layered => {
+            aube_util::WorkspaceNpmrc::RootBeneathMember
+        }
+    };
     let read_yarn_config = read_yarn_config_for_surface(&surface);
     // Classic Yarn (v1) reads `.yarnrc`; Yarn Berry (v2+) abandoned it for
     // `.yarnrc.yml` and ignores a stray legacy `.yarnrc`. Gate the engine's
@@ -1323,18 +2438,28 @@ pub(crate) fn engine_brand_preflight() {
         matches!(surface, ConfigSurface::NonPnpmCompat { role: "npm", .. });
     aube_util::update_engine_context(|c| {
         c.read_branded_pnpm_config = read_branded_pnpm_config;
-        // GLOBAL config is read PM-AGNOSTICALLY and UNGATED by cwd incumbency:
-        // nub honors whatever global config the user already has from any tool —
-        // npm's `~/.npmrc`, pnpm's global `config.yaml`, pnpm's global `auth.ini`.
-        // Set `true` UNCONDITIONALLY (cwd-independent). The original bug was that
-        // these global reads were GATED on the cwd-derived `read_branded_pnpm_config`
-        // (so nub read pnpm's global config only when standing in a pnpm project);
-        // the fix is to DECOUPLE them from the cwd, not to stop reading them. The
-        // separate `read_pnpm_global_config` posture exists precisely so the GLOBAL
-        // reads don't ride the project-scoped gate. (Global WRITES are neutral-only —
-        // enforced in store_config_family: `config set -g` never writes a
-        // pnpm-branded global file.)
-        c.read_pnpm_global_config = true;
+        c.npmrc_settings_allowlist = npmrc_settings_allowlist;
+        c.workspace_npmrc = workspace_npmrc;
+        c.invocation_dir = cwd.clone();
+        // `config.yaml` and `auth.ini` are pnpm-NAMED global files. Read them
+        // only for a provable pnpm-v11+ incumbent; unknown majors use the v10
+        // model and never inherit pnpm global state. Global writes remain
+        // neutral-only (`config set -g` never writes pnpm's files).
+        c.read_pnpm_global_config = pnpm_v11_incumbent;
+        // Nub chooses the `node_modules` layout under every identity; branded
+        // config files do not direct the tree, including pnpm's workspace YAML.
+        // Mirroring an incumbent's layout only reads coherently if its DEFAULT
+        // is mirrored too — npm and bun default to hoisted, so honoring that
+        // would end nub's isolated default — and honoring the written key while
+        // ignoring the identical unwritten intent is a seam users cannot
+        // predict. Dropping the whole category is the only version without one.
+        //
+        // Load-bearing pairing: this same `false` makes
+        // `apply_npmrc_settings_allowlist` keep layout keys, so a pnpm 11
+        // project still configures layout through `.npmrc` / `--node-linker`
+        // rather than being left with no surface at all.
+        c.read_layout_from_workspace_yaml = false;
+        c.read_pnpm_config_env_registry = read_pnpm_config_env_registry;
         c.read_yarn_config = read_yarn_config;
         c.yarn_is_classic = yarn_is_classic;
         c.read_bun_config = read_bun_config;
@@ -1343,6 +2468,29 @@ pub(crate) fn engine_brand_preflight() {
         c.synthetic_user_npmrc_entries = bunfig.user;
         c.synthetic_project_npmrc_entries = bunfig.project;
         c.npm_save_prefix_on_bare_exact = npm_save_prefix_on_bare_exact;
+        // pnpm's `namedRegistries` alias routing is a pnpm-compat surface, so it
+        // engages under the same posture as the pnpm-branded config reads
+        // (pnpm incumbent or fresh nub-as-pnpm-drop-in). Distinct EngineContext
+        // bool because that posture defaults `true` in standalone aube, which
+        // would activate the feature there and break default-preservation.
+        c.named_registries_enabled = read_branded_pnpm_config;
+        // nub treats packageExtensions as a checksummed, drift-enforced config
+        // like pnpm: it stamps `packageExtensionsChecksum` on its own generic
+        // lockfile (nub.lock) and re-resolves / frozen-fails on a mismatch.
+        // Unconditional (not surface-gated) — harmless under lockfile kinds that
+        // carry no checksum (npm/yarn/bun locks), where stored and computed both
+        // resolve to `None`. Standalone aube leaves the default `false`.
+        c.enforce_package_extensions_checksum = true;
+        // The bundled compatibility database, on top of the vendored Yarn and
+        // pnpm catalogs the engine already applies. Lowest precedence and purely
+        // additive, so a curated upstream rule always wins on a key both carry —
+        // and since extensions merge per DEPENDENCY NAME rather than per
+        // selector, an entry this database extends beyond Yarn's still lands.
+        //
+        // Read only when resolving a package, never by the lockfile checksum, so
+        // refreshing the dataset cannot drift an existing lockfile. Gated with
+        // the vendored catalogs by the one `ignoreCompatibilityDb` escape hatch.
+        c.bundled_package_extensions = Some(compat_db::bundled_package_extensions().clone());
     });
     match surface {
         ConfigSurface::NubIdentity(dir) => {
@@ -1362,8 +2510,8 @@ pub(crate) fn engine_brand_preflight() {
             // Compat mode, but the incumbent is npm/yarn/bun — NOT pnpm. The
             // pnpm-specific config surface is theirs to ignore (gated off by
             // `read_branded_pnpm_config = false`): a stray `pnpm-workspace.yaml`,
-            // a `package.json#pnpm.*` object, or pnpm's global `auth.ini` in an
-            // npm/yarn/bun project is another tool's state. The cwd-default
+            // a `package.json#pnpm.*` object, or pnpm's global `config.yaml` /
+            // `auth.ini` in an npm/yarn/bun project is another tool's state. The cwd-default
             // `.pnpmfile.cjs`/`.mjs` is pnpm-proprietary too, and unlike a
             // workspace-yaml *it shapes resolution* — gated off here by
             // `pnpmfile_default_enabled = false`. Explicit
@@ -1373,6 +2521,7 @@ pub(crate) fn engine_brand_preflight() {
             // pattern.
             if let Some(present) = std::env::current_dir()
                 .ok()
+                .filter(|_| !pnpmfile_choice_is_explicit())
                 .and_then(|cwd| pnpmfile_default_path(&cwd))
             {
                 let name = present
@@ -1393,10 +2542,12 @@ pub(crate) fn engine_brand_preflight() {
         ConfigSurface::PnpmOrFresh => {
             // pnpm role (or fresh): play the incumbent completely.
             // `read_branded_pnpm_config = true` keeps `pnpm-workspace.yaml`, the
-            // `pnpm` package.json namespace, and pnpm's `auth.ini` live. nub's own
-            // branded YAML/namespace are `None`/`""` on the const, so an
-            // `aube-workspace.yaml` or `aube` manifest object some other tool left
-            // on disk is neither read nor chosen as a fresh-write target.
+            // `pnpm` package.json namespace live. The separate global gate keeps
+            // pnpm 11's `config.yaml`/`auth.ini` live only when that major is
+            // provable. nub's own branded YAML/namespace are `None`/`""` on the
+            // const, so an `aube-workspace.yaml` or `aube` manifest object some
+            // other tool left on disk is neither read nor chosen as a
+            // fresh-write target.
         }
     }
 }
@@ -1415,6 +2566,26 @@ fn pnpmfile_default_path(cwd: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Set when the invocation named a pnpmfile decision on the command line
+/// (`--pnpmfile` / `--global-pnpmfile` / `--ignore-pnpmfile`).
+///
+/// A process global rather than a parameter because the warning above is
+/// emitted from [`engine_brand_preflight`], which takes no arguments and is
+/// reached from a dozen call sites long before any verb's flags are read. The
+/// warning's own remedy is "name it explicitly with `--pnpmfile`", so printing
+/// it at a user who did exactly that would contradict the run they are looking
+/// at.
+static PNPMFILE_CHOICE_IS_EXPLICIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn note_explicit_pnpmfile_choice() {
+    PNPMFILE_CHOICE_IS_EXPLICIT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn pnpmfile_choice_is_explicit() -> bool {
+    PNPMFILE_CHOICE_IS_EXPLICIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The role-gated config surface for a project, resolved by ONE engine-free
@@ -1438,6 +2609,27 @@ enum ConfigSurface {
     /// pnpm-format artifacts): play the pnpm incumbent completely — the
     /// pnpm-specific surface stays live.
     PnpmOrFresh,
+}
+
+/// Whether the project is a provable pnpm-v11+ incumbent — the gate on the two
+/// engine postures that pnpm 11 introduced together: the pnpm-NAMED global
+/// files (`config.yaml` + `auth.ini`), and `pnpm-workspace.yaml` as the home for
+/// layout settings that v10 keeps in `.npmrc`. They stay SEPARATE EngineContext
+/// fields (the engine loads global files by a different path) but share one
+/// predicate, because they share one version boundary.
+///
+/// Keyed on the declared major like the sibling env/npmrc policies: a lockfile
+/// or a pnpm-named project file proves the incumbent's NAME but not its major,
+/// so it correctly stays on the unknown-major v10 default. nub, npm, yarn, and
+/// bun identities never reach either surface.
+///
+/// Takes `cwd` rather than reading it, so `engine_brand_preflight` keeps to its
+/// one `current_dir()` read.
+fn pnpm_v11_surface(surface: &ConfigSurface, cwd: &Path) -> bool {
+    matches!(surface, ConfigSurface::PnpmOrFresh)
+        && nub_core::pm::resolve::declared_pm_version(cwd, "pnpm")
+            .and_then(|version| parse_major_minor(&version).0)
+            .is_some_and(|major| major >= 11)
 }
 
 /// Engine-free, single-walk resolution of the project's [`ConfigSurface`]
@@ -1504,7 +2696,7 @@ fn resolve_config_surface(cwd: &Path) -> ConfigSurface {
                 _ => ConfigSurface::PnpmOrFresh,
             };
         }
-        let nub_lock = dir.join(use_align::NUB_LOCKFILE).is_file();
+        let nub_lock = nub_lockfile_present(&dir);
         let pnpm_lock = dir.join("pnpm-lock.yaml").is_file();
         let foreign = FOREIGN_NON_PNPM
             .iter()
@@ -1531,7 +2723,7 @@ fn resolve_config_surface(cwd: &Path) -> ConfigSurface {
     }
     // Nothing decided anywhere within the walk. A truly-fresh project (no
     // PM-preference signal of any kind, no pnpm-named file) becomes NUB
-    // identity: the next install writes `lock.yaml` and stamps the manifest,
+    // identity: the next install writes `nub.lock` and stamps the manifest,
     // and the project self-reinforces as nub-identity thereafter. A
     // pnpm-named file seen in the walk keeps the pnpm-shaped surface.
     if saw_pnpm_named {
@@ -1566,6 +2758,31 @@ fn read_yarn_config_for_surface(surface: &ConfigSurface) -> bool {
 /// `BUN_CONFIG_TOKEN` environment variables — true only under a Bun incumbent.
 /// Under any other surface those Bun-named env vars are another tool's state
 /// (name-based policy, mirroring [`read_yarn_config_for_surface`]).
+/// Whether a command run from a workspace member reads that member's `.npmrc`
+/// on top of the workspace root's, or the root's alone, mirroring the
+/// incumbent (each measured from a member dir with the registry set in one
+/// file or the other). pnpm reversed this at v11 (`workspaceDir ?? localPrefix`
+/// in its npmrc loader), so an undeclared pnpm major takes the dominant v10
+/// model. Yarn 1 layers them; Yarn Berry reads no `.npmrc` at all and keeps the
+/// layered default, as does a nub-identity project.
+fn workspace_npmrc_model(
+    surface: &ConfigSurface,
+    pnpm_major: Option<u64>,
+) -> nub_core::workspace::npmrc::MemberNpmrc {
+    use nub_core::workspace::npmrc::MemberNpmrc::{Ignored, Layered};
+    match surface {
+        ConfigSurface::NonPnpmCompat {
+            role: "npm" | "bun",
+            ..
+        } => Ignored,
+        ConfigSurface::PnpmOrFresh => match pnpm_npmrc_key_policy(pnpm_major) {
+            NpmrcKeyPolicy::Pnpm11Allowlist => Ignored,
+            NpmrcKeyPolicy::Open => Layered,
+        },
+        ConfigSurface::NonPnpmCompat { .. } | ConfigSurface::NubIdentity(_) => Layered,
+    }
+}
+
 fn read_bun_config_for_surface(surface: &ConfigSurface) -> bool {
     matches!(surface, ConfigSurface::NonPnpmCompat { role: "bun", .. })
 }
@@ -1633,28 +2850,38 @@ fn read_file_head(path: &Path, max_bytes: usize) -> std::io::Result<String> {
 /// `npm_config_node_linker`, `.npmrc`, or workspace yaml all win):
 ///
 /// - `defaultLockfileFormat` — a TRULY-fresh project (no PM-preference signal
-///   of any kind) writes nub's neutral `lock.yaml` (`=aube`); every other
+///   of any kind) writes nub's neutral `nub.lock` (`=nub`); every other
 ///   surface writes `pnpm-lock.yaml` (`=pnpm`) for drop-in interop. See
 ///   [`nub_setting_defaults`]'s `truly_fresh` arm.
-/// - `virtualStoreDir` / `stateDir` = `node_modules/.nub` — the isolated
-///   store (and the engine's install-state sidecar) live under `.nub`.
+/// - `virtualStoreDir` / `stateDir` = `node_modules/.store` — the isolated
+///   store (and the engine's install-state sidecar) live under `.store`.
 ///   Corner: this replaces the engine's `<modulesDir>/.aube` derivation, so
 ///   a project that renames `modulesDir` without setting `virtualStoreDir`
-///   gets the store at `node_modules/.nub` rather than `<modulesDir>/.nub`.
+///   gets the store at `node_modules/.store` rather than `<modulesDir>/.store`.
 /// - `storeDir` = `$XDG_DATA_HOME/nub/store` (else `~/.local/share/nub/store`)
 ///   — the global CAS store lives in nub's own XDG namespace, not aube's
 ///   (the engine appends its `v1` schema suffix, so content lands at
 ///   `…/nub/store/v1`). Skipped when no home directory resolves — the
 ///   engine then falls back to its own default, which fails the same way
 ///   nub would.
-/// - `cacheDir` is still NOT set here — the engine cache moves through the
-///   `aube::set_cache_root` registration in [`engine_brand_preflight`]
-///   instead. The settings accessor (`resolved_cache_dir`) only consults
-///   the setting when `.npmrc` sets it *explicitly* (the embedder-defaults
-///   tier never reaches it, verified empirically 2026-06-09), and the
-///   non-settings consumers (git clone cache, node-gyp tool cache, primer,
-///   adaptive state) never read the setting at all; the process-global
-///   cache root covers every one of them.
+/// - `cacheDir` is still NOT set here, and does not need to be: the DEFAULT
+///   location comes from the identity profile's `cache_namespace`
+///   (`$XDG_CACHE/nub/pm`), which is where the engine's own
+///   `aube_store::dirs::cache_dir()` lands. The setting layers a user
+///   OVERRIDE on top of that default and resolves through the full chain —
+///   `NUB_CACHE_DIR` / `npm_config_cache_dir` / `.npmrc cache-dir` all reach
+///   `resolved_cache_dir`, embedder defaults included. (Both halves of this
+///   bullet used to say otherwise: an `.npmrc`-only presence gate in front of
+///   the accessor made every other source inert until it was dropped by the
+///   v1.35.0 engine sync (#621), and the host-branded `NUB_CACHE_DIR` reached
+///   only the resolver primer until #654. `nub_setting_defaults` is pinned by
+///   `pm_env_matrix::cache_dir_env_moves_the_pm_cache`.) The handful of
+///   non-settings consumers that deliberately stay on the platform default
+///   regardless — the OSV advisory mirror, the bootstrapped node-gyp, git
+///   clones, and the global-links registry behind `link -g` — are documented
+///   as such on the setting itself. This is the third copy of that list, after
+///   `settings.toml`'s `cacheDir` docs and the install docs page; nothing
+///   checks that they agree, so a consumer added to one belongs in all three.
 /// - `defaultTrust=true` — the gated default-trust floor (curated list ∧
 ///   registry-resolved ∧ OSV MAL-* gate active ∧ past the cooling window)
 ///   is ON under nub in both modes; upstream aube keeps it off. Precedence
@@ -1668,24 +2895,34 @@ fn read_file_head(path: &Path, max_bytes: usize) -> std::io::Result<String> {
 /// linker is PnP but nub will install a `node_modules` tree instead. Yarn
 /// Berry defaults to PnP when no `nodeLinker` is configured, so absence is
 /// warning-worthy for Berry but not for Yarn Classic.
-fn warn_if_pnp_requested(detected: Option<&DetectedLockfile>, cwd: &Path) {
+/// Abort a mutating install when the Yarn project requests Plug'n'Play
+/// (`nodeLinker: pnp` in `.yarnrc.yml`, or Yarn Berry's default). nub installs
+/// a `node_modules` tree, so honoring the lockfile under PnP would silently
+/// produce a materially different on-disk layout than the incumbent's —
+/// exactly the silent partial the abort-eagerly policy refuses. Fatal at plan
+/// time (before any `node_modules` write); gated to the install family via the
+/// `noise == Warn` call site, so read-only PM commands are unaffected.
+fn pnp_fatal_if_requested(detected: Option<&DetectedLockfile>, cwd: &Path) -> Result<()> {
     let Some(kind @ (LockfileKind::Yarn | LockfileKind::YarnBerry)) = detected.map(|d| d.kind)
     else {
-        return;
+        return Ok(());
     };
     let root = detected.map(|d| d.dir.as_path()).unwrap_or(cwd);
     if effective_yarn_node_linker(root, cwd, kind == LockfileKind::YarnBerry).as_deref()
         == Some("pnp")
     {
-        let line = "nub: this Yarn project uses Plug'n'Play (nodeLinker: pnp or Yarn Berry's default), \
-                    which nub does not implement — installing a node_modules tree instead. \
-                    [WARN_NUB_PNP_LINKER_DOWNGRADE]";
-        if scope_warning_uses_dim() {
-            eprintln!("\x1b[2m{line}\x1b[0m");
-        } else {
-            eprintln!("{line}");
-        }
+        return Err(pnp_unsupported_error());
     }
+    Ok(())
+}
+
+fn pnp_unsupported_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "nub: this project is configured for Yarn Plug'n'Play (nodeLinker: pnp, or Yarn Berry's \
+         default) — nub installs a node_modules tree and doesn't support PnP yet, so the result \
+         would diverge from yarn's. Install with yarn, or set `nodeLinker: node-modules` in \
+         .yarnrc.yml. [ERR_NUB_PNP_UNSUPPORTED]"
+    )
 }
 
 fn effective_yarn_node_linker(root: &Path, cwd: &Path, berry_default_pnp: bool) -> Option<String> {
@@ -1762,37 +2999,147 @@ fn strip_yarnrc_value(rest: &str) -> &str {
     rest.split('#').next().map(str::trim).unwrap_or(rest)
 }
 
-/// - Layout policy: flat-layout lockfile kinds (npm/yarn/bun) default
-///   `nodeLinker` to `hoisted`; pnpm/aube kinds and fresh projects keep the
-///   engine's `isolated` default (no entry pushed, so user/env settings
-///   resolve exactly as in stock aube).
+/// - Layout policy: EVERY project defaults to the isolated layout
+///   (`nodeLinker=isolated`) — strict (no phantom deps) and GVS-fast; a project
+///   that relies on phantom deps opts back into the flat tree with
+///   `install.linker: "hoisted"`. Hoisting is left GVS-AWARE via the engine's
+///   `gvs_over_default_hoist` profile: a NON-injected project leaves `hoist` at
+///   the built-in default (`true`), and under that profile a DEFAULT hoist no
+///   longer vetoes the shared store — so the global virtual store engages
+///   wherever it's active (off-CI, no next/nuxt/parcel trigger, no explicit
+///   `enableGlobalVirtualStore=false`) with NO hidden tree, and the pnpm-parity
+///   hidden hoist tree (`node_modules/.store/node_modules/`) is built wherever GVS
+///   is OFF (CI, `nub ci`, a trigger, an explicit GVS opt-out, dlx), restoring
+///   ambient `@types/*` resolution for store-resident packages (#286). The ONE
+///   carve-out is injected deps (`dependenciesMeta.*.injected`): they need the
+///   hidden tree unconditionally, so nub pushes an EXPLICIT `hoist=true`, which
+///   DOES veto GVS under the profile (per-project + hidden tree, always). A
+///   higher-precedence CLI/environment values still win over native config;
+///   incumbent projects keep resolving their own PM config unchanged.
 /// - Fresh-write lockfile format: a TRULY-fresh project (no PM-preference
-///   signal of any kind — `truly_fresh`) writes nub's neutral `lock.yaml`
-///   (`defaultLockfileFormat=aube`, which under the nub embedder resolves to
-///   the `lock.yaml` basename); every other surface writes `pnpm-lock.yaml`,
+///   signal of any kind — `truly_fresh`) writes nub's neutral `nub.lock`
+///   (`defaultLockfileFormat=nub`); every other surface writes `pnpm-lock.yaml`,
 ///   keeping a pnpm-incumbent / mixed project drop-in interoperable. A
 ///   user-set `defaultLockfileFormat` (env/.npmrc/yaml) still wins on either
 ///   path — this is only the embedder-tier default.
 fn nub_setting_defaults(
     detected: Option<&DetectedLockfile>,
     truly_fresh: bool,
+    cwd: &Path,
+    store_locality: VirtualStoreLocality,
 ) -> Vec<(String, String)> {
-    let fresh_format = if truly_fresh { "aube" } else { "pnpm" };
+    // `nub`, not `aube`: same format, but the value is user-visible — `nub
+    // config` lists it — so the engine's brand must not be the answer to "what
+    // will the first install write". The engine accepts both spellings.
+    let fresh_format = if truly_fresh { "nub" } else { "pnpm" };
+    // The phantom-adapter disk-materialize list is no longer hand-curated: the
+    // dynamic per-version scanner (`dynamic_phantom` → `phantom_closure`, on by
+    // default) detects undeclared-import phantoms per content-fingerprint and
+    // ejects them through #319's ancestor-closure, subsuming the old 14-entry
+    // const (incl. the singleton-hazard adapters the closure now makes sound). So
+    // this embedder default carries ONLY the #315 vite eject; empty otherwise
+    // (aube's `parse_string_list` drops the empty entry). nub exposes no direct
+    // user-facing `diskMaterializePackages` knob: native
+    // `install.linker.eject` contributes an explicit seed, while nub's
+    // hook drops incumbent `.npmrc`/env/workspace seed names and retains only the
+    // native seed plus this internal vite entry. Standalone aube installs no hook
+    // and still honors its setting unchanged.
+    //
+    // Vite symlink-GVS compat (#315): eject the `vite` package project-local so
+    // its dist can be patched with the backported fs.allow sniff (< 8.1) without
+    // touching the shared CAS store. Scoped to a DIRECT-dep vite (a raw `vite`
+    // app / `vite dev` CLI project) — that is the only shape whose loaded Vite is
+    // the ejected project-local copy the backport reaches; a library-embedded
+    // framework (Astro/SvelteKit) loads its Vite from the shared store via a
+    // sibling symlink, so ejecting for it would be wasted dedup (Unit A's
+    // `.modules.yaml` covers those for Vite ≥ 8.1). Only under the machine-global
+    // store (`Default`) — `nub ci`'s project-local store is already under the
+    // workspace root, so Vite serves it with no override. This seed also carries
+    // #315 on the phantom-eject opt-out path, where the closure hook is not
+    // installed. The post-install writer/patcher lives in [`vite_compat`]; this is
+    // its materialization half.
+    let disk_materialize = if store_locality == VirtualStoreLocality::Default
+        && vite_compat::enabled()
+        && vite_compat::manifest_declares_vite(detected.map(|d| d.dir.as_path()).unwrap_or(cwd))
+    {
+        // Draw from the hook's allowlist so the embedder default and the seed the
+        // hook keeps ([`phantom_closure::nub_internal_seed`]) can't drift.
+        phantom_closure::NUB_INTERNAL_DISK_MATERIALIZE_SEED.join(",")
+    } else {
+        String::new()
+    };
+    // The whole-install GVS-off list. `next`/`react-native` eject unconditionally
+    // (a resolver that canonicalizes node_modules by realpath — Turbopack, bare-RN
+    // Metro — can't reach the machine-global store at any version). `expo` is
+    // version-gated: it gained store-awareness only in SDK 56 (On-demand
+    // Filesystem), so a project declaring `expo` below the floor is ejected while
+    // 56+ keeps GVS. See [`expo_compat`]. `remix` is gated to the `3.0.0`
+    // prereleases, whose asset server could serve npm packages to the browser only
+    // from mounts relative to the project root; every stable Remix 3 mounts the
+    // store named in `.modules.yaml`. See [`remix_compat`]. The list stays curated and small because there is no
+    // manifest signal for "this tool canonicalizes symlinks"; it is unavoidably
+    // a behavioral-property list.
+    // The incumbent's root when detected, else the cwd — a fresh project
+    // (`detected.is_none()`) is rooted at the cwd. Workspace discovery expands
+    // the member globs against the disk, so it runs ONCE here and the three
+    // manifest scans below (the two version gates and the injected-deps check)
+    // share the result.
+    let gvs_root = detected.map(|d| d.dir.as_path()).unwrap_or(cwd);
+    let workspace_members = aube_workspace::find_workspace_packages(gvs_root).unwrap_or_default();
+    let mut gvs_off: Vec<&str> = vec!["next", "react-native"];
+    if expo_compat::expo_below_gvs_floor(gvs_root, &workspace_members) {
+        gvs_off.push("expo");
+    }
+    if remix_compat::remix_needs_project_local_store(gvs_root, &workspace_members) {
+        gvs_off.push("remix");
+    }
+    let store_dir = format!("node_modules/{PROJECT_VIRTUAL_STORE_LEAF}");
     let mut defaults = vec![
         (
             "defaultLockfileFormat".to_string(),
             fresh_format.to_string(),
         ),
         ("defaultTrust".to_string(), "true".to_string()),
-        (
-            "virtualStoreDir".to_string(),
-            "node_modules/.nub".to_string(),
-        ),
-        ("stateDir".to_string(), "node_modules/.nub".to_string()),
+        // Nub advertises a real 24-hour trust floor, not an advisory one. Pin
+        // both halves at Nub's embedder tier rather than inheriting the engine's
+        // current built-in values: 1440 minutes, and fail closed when no mature
+        // version satisfies the range. Explicit user config still wins.
+        ("minimumReleaseAge".to_string(), "1440".to_string()),
+        ("minimumReleaseAgeStrict".to_string(), "true".to_string()),
+        ("virtualStoreDir".to_string(), store_dir.clone()),
+        ("stateDir".to_string(), store_dir),
         (
             "disableGlobalVirtualStoreForPackages".to_string(),
-            "next,nuxt,parcel".to_string(),
+            // The whole-install GVS-off last resort — reserved for a store-LOCALITY
+            // break (a tool whose resolver can't reach the machine-global store),
+            // NOT a phantom-dep class (those the dynamic detector + closure now
+            // eject per-package). `nuxt` was DROPPED: its walk-up is only 2 phantom
+            // edges (~2.3% closure), so it's closure-ejectable at rung 1 —
+            // symlink-GVS works (see [[nuxt-gvs-unlock]]). `parcel` was DROPPED: its
+            // real break was never `.parcelrc` walk-up but a GVS store-dir over-split
+            // — the prewarm hashed the widened (all-platform) graph while the link
+            // phase hashed the host-filtered one, so parcel's native subtree
+            // materialized `@parcel/core` at two byte-identical store dirs; two
+            // consumers loaded different copies → two serializer registries →
+            // `DataCloneError` at worker-farm startup. Fixed at the source (the
+            // prewarm now host-filters its graph to match the link phase), verified
+            // green across parcel 2.9–2.13 + 2.16. What remains:
+            // - `next` — Turbopack canonicalizes through symlinks and chroots to a
+            //   single project root; irreducible, so the store must be project-local.
+            //   (It hit the same store-split, now also fixed, but the chroot break is
+            //   independent and keeps it here pending its own verification.)
+            // - `react-native` — bare RN's Metro (`@react-native/metro-config`)
+            //   crawls by realpath and only sees the project root, so the global
+            //   store is out of scope and even DECLARED deps (`@babel/runtime`)
+            //   report unresolved.
+            // - `expo` — the SAME break, but ONLY below SDK 56. Expo's Metro fork
+            //   became store-aware in SDK 56 (the On-demand Filesystem); pre-56
+            //   Expo uses the eager realpath crawl and breaks under GVS, so it is
+            //   ejected version-conditionally ([`expo_compat`]) rather than by a
+            //   flat name — 56+ keeps GVS.
+            gvs_off.join(","),
         ),
+        ("diskMaterializePackages".to_string(), disk_materialize),
     ];
     if let Some(data) = nub_data_dir() {
         defaults.push((
@@ -1800,28 +3147,37 @@ fn nub_setting_defaults(
             data.join("store").to_string_lossy().into_owned(),
         ));
     }
-    let hoisted_kind = matches!(
-        detected.map(|d| d.kind),
-        Some(
-            LockfileKind::Npm
-                | LockfileKind::NpmShrinkwrap
-                | LockfileKind::Yarn
-                | LockfileKind::YarnBerry
-                | LockfileKind::Bun
-        )
-    );
-    // `dependenciesMeta.*.injected` is materialized only under the isolated
-    // linker (aube needs the `.nub/` virtual store to sibling-link packed
-    // copies). When a flat-layout incumbent declares injected deps, keep the
-    // engine's `isolated` default instead of forcing `hoisted` — otherwise the
-    // injection directive is silently dropped and peer deps resolve against the
-    // wrong tree. A user-set `nodeLinker` (env/.npmrc/yaml) still wins; this
-    // only declines to push the embedder-tier hoisted default.
-    let injected = detected
-        .map(|d| unsupported_config::injected_deps_present(&d.dir))
-        .unwrap_or(false);
-    if hoisted_kind && !injected {
-        defaults.push(("nodeLinker".to_string(), "hoisted".to_string()));
+    // Scan for injected deps at the same root, so a fresh project is still
+    // excluded from the GVS default below if it declares injected deps.
+    let injected = unsupported_config::injected_deps_present(gvs_root, &workspace_members);
+    // EVERY project defaults to isolated. Hoisting is left GVS-AWARE via the
+    // engine's `gvs_over_default_hoist` profile (nub's identity sets it): a
+    // NON-injected project pushes NO `hoist`, so it resolves to the built-in
+    // default (true) which — under the profile — does NOT veto the shared store,
+    // so GVS engages wherever active (no hidden tree) and the pnpm-parity hidden
+    // hoist tree is built by the linker wherever GVS is off (CI/`nub ci`/a
+    // next/nuxt/parcel trigger/explicit GVS opt-out/dlx) — restoring ambient
+    // `@types/*` for store-resident packages (#286). Injected deps
+    // (`dependenciesMeta.*.injected`) are the ONE carve-out: they need the
+    // hidden tree unconditionally, so nub pushes an EXPLICIT `hoist=true`, which
+    // DOES veto GVS under the profile (per-project + hidden tree, always) —
+    // proven, where injected-under-GVS is not. Higher-precedence CLI/environment
+    // values and native install config still override these defaults.
+    defaults.push(("nodeLinker".to_string(), "isolated".to_string()));
+    if injected {
+        defaults.push(("hoist".to_string(), "true".to_string()));
+    }
+    // `nub ci` forces the virtual store PROJECT-LOCAL by pushing an explicit
+    // `enableGlobalVirtualStore=false` (GVS off). With GVS off and the default
+    // `hoist=true`, the isolated linker yields real `node_modules/.store/<dep>`
+    // dirs + relative symlinks AND the pnpm-parity hidden hoist tree
+    // (`node_modules/.store/node_modules/`) — a self-contained tree that survives a
+    // multi-stage-Docker `COPY --from`, unlike the machine-global store the
+    // default install engages (#241). Isolation (phantom-dep protection) is
+    // unchanged; only the store LOCATION moves. Embedder-tier, so an explicit
+    // user `enableGlobalVirtualStore`/`nodeLinker` still wins.
+    if store_locality == VirtualStoreLocality::ProjectLocal {
+        defaults.push(("enableGlobalVirtualStore".to_string(), "false".to_string()));
     }
     defaults
 }
@@ -1833,7 +3189,7 @@ fn nub_setting_defaults(
 /// `None` only then); this additionally requires that no pnpm-NAMED file
 /// (`pnpm-workspace.yaml`, `.pnpmfile.*`, `.pnpmrc`) sits in the walk — a
 /// pnpm-named file is a genuine pnpm signal that makes the project pnpm-shaped,
-/// not nub's to claim. On the truly-fresh path nub writes `lock.yaml` and
+/// not nub's to claim. On the truly-fresh path nub writes `nub.lock` and
 /// stamps the manifest with its own identity; any incumbent signal is
 /// respected and left untouched.
 fn is_truly_fresh_project(cwd: &Path, detected: Option<&DetectedLockfile>) -> bool {
@@ -1852,15 +3208,58 @@ fn is_truly_fresh_project(cwd: &Path, detected: Option<&DetectedLockfile>) -> bo
     true
 }
 
-/// Nub's XDG data root (`$XDG_DATA_HOME/nub` or `~/.local/share/nub`), the
-/// data-dir sibling of `nub_core::node::discovery::cache_dir`.
-fn nub_data_dir() -> Option<PathBuf> {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs_next::home_dir().map(|h| h.join(".local/share")))?;
-    Some(base.join("nub"))
+/// Whether `dir` holds nub's own canonical lockfile under EITHER the current
+/// name (`nub.lock`) or the legacy name (`lock.yaml`) still honored through
+/// the rename transition. The bespoke nub-side identity probes
+/// (`resolve_config_surface`) check the file directly rather than through the
+/// engine's candidate set, so they consult both names here.
+fn nub_lockfile_present(dir: &Path) -> bool {
+    dir.join(use_align::NUB_LOCKFILE).is_file()
+        || dir.join(use_align::NUB_LEGACY_LOCKFILE).is_file()
+}
+
+/// Nub's XDG data root (`$XDG_DATA_HOME/nub`, `%LOCALAPPDATA%\nub` on Windows,
+/// else `~/.local/share/nub`), the data-dir sibling of
+/// `nub_core::node::discovery::cache_dir`.
+///
+/// The Windows `%LOCALAPPDATA%` branch mirrors the engine's own data-path
+/// resolvers (`aube_store::dirs::store_dir`, `aube_runtime` `data_dir`): without
+/// it the CAS `storeDir` default fell through to the Unix `.local/share` leaf on
+/// Windows (`%USERPROFILE%\.local\share\nub\store`), split from the cache tier at
+/// `%LOCALAPPDATA%\nub\pm` — #451. This feeds the `storeDir` embedder default and
+/// the phantom scanner's store path; both stay consistent because both call here.
+pub(crate) fn nub_data_dir() -> Option<PathBuf> {
+    nub_data_dir_from(
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        dirs_next::home_dir(),
+        cfg!(windows),
+    )
+}
+
+/// Pure resolver for [`nub_data_dir`] — precedence: `$XDG_DATA_HOME/nub`; then,
+/// on Windows, `%LOCALAPPDATA%\nub`; then `<home>/.local/share/nub`.
+/// `local_app_data` is consulted only when `windows`, so the unix XDG
+/// `.local/share` convention is preserved everywhere else. Split out
+/// env-injected so the precedence is unit-testable off Windows (mirrors
+/// `nub_core::node::discovery::windows_cache_dir`).
+fn nub_data_dir_from(
+    xdg_data_home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    home: Option<PathBuf>,
+    windows: bool,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_data_home {
+        return Some(xdg.join("nub"));
+    }
+    if windows && let Some(local) = local_app_data {
+        return Some(local.join("nub"));
+    }
+    home.map(|h| h.join(".local/share").join("nub"))
 }
 
 /// Process-env snapshot for `InstallOptions::env_snapshot` — same content as
@@ -1874,17 +3273,163 @@ pub(crate) fn env_snapshot() -> Vec<(String, String)> {
 /// (`vendor/aube/crates/aube/src/lib.rs`): workers capped at 8 (the install
 /// semaphore already gates network), blocking pool at 128 (tarball decode +
 /// linker fan-out). The AUBE_TOKIO_* benchmark overrides are not honored here.
+///
+/// CONSTRAINT-AWARE sizing: on a resource-constrained box (a tight cgroup
+/// `pids.max` or low `RLIMIT_NPROC`) the unbounded `128` blocking pool plus the
+/// parallel native postinstalls can drive the total thread+process count past
+/// the kernel ceiling; tokio then PANICS when `clone(2)` returns `EAGAIN` growing
+/// its blocking pool, which under `panic = "abort"` aborts the whole install
+/// (the `nub ci` exit-101). When [`resource_limits::spawn_headroom`] detects a
+/// constraint we shrink BOTH pools to fit the headroom; on an unconstrained box
+/// it returns `None` and we keep the full-speed defaults — so normal-box install
+/// performance is untouched.
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8);
+    // Use `resource_limits::available_cores()` (NOT a local `unwrap_or(4)`) so this
+    // `raw_cpu` matches the `cores` the `cpu_budget()` gate compares against — the
+    // two must agree on the same `unwrap_or(1)` fallback or the gate could disagree
+    // with the pool sizing in the rare `available_parallelism()`-errors case.
+    let raw_cpu = resource_limits::available_cores();
+    // The effective CPU budget auto-detected from a cgroup CFS quota — `None` on an
+    // unconstrained box, where we keep the full core count. This is the PROACTIVE
+    // CPU axis, composed below with the REACTIVE PID headroom: a CPU-bound pool is
+    // bounded by the smaller of the two.
+    let cpu_budget = resource_limits::cpu_budget();
+    let cpu = cpu_budget.unwrap_or(raw_cpu);
+    let mut workers = cpu.min(8);
+    let mut blocking = 128usize;
+    // The rayon GLOBAL pool is sized off the most restrictive of the two axes and
+    // capped EXACTLY ONCE below: `build_global` errors if the pool already exists,
+    // so the first cap wins — computing the final value first lets the PID share
+    // tighten rayon BELOW the CPU budget (and vice versa) instead of whichever cap
+    // happened to run first sticking. Start from the CPU budget (None → raw cores).
+    let mut rayon_target = cpu;
+
+    // Captured for the diagnostic seam below, which cannot otherwise distinguish "no
+    // constraint detected" from "detected, but every derived pool saturated its own cap".
+    let detected_headroom = resource_limits::spawn_headroom();
+
+    if let Some(headroom) = detected_headroom {
+        // ONE headroom budget split across the four concurrent OS-thread/process
+        // consumers (tokio workers + tokio blocking pool + rayon GLOBAL pool +
+        // parallel build-scripts) so their SUM stays under the ceiling — capping
+        // each independently at `min(headroom, …)` would let the sum blow past it.
+        let (w, b, rayon_threads, child) = resource_limits::split_budget(headroom);
+        workers = workers.min(w);
+        blocking = blocking.min(b);
+        // Compose with the CPU budget: rayon is bounded by the SMALLER of the
+        // CPU-quota-derived and PID-headroom-derived shares (both feed the same
+        // pool). Capped once after this block.
+        rayon_target = rayon_target.min(rayon_threads);
+        // Lower the parallel build-script count to match (single-threaded here, so
+        // the env mutation is race-free, and it runs BEFORE the env_snapshot the
+        // engine resolves settings from).
+        apply_constrained_child_concurrency(child);
+        tracing::debug!(
+            headroom,
+            cpu_budget = cpu,
+            workers,
+            blocking,
+            rayon = rayon_target,
+            child_concurrency = child,
+            "constrained box detected: capping install runtime pools (tokio + rayon) + build-script concurrency under the PID/thread + CPU-quota ceilings"
+        );
+    } else if let Some(budget) = cpu_budget {
+        // CPU-quota constraint with NO PID constraint: the box has a CFS quota but
+        // generous PIDs. Size the CPU-bound pools
+        // (workers + rayon, already set above) to the quota; the IO-bound blocking
+        // pool and child concurrency keep their full defaults (PID headroom is fine).
+        tracing::debug!(
+            cpu_budget = budget,
+            workers,
+            rayon = rayon_target,
+            "CPU-quota constraint detected: capping CPU-bound install pools (tokio workers + rayon) to the effective CPU budget"
+        );
+    }
+
+    // Internal diagnostic seam (NOT a public knob — `__NUB_*` per the brand
+    // boundary's internal exemption): when set, print the resolved pool sizing to
+    // real stderr, BEFORE the install's fd-capture can swallow a `tracing` line.
+    // Lets a constrained-box test assert the detected budget deterministically.
+    //
+    // `headroom` is printed RAW because the derived pool sizes are lossy: every one of
+    // them saturates its own cap, so `blocking=128` means "no constraint detected" OR
+    // "detected, with headroom >= 384" (`min(128, max(h/3, 4))`), and `workers`/`rayon`
+    // clamp against the core count on top of that. Reading detection state off the
+    // derived numbers alone is ambiguous above that band and cost a verification round
+    // — a successful read of a large limit was briefly mistaken for lost detection, and
+    // only strace resolved it. The raw value makes the seam self-sufficient.
+    if std::env::var_os("__NUB_PRINT_CPU_BUDGET").is_some() {
+        eprintln!(
+            "__nub_cpu_budget raw_cpu={raw_cpu} cpu_budget={cpu_budget:?} headroom={detected_headroom:?} workers={workers} blocking={blocking} rayon={rayon_target}"
+        );
+    }
+
+    // Size the rayon GLOBAL pool whenever EITHER axis constrains below the raw core
+    // count. The embedded engine fans CAS writes / delta / fetch out over rayon's
+    // IMPLICIT global pool, whose lazy init otherwise spins up
+    // `available_parallelism()` threads (v1-quota-blind, PID-unbounded) and PANICS
+    // on thread-create EAGAIN — the SAME exit-101 abort, relocated to rayon. Done
+    // once here, before any engine `par_iter` touches the pool.
+    if rayon_target < raw_cpu {
+        cap_rayon_global_pool(rayon_target);
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
-        .max_blocking_threads(128)
+        .max_blocking_threads(blocking)
         .enable_all()
         .build()
         .context("failed to build the install engine's tokio runtime")
+}
+
+/// Lower the parallel build-script process count (aube's `child_concurrency`,
+/// default 5) so the native-postinstall fan-out — each spawning Go/Rust
+/// grandchildren — stays under the PID ceiling. nub exports this through the
+/// NEUTRAL `npm_config_child_concurrency` setting (which aube honors, same as
+/// npm/pnpm), so standalone aube is UNCHANGED and no engine-brand var leaks; only
+/// nub, on a detected constraint, asks for fewer parallel builds. A user/CI-set
+/// value (any of the recognized keys) is left untouched.
+///
+/// SAFETY: called from `build_runtime` BEFORE the runtime is built and before any
+/// engine work — single-threaded at that point, so the `set_var` doesn't race
+/// other threads reading the environment.
+fn apply_constrained_child_concurrency(capped: usize) {
+    // Respect an explicit user/CI choice — never override a value they set. Only
+    // the NEUTRAL keys are honored: nub respects ZERO AUBE_*-branded env vars
+    // (AGENTS.md brand boundary), so `AUBE_CHILD_CONCURRENCY` is deliberately NOT
+    // read here even to defer to it.
+    const KEYS: [&str; 2] = [
+        "npm_config_child_concurrency",
+        "NPM_CONFIG_CHILD_CONCURRENCY",
+    ];
+    if KEYS.iter().any(|k| std::env::var_os(k).is_some()) {
+        return;
+    }
+    // SAFETY: see the doc comment — single-threaded at call time.
+    unsafe {
+        std::env::set_var("npm_config_child_concurrency", capped.to_string());
+    }
+}
+
+/// Size rayon's IMPLICIT GLOBAL thread pool under a detected PID/thread
+/// constraint, so the engine's `par_iter` CAS/delta/fetch fan-out can't lazily
+/// spin the pool up to `available_parallelism()` (which honors the cgroup CPU
+/// quota, NOT the PID quota) and PANIC on a thread-create EAGAIN — the same
+/// exit-101 abort the tokio cap closes, relocated to rayon.
+///
+/// `build_global` initializes the process-wide pool and ERRORS if it already
+/// exists. We tolerate that: a prior install in the same process (or rayon
+/// already lazily initialized) means the pool is set, and we can't resize it —
+/// the cap is best-effort, applied the first time on a constrained box. Setting
+/// `RAYON_NUM_THREADS` is NOT used (it only takes effect before first use and we
+/// can't guarantee that across an embedder), so the explicit `build_global` is
+/// the reliable lever when we own first-touch (pre-runtime, pre-engine here).
+fn cap_rayon_global_pool(threads: usize) {
+    // `build_global` errors if the global pool is already initialized — tolerate
+    // it (can't resize an existing pool); the cap took effect on first touch.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .build_global();
 }
 
 // ───────────────────────── fd capture ──────────────────────────
@@ -1939,19 +3484,64 @@ pub(crate) fn with_fd_captured<T>(fd: libc::c_int, f: impl FnOnce() -> T) -> (T,
         }
         libc::close(write_end);
         // Drain concurrently so a full pipe buffer can never deadlock `f`.
-        let mut reader = std::fs::File::from_raw_fd(read_end);
-        let drain = std::thread::spawn(move || {
+        // `Builder::spawn` (returns `io::Result`) over `thread::spawn` (which
+        // PANICS — and under `panic = "abort"` aborts the process — on
+        // thread-create EAGAIN under thread/PID pressure). On spawn failure we
+        // fall back to running `f` first and draining inline afterwards: this
+        // capture path is `config get registry`, whose output is a few bytes
+        // (well under the pipe buffer), so the post-`f` drain cannot deadlock.
+        // Probe thread availability with a trivial throwaway thread BEFORE moving
+        // the reader into a doomed spawn (`Builder::spawn` consumes its closure
+        // even on `Err`, so we can't recover the reader after a failed spawn).
+        let can_spawn = std::thread::Builder::new()
+            .name("nub-fd-capture-probe".into())
+            .spawn(|| {})
+            .map(|p| {
+                let _ = p.join();
+            })
+            .is_ok();
+        if can_spawn {
+            let mut reader = std::fs::File::from_raw_fd(read_end);
+            let drain = std::thread::Builder::new()
+                .name("nub-fd-capture".into())
+                .spawn(move || {
+                    let mut buf = Vec::new();
+                    let _ = reader.read_to_end(&mut buf);
+                    buf
+                });
+            match drain {
+                Ok(drain) => {
+                    let result = f();
+                    flush(fd); // post-run: push f's buffered tail into the pipe
+                    libc::dup2(saved, fd);
+                    libc::close(saved);
+                    // fd restored + our write end closed ⇒ the drain sees EOF.
+                    let bytes = drain.join().unwrap_or_default();
+                    (result, String::from_utf8_lossy(&bytes).into_owned())
+                }
+                Err(_) => {
+                    // Probe passed but the real spawn raced to failure: `reader`
+                    // is consumed, so close our read end and skip the capture.
+                    let result = f();
+                    flush(fd);
+                    libc::dup2(saved, fd);
+                    libc::close(saved);
+                    (result, String::new())
+                }
+            }
+        } else {
+            // No drain thread available. Run `f`, restore the fd, then drain the
+            // (few-byte `config get registry`) capture inline — too small to fill
+            // the pipe buffer, so a post-`f` drain cannot deadlock.
+            let result = f();
+            flush(fd);
+            libc::dup2(saved, fd);
+            libc::close(saved);
+            let mut reader = std::fs::File::from_raw_fd(read_end);
             let mut buf = Vec::new();
             let _ = reader.read_to_end(&mut buf);
-            buf
-        });
-        let result = f();
-        flush(fd); // post-run: push f's buffered tail into the pipe
-        libc::dup2(saved, fd);
-        libc::close(saved);
-        // fd restored + our write end closed ⇒ the drain thread sees EOF.
-        let bytes = drain.join().unwrap_or_default();
-        (result, String::from_utf8_lossy(&bytes).into_owned())
+            (result, String::from_utf8_lossy(&buf).into_owned())
+        }
     }
 }
 
@@ -2104,12 +3694,650 @@ pub(crate) fn with_fd_captured<T>(_fd: i32, f: impl FnOnce() -> T) -> (T, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project_config::{Hoist, InstallConfig, LinkerConfig};
 
     fn get<'a>(defaults: &'a [(String, String)], key: &str) -> Option<&'a str> {
         defaults
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    // #451: the Windows data root must be %LOCALAPPDATA%\nub, never the Unix
+    // `.local/share` leaf — otherwise the CAS store splits from the cache tier.
+    #[test]
+    fn nub_data_dir_precedence() {
+        let xdg = PathBuf::from("/xdg-data");
+        let lad = PathBuf::from(r"C:\Users\u\AppData\Local");
+        let home = PathBuf::from("/home/u");
+        let call = |x, l, windows| nub_data_dir_from(x, l, Some(home.clone()), windows);
+
+        // XDG_DATA_HOME wins on every platform.
+        assert_eq!(
+            call(Some(xdg.clone()), Some(lad.clone()), true),
+            Some(xdg.join("nub"))
+        );
+        assert_eq!(call(Some(xdg.clone()), None, false), Some(xdg.join("nub")));
+
+        // Windows, no XDG → %LOCALAPPDATA%\nub, never `.local/share`.
+        assert_eq!(call(None, Some(lad.clone()), true), Some(lad.join("nub")));
+
+        // Unix, no XDG → <home>/.local/share/nub; LOCALAPPDATA ignored.
+        assert_eq!(
+            call(None, Some(lad.clone()), false),
+            Some(home.join(".local/share").join("nub"))
+        );
+
+        // Windows with neither XDG nor LOCALAPPDATA → the home fallback.
+        assert_eq!(
+            call(None, None, true),
+            Some(home.join(".local/share").join("nub"))
+        );
+    }
+
+    fn lower(install: InstallConfig, defaults: &[(String, String)]) -> NativeInstallSettings {
+        lower_native_install_settings(&install, defaults).unwrap()
+    }
+
+    fn with_linker(linker: LinkerConfig) -> InstallConfig {
+        InstallConfig {
+            linker: Some(linker),
+            ..InstallConfig::default()
+        }
+    }
+
+    #[test]
+    fn global_linker_yields_to_injected_deps_hidden_tree() {
+        let injected = [("hoist".to_string(), "true".to_string())];
+        let injected = lower_native_install_settings(
+            &with_linker(LinkerConfig::Global { eject: None }),
+            &injected,
+        )
+        .expect("injected deps must not make the documented global linker fail");
+        assert_eq!(get(&injected.layout, "nodeLinker"), Some("isolated"));
+        assert_eq!(
+            get(&injected.layout, "enableGlobalVirtualStore"),
+            None,
+            "the injected-deps hidden tree must keep the store project-local"
+        );
+
+        let clean = lower(with_linker(LinkerConfig::Global { eject: None }), &[]);
+        assert_eq!(
+            get(&clean.layout, "enableGlobalVirtualStore"),
+            Some("true"),
+            "without injected deps the same layout pins the shared store"
+        );
+    }
+
+    #[test]
+    fn linker_strategy_lowers_to_a_layout_plus_a_store_location() {
+        // Both symlink strategies are aube's `isolated` layout — they differ
+        // only in WHERE the store lives, so each must PIN that half rather than
+        // inherit it. Leaving the `Global` arm silent would let a lower-tier
+        // `enableGlobalVirtualStore=false` win over an explicit request.
+        for (linker, node_linker, gvs) in [
+            (
+                LinkerConfig::Global { eject: None },
+                "isolated",
+                Some("true"),
+            ),
+            (
+                LinkerConfig::Isolated { hoist: None },
+                "isolated",
+                Some("false"),
+            ),
+            (LinkerConfig::Hoisted, "hoisted", None),
+        ] {
+            let lowered = lower(with_linker(linker.clone()), &[]);
+            assert_eq!(
+                get(&lowered.layout, "nodeLinker"),
+                Some(node_linker),
+                "{linker:?}"
+            );
+            assert_eq!(
+                get(&lowered.layout, "enableGlobalVirtualStore"),
+                gvs,
+                "{linker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_hoist_lowers_to_the_pnpm_hoist_pattern_pair() {
+        for (hoist, enabled, pattern) in [
+            (Hoist::Bool(true), "true", Some("*")),
+            (Hoist::Bool(false), "false", None),
+            (
+                Hoist::Patterns(vec!["@types/*".into(), "!@types/node".into()]),
+                "true",
+                Some("@types/*,!@types/node"),
+            ),
+        ] {
+            let lowered = lower(
+                with_linker(LinkerConfig::Isolated {
+                    hoist: Some(hoist.clone()),
+                }),
+                &[],
+            );
+            assert_eq!(get(&lowered.layout, "hoist"), Some(enabled), "{hoist:?}");
+            assert_eq!(get(&lowered.layout, "hoistPattern"), pattern, "{hoist:?}");
+        }
+    }
+
+    #[test]
+    fn global_eject_extends_both_embedder_default_lists() {
+        let defaults = vec![
+            (
+                "disableGlobalVirtualStoreForPackages".into(),
+                "next,react-native".into(),
+            ),
+            ("diskMaterializePackages".into(), "vite".into()),
+        ];
+        let lowered = lower(
+            with_linker(LinkerConfig::Global {
+                eject: Some(vec!["@corp/tool-*".into(), "next".into()]),
+            }),
+            &defaults,
+        );
+
+        // Additive and deduped on top of the compat-required embedder ejects —
+        // a project can add to them but cannot un-eject one.
+        assert_eq!(
+            get(&lowered.layout, "disableGlobalVirtualStoreForPackages"),
+            Some("next,react-native,@corp/tool-*")
+        );
+        assert_eq!(
+            get(&lowered.layout, "diskMaterializePackages"),
+            Some("vite,@corp/tool-*,next")
+        );
+        // Also carried out of band: the phantom closure is seeded from it.
+        assert_eq!(
+            lowered.eject,
+            vec!["@corp/tool-*".to_string(), "next".to_string()]
+        );
+    }
+
+    #[test]
+    fn public_hoist_lowers_independently_of_the_linker_strategy() {
+        // Writes BOTH aube keys. Writing only `publicHoistPattern` would leave
+        // `shamefullyHoist` at a lower tier's value, which inverts the request.
+        // `["*"]` is the everything-spelling — pnpm's own representation of
+        // `shamefully-hoist` — so it still travels as a pattern, not the flag.
+        for (public_hoist, shamefully, patterns) in [
+            (vec!["*".to_string()], "false", "*"),
+            (Vec::new(), "false", ""),
+            (
+                vec!["@types/*".to_string(), "eslint-*".to_string()],
+                "false",
+                "@types/*,eslint-*",
+            ),
+        ] {
+            let lowered = lower(
+                InstallConfig {
+                    public_hoist: Some(public_hoist.clone()),
+                    ..InstallConfig::default()
+                },
+                &[],
+            );
+            assert_eq!(
+                get(&lowered.layout, "shamefullyHoist"),
+                Some(shamefully),
+                "{public_hoist:?}"
+            );
+            assert_eq!(
+                get(&lowered.layout, "publicHoistPattern"),
+                Some(patterns),
+                "{public_hoist:?}"
+            );
+            // It sits outside `linker` because it means the same thing under
+            // every strategy — including none written at all.
+            assert_eq!(get(&lowered.layout, "nodeLinker"), None, "{public_hoist:?}");
+        }
+    }
+
+    #[test]
+    fn minimum_release_age_rounds_up_to_whole_minutes() {
+        // Positive sub-minute durations must remain a full minute: rounding down
+        // would silently weaken the configured release-age gate.
+        for seconds in [1, 30, 59, 60] {
+            let lowered = lower(
+                InstallConfig {
+                    minimum_release_age: Some(std::time::Duration::from_secs(seconds)),
+                    ..InstallConfig::default()
+                },
+                &[],
+            );
+            assert_eq!(
+                get(&lowered.resolution, "minimumReleaseAge"),
+                Some("1"),
+                "{seconds}s must conservatively round up to one minute"
+            );
+        }
+
+        let lowered = lower(
+            InstallConfig {
+                minimum_release_age: Some(std::time::Duration::from_secs(61)),
+                minimum_release_age_exclude: Some(vec!["@internal/*".into(), "left-pad".into()]),
+                ..InstallConfig::default()
+            },
+            &[],
+        );
+        assert_eq!(get(&lowered.resolution, "minimumReleaseAge"), Some("2"));
+        assert_eq!(
+            get(&lowered.resolution, "minimumReleaseAgeStrict"),
+            Some("true")
+        );
+        assert_eq!(
+            get(&lowered.resolution, "minimumReleaseAgeExclude"),
+            Some("@internal/*,left-pad")
+        );
+    }
+
+    #[test]
+    fn explicit_false_and_empty_install_values_survive_lowering() {
+        // An explicitly-written `false` / `[]` is a VALUE, not an absence: it
+        // must reach the engine so it overrides what the default would be.
+        let lowered = lower(
+            InstallConfig {
+                linker: Some(LinkerConfig::Isolated {
+                    hoist: Some(Hoist::Bool(false)),
+                }),
+                minimum_release_age_exclude: Some(Vec::new()),
+                ..InstallConfig::default()
+            },
+            &[],
+        );
+        assert_eq!(get(&lowered.layout, "hoist"), Some("false"));
+        assert_eq!(
+            get(&lowered.resolution, "minimumReleaseAgeExclude"),
+            Some("")
+        );
+
+        // `eject: []` still WRITES both list keys — at the embedder's own value,
+        // since the merge is additive — where no `eject` key writes neither.
+        let defaults = vec![("diskMaterializePackages".to_string(), "vite".to_string())];
+        let empty = lower(
+            with_linker(LinkerConfig::Global {
+                eject: Some(Vec::new()),
+            }),
+            &defaults,
+        );
+        let absent = lower(with_linker(LinkerConfig::Global { eject: None }), &defaults);
+        assert_eq!(get(&empty.layout, "diskMaterializePackages"), Some("vite"));
+        assert_eq!(get(&absent.layout, "diskMaterializePackages"), None);
+    }
+
+    #[test]
+    fn pnp_linker_is_reserved_and_aborts_the_install() {
+        // `pnp` parses but has no write path, so the reservation is enforced
+        // here, at lowering. The CODE is asserted, not just the failure: it is
+        // what tells an author their `linker` was understood and refused rather
+        // than mis-parsed into something else.
+        let err = lower_native_install_settings(&with_linker(LinkerConfig::Pnp), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ERR_NUB_CONFIG_UNSUPPORTED"), "{err}");
+    }
+
+    /// Layout applies under every identity, so `nub.jsonc` is the canonical
+    /// place to configure it regardless of incumbent — which means a reserved
+    /// layout value is refused under an incumbent too. A field Nub honors is a
+    /// field Nub validates; the old behavior lowered nothing in
+    /// compat mode and so accepted `pnp` there in silence.
+    #[test]
+    fn a_reserved_linker_value_is_refused_under_an_incumbent_too() {
+        let install = with_linker(LinkerConfig::Pnp);
+        let err = lower_native_install_settings_for_mode(Some(&install), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ERR_NUB_CONFIG_UNSUPPORTED"), "{err}");
+    }
+
+    /// Layout survives under any identity, while release-age settings apply
+    /// only under Nub's own. Both groups are asserted so a regression that
+    /// drops either or stops distinguishing them fails here.
+    #[test]
+    fn scoping_keeps_layout_everywhere_and_resolution_only_under_nub() {
+        let lowered = NativeInstallSettings {
+            layout: vec![("nodeLinker".into(), "hoisted".into())],
+            resolution: vec![("minimumReleaseAge".into(), "4320".into())],
+            eject: Vec::new(),
+        };
+        let keys = |native| -> Vec<String> {
+            scoped_install_settings(&lowered, native, VirtualStoreLocality::Default)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        assert_eq!(
+            keys(false),
+            vec!["nodeLinker"],
+            "an incumbent project still gets its nub.jsonc layout, and no resolution"
+        );
+        assert_eq!(
+            keys(true),
+            vec!["nodeLinker", "minimumReleaseAge"],
+            "Nub identity gets both groups"
+        );
+    }
+
+    #[test]
+    fn install_config_mode_gate_accepts_only_nub_identity_or_truly_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let detected = |kind| DetectedLockfile {
+            kind,
+            dir: dir.path().to_path_buf(),
+            fresh: false,
+        };
+        assert!(native_pm_mode(None, true, dir.path()));
+        assert!(native_pm_mode(
+            Some(&detected(LockfileKind::Aube)),
+            false,
+            dir.path()
+        ));
+        for kind in [
+            LockfileKind::Npm,
+            LockfileKind::Pnpm,
+            LockfileKind::Yarn,
+            LockfileKind::YarnBerry,
+            LockfileKind::Bun,
+        ] {
+            assert!(!native_pm_mode(Some(&detected(kind)), false, dir.path()));
+        }
+    }
+
+    /// The `install` block used by the scope test: layout and release-age
+    /// settings lowered once and scoped two ways.
+    fn both_axes() -> InstallConfig {
+        InstallConfig {
+            linker: Some(LinkerConfig::Hoisted),
+            public_hoist: Some(vec!["@types/*".to_string()]),
+            minimum_release_age: Some(std::time::Duration::from_secs(3600)),
+            minimum_release_age_exclude: Some(vec!["@internal/*".to_string()]),
+        }
+    }
+
+    fn mode_for(kind: LockfileKind, dir: &Path) -> bool {
+        native_pm_mode(
+            Some(&DetectedLockfile {
+                kind,
+                dir: dir.to_path_buf(),
+                fresh: false,
+            }),
+            false,
+            dir,
+        )
+    }
+
+    // `nub.jsonc` is the canonical layout surface regardless of incumbent.
+    // Release-age resolution still follows the incumbent, so an incumbent
+    // project takes layout from `nub.jsonc` and no release-age setting.
+    #[test]
+    fn an_incumbent_takes_layout_from_nub_jsonc_but_never_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let lowered = lower(both_axes(), &[]);
+
+        for kind in [LockfileKind::Npm, LockfileKind::Pnpm] {
+            let mode = mode_for(kind, dir.path());
+            assert!(!mode, "{kind:?} must not resolve as nub identity");
+            let scoped = scoped_install_settings(&lowered, mode, VirtualStoreLocality::Default);
+            assert_eq!(
+                get(&scoped, "nodeLinker"),
+                Some("hoisted"),
+                "{kind:?} must still take its layout from nub.jsonc"
+            );
+            assert_eq!(get(&scoped, "publicHoistPattern"), Some("@types/*"));
+            assert_eq!(
+                get(&scoped, "minimumReleaseAge"),
+                None,
+                "{kind:?} resolves as its incumbent, so nub-native resolution config stays out"
+            );
+        }
+
+        let native = scoped_install_settings(&lowered, true, VirtualStoreLocality::Default);
+        assert_eq!(get(&native, "nodeLinker"), Some("hoisted"));
+        assert_eq!(get(&native, "publicHoistPattern"), Some("@types/*"));
+    }
+
+    // RESOLUTION is the compatibility guarantee: which version a range selects
+    // must mirror the incumbent, so `minimumReleaseAge` reaches the engine only
+    // under nub identity.
+    #[test]
+    fn release_age_settings_stay_scoped_to_nub_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let lowered = lower(both_axes(), &[]);
+
+        for kind in [LockfileKind::Npm, LockfileKind::Pnpm] {
+            let scoped = scoped_install_settings(
+                &lowered,
+                mode_for(kind, dir.path()),
+                VirtualStoreLocality::Default,
+            );
+            assert_eq!(get(&scoped, "minimumReleaseAge"), None, "{kind:?}");
+            assert_eq!(get(&scoped, "minimumReleaseAgeStrict"), None, "{kind:?}");
+            assert_eq!(get(&scoped, "minimumReleaseAgeExclude"), None, "{kind:?}");
+        }
+
+        // Same lowering, nub identity: the fields do apply, so the absence above
+        // is the scoping and not a lowering that never produced them.
+        let native_mode = mode_for(LockfileKind::Aube, dir.path());
+        assert!(native_mode, "nub.lock must resolve as nub identity");
+        let native = scoped_install_settings(&lowered, native_mode, VirtualStoreLocality::Default);
+        assert_eq!(get(&native, "minimumReleaseAge"), Some("60"));
+        assert_eq!(get(&native, "minimumReleaseAgeStrict"), Some("true"));
+        assert_eq!(
+            get(&native, "minimumReleaseAgeExclude"),
+            Some("@internal/*")
+        );
+    }
+
+    #[test]
+    fn project_snapshot_reaches_install_lowering() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nub.jsonc"),
+            r#"{
+              "install": {
+                "linker": { "strategy": "isolated", "hoist": false },
+                "publicHoist": ["@types/*"],
+                "minimumReleaseAge": "3d",
+                "minimumReleaseAgeExclude": ["@internal/*"]
+              }
+            }"#,
+        )
+        .unwrap();
+        // `load_effective_config` also reads the GLOBAL layer, which resolves
+        // through `XDG_CONFIG_HOME` — a process-global. `with_config_home` points
+        // it at an empty dir, so the developer's real `~/.config/nub/nub.jsonc`
+        // cannot merge into the snapshot asserted below, and holds the
+        // process-wide env lock every `unsafe set_var` in the suite serializes on
+        // (an unsynchronized `getenv` against one is a data race under 2024).
+        let snapshot = crate::config::with_config_home(|_| {
+            crate::project_config::load_effective_config(
+                dir.path(),
+                crate::project_config::ConfigOverlays::default(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            snapshot
+                .project
+                .as_ref()
+                .map(|project| project.source.root.as_path()),
+            Some(dir.path())
+        );
+
+        let lowered = lower_native_install_settings(&snapshot.values.install, &[]).unwrap();
+        assert_eq!(get(&lowered.layout, "nodeLinker"), Some("isolated"));
+        assert_eq!(
+            get(&lowered.layout, "enableGlobalVirtualStore"),
+            Some("false")
+        );
+        assert_eq!(get(&lowered.layout, "hoist"), Some("false"));
+        assert_eq!(get(&lowered.layout, "publicHoistPattern"), Some("@types/*"));
+        assert_eq!(get(&lowered.resolution, "minimumReleaseAge"), Some("4320"));
+        assert_eq!(
+            get(&lowered.resolution, "minimumReleaseAgeExclude"),
+            Some("@internal/*")
+        );
+    }
+
+    #[test]
+    fn pnpm_npmrc_key_policy_narrows_only_at_v11() {
+        // pnpm reversed its `.npmrc` settings-reading at v11: ≤10 reads the
+        // open key space, 11+ restricts to the auth/registry allowlist. An
+        // unknown major defaults to Open (the dominant/most-compatible model).
+        assert!(matches!(
+            pnpm_npmrc_key_policy(Some(9)),
+            NpmrcKeyPolicy::Open
+        ));
+        assert!(matches!(
+            pnpm_npmrc_key_policy(Some(10)),
+            NpmrcKeyPolicy::Open
+        ));
+        assert!(matches!(
+            pnpm_npmrc_key_policy(Some(11)),
+            NpmrcKeyPolicy::Pnpm11Allowlist
+        ));
+        assert!(matches!(
+            pnpm_npmrc_key_policy(Some(12)),
+            NpmrcKeyPolicy::Pnpm11Allowlist
+        ));
+        assert!(matches!(pnpm_npmrc_key_policy(None), NpmrcKeyPolicy::Open));
+    }
+
+    /// A one-member workspace whose root manifest carries `root_fields`, with
+    /// `lockfile` (if any) beside it; returns the tempdir and the member dir.
+    fn npmrc_model_workspace(
+        root_fields: &str,
+        lockfile: Option<&str>,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            format!(r#"{{"name":"root","workspaces":["packages/*"],{root_fields}}}"#),
+        )
+        .unwrap();
+        if let Some(lockfile) = lockfile {
+            std::fs::write(root.path().join(lockfile), "").unwrap();
+        }
+        let member = root.path().join("packages").join("a");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("package.json"), r#"{"name":"a"}"#).unwrap();
+        (root, member)
+    }
+
+    #[test]
+    fn member_npmrc_model_mirrors_each_incumbent() {
+        use nub_core::workspace::npmrc::MemberNpmrc::{Ignored, Layered};
+        let cases = [
+            (r#""packageManager":"pnpm@10.34.9""#, None, Layered),
+            (r#""packageManager":"pnpm@11.28.10""#, None, Ignored),
+            // A range in `devEngines` still names pnpm 11.
+            (
+                r#""devEngines":{"packageManager":{"name":"pnpm","version":"^11.0.0"}}"#,
+                None,
+                Ignored,
+            ),
+            (
+                r#""devEngines":{"packageManager":{"name":"pnpm","version":"~11.28.0"}}"#,
+                None,
+                Ignored,
+            ),
+            // Several tools in a `devEngines` array are no single pin, in either
+            // order: the lockfile decides, as it does for the engine.
+            (
+                r#""devEngines":{"packageManager":[{"name":"pnpm"},{"name":"npm"}]}"#,
+                Some("pnpm-lock.yaml"),
+                Layered,
+            ),
+            (
+                r#""devEngines":{"packageManager":[{"name":"npm"},{"name":"pnpm"}]}"#,
+                Some("pnpm-lock.yaml"),
+                Layered,
+            ),
+            // Versioned entries: the lockfile picks the tool, and that tool's
+            // entry gives its major, in either order.
+            (
+                r#""devEngines":{"packageManager":[{"name":"pnpm","version":"^11.0.0"},{"name":"npm","version":"^11.0.0"}]}"#,
+                Some("pnpm-lock.yaml"),
+                Ignored,
+            ),
+            (
+                r#""devEngines":{"packageManager":[{"name":"npm","version":"^11.0.0"},{"name":"pnpm","version":"^11.0.0"}]}"#,
+                Some("pnpm-lock.yaml"),
+                Ignored,
+            ),
+            (
+                r#""devEngines":{"packageManager":[{"name":"npm","version":"^11.0.0"},{"name":"pnpm","version":"^10.0.0"}]}"#,
+                Some("pnpm-lock.yaml"),
+                Layered,
+            ),
+            (
+                r#""devEngines":{"packageManager":[{"name":"npm","version":"^11.0.0"},{"name":"pnpm","version":"^11.0.0"}]}"#,
+                Some("package-lock.json"),
+                Ignored,
+            ),
+            (r#""packageManager":"npm@11.20.0""#, None, Ignored),
+            (r#""packageManager":"bun@1.4.3""#, None, Ignored),
+            (r#""packageManager":"yarn@1.22.22""#, None, Layered),
+            (r#""private":true"#, Some("package-lock.json"), Ignored),
+            (r#""private":true"#, Some("bun.lock"), Ignored),
+            (r#""private":true"#, Some("yarn.lock"), Layered),
+            (r#""private":true"#, None, Layered),
+        ];
+        // Asked the way nub-core's own `.npmrc` readers ask, through the probe
+        // `main` registers, so they and the engine posture cannot disagree.
+        register_incumbent_probe();
+        for (fields, lockfile, expected) in cases {
+            let (root, member) = npmrc_model_workspace(fields, lockfile);
+            let model = nub_core::workspace::npmrc::member_npmrc(&member);
+            assert_eq!(model, expected, "{fields} + {lockfile:?}");
+            // nub-core's readers and the engine's agree on the declared tool
+            // (role vs config surface) and on each tool's declared version.
+            assert_eq!(
+                nub_core::pm::resolve::declared_pm_raw(root.path()).map(|(name, _)| name),
+                aube_lockfile::declared_package_manager(root.path()).map(|d| d.name),
+                "{fields}: declared tool"
+            );
+            for tool in ["pnpm", "npm", "yarn", "bun"] {
+                assert_eq!(
+                    nub_core::pm::resolve::declared_pm_version(root.path(), tool),
+                    aube_lockfile::declared_version_for(root.path(), tool),
+                    "{fields}: declared {tool} version"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_declared_pnpm_pin_marks_the_workspace_root_before_its_lockfile() {
+        // nub-core's pnpm-named-file gate reads the declaration through the probe
+        // `main` registers; registering here is that production configuration.
+        register_incumbent_probe();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"root","packageManager":"pnpm@11.28.10"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+        let member = root.path().join("packages").join("a");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("package.json"), r#"{"name":"a"}"#).unwrap();
+
+        let found =
+            nub_core::workspace::detect::detect_project(&member).and_then(|p| p.workspace_root);
+        assert_eq!(
+            found.map(|p| p.canonicalize().unwrap()),
+            Some(root.path().canonicalize().unwrap()),
+            "workspace root seen from the member"
+        );
+        assert_eq!(declared_pnpm_major_in(&member), Some(11));
     }
 
     #[test]
@@ -2121,57 +4349,272 @@ mod tests {
             fresh: false,
         };
 
-        // Flat-layout kinds ⇒ nodeLinker defaults to hoisted.
+        // Every non-injected incumbent kind AND a fresh project default to
+        // isolated with NO `hoist` push: hoist resolves to the built-in default
+        // (true), which under nub's `gvs_over_default_hoist` profile lets GVS
+        // engage while the linker builds the hidden tree only where GVS is off.
+        // The tempdir has no injected manifest.
         for kind in [
             LockfileKind::Npm,
+            LockfileKind::NpmShrinkwrap,
+            LockfileKind::Yarn,
             LockfileKind::YarnBerry,
             LockfileKind::Bun,
+            LockfileKind::Pnpm,
+            LockfileKind::Aube,
         ] {
+            let defaults = nub_setting_defaults(
+                Some(&detected(kind)),
+                false,
+                dir.path(),
+                VirtualStoreLocality::Default,
+            );
             assert_eq!(
-                get(
-                    &nub_setting_defaults(Some(&detected(kind)), false),
-                    "nodeLinker"
-                ),
-                Some("hoisted"),
-                "{kind:?} must default to the hoisted layout"
+                get(&defaults, "nodeLinker"),
+                Some("isolated"),
+                "{kind:?} must default to the isolated layout"
+            );
+            assert_eq!(
+                get(&defaults, "hoist"),
+                None,
+                "{kind:?} must NOT push hoist — a default hoist keeps GVS engaged"
             );
         }
 
-        // pnpm-shaped kinds and no lockfile ⇒ no entry (engine's isolated
-        // default applies, user/env settings resolve as in stock aube).
-        for kind in [LockfileKind::Pnpm, LockfileKind::Aube] {
-            assert_eq!(
-                get(
-                    &nub_setting_defaults(Some(&detected(kind)), false),
-                    "nodeLinker"
-                ),
-                None,
-                "{kind:?} must not inject a nodeLinker default"
+        // A fresh project (no lockfile) gets the same GVS default.
+        let fresh = nub_setting_defaults(None, true, dir.path(), VirtualStoreLocality::Default);
+        assert_eq!(
+            get(&fresh, "nodeLinker"),
+            Some("isolated"),
+            "fresh ⇒ isolated"
+        );
+        assert_eq!(
+            get(&fresh, "hoist"),
+            None,
+            "fresh ⇒ no hoist push (GVS engages by default)"
+        );
+    }
+
+    #[test]
+    fn phantom_disk_materialize_list_is_retired_in_favor_of_the_detector() {
+        // The 14-entry hand-curated adapter list is gone: the dynamic per-version
+        // scanner + #319 ancestor-closure (on by default) detect and eject those
+        // phantoms, so nub no longer seeds them as an embedder default. A fresh,
+        // non-vite project's `diskMaterializePackages` default is therefore
+        // empty (the vite #315 seed is the only remaining embedder-default entry,
+        // and this fixture declares no vite).
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = nub_setting_defaults(None, true, dir.path(), VirtualStoreLocality::Default);
+        let list = get(&fresh, "diskMaterializePackages").unwrap_or_default();
+        let names: Vec<&str> = list.split(',').filter(|s| !s.is_empty()).collect();
+        for retired in [
+            "@hookform/resolvers",
+            "@prisma/client",
+            "next-themes",
+            "@react-pdf/renderer",
+            "preact",
+            "drizzle-orm",
+        ] {
+            assert!(
+                !names.contains(&retired),
+                "{retired} must no longer be a hardcoded default (detector subsumes it): {list:?}"
             );
         }
+    }
+
+    #[test]
+    fn disable_gvs_default_drops_nuxt_and_parcel_and_keeps_the_store_locality_breakers() {
+        // The whole-install GVS-off list is now reserved for store-LOCALITY
+        // breaks. `nuxt` is closure-ejectable at rung 1 ([[nuxt-gvs-unlock]]) so
+        // it was dropped; `parcel` was dropped once its real break — a GVS
+        // store-dir over-split from the prewarm/link graph mismatch — was fixed at
+        // the source (see `run_gvs_prewarm_materializer`). `next` (Turbopack
+        // chroot) and `react-native` (bare-RN Metro realpath crawl) remain
+        // irreducible store-locality breaks.
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = nub_setting_defaults(None, true, dir.path(), VirtualStoreLocality::Default);
         assert_eq!(
-            get(&nub_setting_defaults(None, true), "nodeLinker"),
+            get(&fresh, "disableGlobalVirtualStoreForPackages"),
+            Some("next,react-native"),
+        );
+    }
+
+    #[test]
+    fn expo_below_sdk_56_is_gvs_ejected_but_56_plus_keeps_gvs() {
+        // Expo's Metro fork became store-aware in SDK 56 (On-demand Filesystem),
+        // so `expo` ejects version-conditionally: below the floor joins the
+        // store-locality breakers, at/above it keeps GVS. A range whose major
+        // can't be floored pre-resolution ejects (safe direction).
+        let disable_list = |manifest: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("package.json"), manifest).unwrap();
+            let defaults =
+                nub_setting_defaults(None, false, dir.path(), VirtualStoreLocality::Default);
+            get(&defaults, "disableGlobalVirtualStoreForPackages")
+                .unwrap()
+                .to_string()
+        };
+
+        // Below the floor → ejected (dependencies and devDependencies both count).
+        assert_eq!(
+            disable_list(r#"{"name":"x","dependencies":{"expo":"~52.0.0"}}"#),
+            "next,react-native,expo",
+        );
+        assert_eq!(
+            disable_list(r#"{"name":"x","devDependencies":{"expo":"^51.0.0"}}"#),
+            "next,react-native,expo",
+        );
+        assert_eq!(
+            disable_list(r#"{"name":"x","optionalDependencies":{"expo":"50.0.0"}}"#),
+            "next,react-native,expo",
+        );
+        // Unfloorable range → eject-on-ambiguity.
+        assert_eq!(
+            disable_list(r#"{"name":"x","dependencies":{"expo":"*"}}"#),
+            "next,react-native,expo",
+        );
+        // At/above the floor → GVS stays on (expo absent from the list).
+        assert_eq!(
+            disable_list(r#"{"name":"x","dependencies":{"expo":"~56.0.0"}}"#),
+            "next,react-native",
+        );
+        assert_eq!(
+            disable_list(r#"{"name":"x","dependencies":{"expo":"^57.0.4"}}"#),
+            "next,react-native",
+        );
+        // Not an Expo project → unchanged.
+        assert_eq!(
+            disable_list(r#"{"name":"x","dependencies":{"react":"19.2.0"}}"#),
+            "next,react-native",
+        );
+    }
+
+    #[test]
+    fn injected_deps_keep_the_hidden_hoist_tree_and_opt_out_of_gvs() {
+        // The ONE carve-out: a project declaring `dependenciesMeta.*.injected`
+        // needs the hidden hoist tree unconditionally, so nub pushes an EXPLICIT
+        // `hoist=true` — which vetoes GVS under the `gvs_over_default_hoist`
+        // profile (per-project + hidden tree, always). Covered for both a
+        // detected incumbent and a fresh project rooted at cwd.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"x","dependenciesMeta":{"foo":{"injected":true}}}"#,
+        )
+        .unwrap();
+        let detected = DetectedLockfile {
+            kind: LockfileKind::Npm,
+            dir: dir.path().to_path_buf(),
+            fresh: false,
+        };
+        for defaults in [
+            nub_setting_defaults(
+                Some(&detected),
+                false,
+                dir.path(),
+                VirtualStoreLocality::Default,
+            ),
+            nub_setting_defaults(None, true, dir.path(), VirtualStoreLocality::Default), // fresh, injected at cwd
+        ] {
+            assert_eq!(
+                get(&defaults, "nodeLinker"),
+                Some("isolated"),
+                "injected ⇒ isolated (like every project)"
+            );
+            assert_eq!(
+                get(&defaults, "hoist"),
+                Some("true"),
+                "injected ⇒ explicit hoist=true (vetoes GVS, forces the hidden tree)"
+            );
+        }
+    }
+
+    #[test]
+    fn ci_forces_project_local_store_but_keeps_isolation() {
+        // `nub ci` (VirtualStoreLocality::ProjectLocal) pushes
+        // `enableGlobalVirtualStore=false` so the frozen node_modules is
+        // COPY-relocatable (#241), while keeping the isolated layout (phantom-dep
+        // protection). It pushes NO `hoist`: with GVS off the default hoist=true
+        // makes the linker build the pnpm-parity hidden tree. A plain install
+        // (Default) leaves GVS on.
+        let dir = tempfile::tempdir().unwrap();
+        let detected = DetectedLockfile {
+            kind: LockfileKind::Npm,
+            dir: dir.path().to_path_buf(),
+            fresh: false,
+        };
+
+        let ci = nub_setting_defaults(
+            Some(&detected),
+            false,
+            dir.path(),
+            VirtualStoreLocality::ProjectLocal,
+        );
+        assert_eq!(
+            get(&ci, "enableGlobalVirtualStore"),
+            Some("false"),
+            "ci must force the store project-local (GVS off)"
+        );
+        assert_eq!(
+            get(&ci, "nodeLinker"),
+            Some("isolated"),
+            "ci keeps the isolated layout"
+        );
+        assert_eq!(
+            get(&ci, "hoist"),
             None,
-            "no lockfile must not inject a nodeLinker default"
+            "ci pushes no hoist — the default builds the hidden tree with GVS off"
+        );
+
+        let plain = nub_setting_defaults(
+            Some(&detected),
+            false,
+            dir.path(),
+            VirtualStoreLocality::Default,
+        );
+        assert_eq!(
+            get(&plain, "enableGlobalVirtualStore"),
+            None,
+            "a plain install never forces GVS off (stays on outside CI)"
+        );
+    }
+
+    #[test]
+    fn ci_keeps_global_linker_project_local() {
+        let lowered = lower(with_linker(LinkerConfig::Global { eject: None }), &[]);
+        let ci = scoped_install_settings(&lowered, true, VirtualStoreLocality::ProjectLocal);
+        assert_eq!(get(&ci, "nodeLinker"), Some("isolated"));
+        assert_eq!(
+            get(&ci, "enableGlobalVirtualStore"),
+            None,
+            "nub ci's embedder default must keep the tree COPY-relocatable"
         );
     }
 
     #[test]
     fn fresh_write_format_flips_with_truly_fresh() {
-        // A truly-fresh project writes nub's neutral `lock.yaml`
-        // (`defaultLockfileFormat=aube`); every other surface keeps the
-        // pnpm-lock fresh-write default for drop-in interop.
+        let dir = tempfile::tempdir().unwrap();
+        // A truly-fresh project writes nub's neutral `nub.lock`
+        // (`defaultLockfileFormat=nub`); every other surface keeps the
+        // pnpm-lock fresh-write default for drop-in interop. The value is
+        // spelled `nub`, not the engine's `aube`, because `nub config` lists
+        // it — both spellings select the same format.
         assert_eq!(
-            get(&nub_setting_defaults(None, true), "defaultLockfileFormat"),
-            Some("aube"),
-            "truly-fresh must write nub's lock.yaml"
+            get(
+                &nub_setting_defaults(None, true, dir.path(), VirtualStoreLocality::Default),
+                "defaultLockfileFormat"
+            ),
+            Some("nub"),
+            "truly-fresh must write nub's nub.lock"
         );
         assert_eq!(
-            get(&nub_setting_defaults(None, false), "defaultLockfileFormat"),
+            get(
+                &nub_setting_defaults(None, false, dir.path(), VirtualStoreLocality::Default),
+                "defaultLockfileFormat"
+            ),
             Some("pnpm"),
             "a project with a pnpm signal keeps the pnpm-lock fresh-write default"
         );
-        let dir = tempfile::tempdir().unwrap();
         let pnpm = DetectedLockfile {
             kind: LockfileKind::Pnpm,
             dir: dir.path().to_path_buf(),
@@ -2179,7 +4622,12 @@ mod tests {
         };
         assert_eq!(
             get(
-                &nub_setting_defaults(Some(&pnpm), false),
+                &nub_setting_defaults(
+                    Some(&pnpm),
+                    false,
+                    dir.path(),
+                    VirtualStoreLocality::Default
+                ),
                 "defaultLockfileFormat"
             ),
             Some("pnpm"),
@@ -2189,10 +4637,10 @@ mod tests {
 
     #[test]
     fn setting_defaults_always_carry_the_nub_identity_settings() {
-        // Every engine command gets the `.nub` store/state location and the
+        // Every engine command gets the `.store` store/state location and the
         // nub-namespaced global dirs regardless of detection; the non-truly-
         // fresh surfaces also get the pnpm lockfile fresh-write default (the
-        // truly-fresh `aube`/`lock.yaml` flip is covered separately). (These
+        // truly-fresh `nub`/`nub.lock` flip is covered separately). (These
         // ride the engine's
         // embedder-defaults tier, so any user source overrides them —
         // precedence is covered by the engine's own tests and the
@@ -2208,10 +4656,28 @@ mod tests {
             // identity-settings invariants for the non-truly-fresh surfaces
             // (the truly-fresh lockfile-format flip is covered separately in
             // `fresh_write_format_flips_with_truly_fresh`).
-            let defaults = nub_setting_defaults(detected.as_ref(), false);
+            let defaults = nub_setting_defaults(
+                detected.as_ref(),
+                false,
+                dir.path(),
+                VirtualStoreLocality::Default,
+            );
             assert_eq!(get(&defaults, "defaultLockfileFormat"), Some("pnpm"));
-            assert_eq!(get(&defaults, "virtualStoreDir"), Some("node_modules/.nub"));
-            assert_eq!(get(&defaults, "stateDir"), Some("node_modules/.nub"));
+            assert_eq!(
+                get(&defaults, "minimumReleaseAge"),
+                Some("1440"),
+                "Nub's release-age floor must default to 24 hours"
+            );
+            assert_eq!(
+                get(&defaults, "minimumReleaseAgeStrict"),
+                Some("true"),
+                "Nub's 24-hour release-age floor must fail closed by default"
+            );
+            assert_eq!(
+                get(&defaults, "virtualStoreDir"),
+                Some("node_modules/.store")
+            );
+            assert_eq!(get(&defaults, "stateDir"), Some("node_modules/.store"));
             // The global store lands in nub's XDG data namespace (dev boxes
             // always resolve a home dir, so the entry is present here).
             let store = get(&defaults, "storeDir").expect("storeDir default");
@@ -2258,7 +4724,8 @@ mod tests {
 
         for kind in all_kinds {
             let d = kind.map(detected);
-            let defaults = nub_setting_defaults(d.as_ref(), false);
+            let defaults =
+                nub_setting_defaults(d.as_ref(), false, dir.path(), VirtualStoreLocality::Default);
             let label = format!("{kind:?}");
 
             // Must always carry the safe explicit-allowlist posture.
@@ -2267,7 +4734,6 @@ mod tests {
                 Some("true"),
                 "{label}: defaultTrust must be \"true\""
             );
-
             // Must never inject an allow-all build-script key.
             assert_eq!(
                 get(&defaults, "dangerouslyAllowAllBuilds"),
@@ -2316,14 +4782,14 @@ mod tests {
     }
 
     #[test]
-    fn warn_if_pnp_requested_fires_only_for_yarn_with_pnp_linker() {
+    fn pnp_fatal_fires_only_for_yarn_with_pnp_linker() {
         let dir = tempfile::tempdir().unwrap();
         let yarnrc = dir.path().join(".yarnrc.yml");
         static YARN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-        // Helper that mirrors the gating logic without actually calling
-        // eprintln! — we check the predicate, not the output channel.
-        let would_warn = |kind: Option<LockfileKind>, content: Option<&str>| {
+        // Helper that mirrors the gating predicate without constructing the
+        // error — we check when the fatal fires, not its rendering.
+        let would_abort = |kind: Option<LockfileKind>, content: Option<&str>| {
             let _ = std::fs::remove_file(&yarnrc);
             if let Some(c) = content {
                 std::fs::write(&yarnrc, c).unwrap();
@@ -2353,25 +4819,25 @@ mod tests {
                     == Some("pnp")
         };
 
-        // Yarn + pnp → warn.
-        assert!(would_warn(
+        // Yarn + pnp → abort.
+        assert!(would_abort(
             Some(LockfileKind::Yarn),
             Some("nodeLinker: pnp\n")
         ));
-        assert!(would_warn(
+        assert!(would_abort(
             Some(LockfileKind::YarnBerry),
             Some("nodeLinker: pnp\n")
         ));
 
-        // Yarn + hoisted → no warn.
-        assert!(!would_warn(
+        // Yarn + hoisted → no abort.
+        assert!(!would_abort(
             Some(LockfileKind::Yarn),
             Some("nodeLinker: hoisted\n")
         ));
 
-        // Yarn Classic + no .yarnrc.yml → no warn; Yarn Berry defaults to PnP.
-        assert!(!would_warn(Some(LockfileKind::Yarn), None));
-        assert!(would_warn(Some(LockfileKind::YarnBerry), None));
+        // Yarn Classic + no .yarnrc.yml → no abort; Yarn Berry defaults to PnP.
+        assert!(!would_abort(Some(LockfileKind::Yarn), None));
+        assert!(would_abort(Some(LockfileKind::YarnBerry), None));
 
         // A nearer rc file overrides an ancestor rc file.
         std::fs::write(&yarnrc, "nodeLinker: pnp\n").unwrap();
@@ -2405,21 +4871,21 @@ mod tests {
         unsafe { std::env::remove_var("YARN_NODE_LINKER") };
 
         // Non-yarn kinds + pnp → no warn (npm/bun projects can't have .yarnrc.yml pnp).
-        assert!(!would_warn(
+        assert!(!would_abort(
             Some(LockfileKind::Npm),
             Some("nodeLinker: pnp\n")
         ));
-        assert!(!would_warn(
+        assert!(!would_abort(
             Some(LockfileKind::Bun),
             Some("nodeLinker: pnp\n")
         ));
-        assert!(!would_warn(
+        assert!(!would_abort(
             Some(LockfileKind::Pnpm),
             Some("nodeLinker: pnp\n")
         ));
 
         // No lockfile → no warn.
-        assert!(!would_warn(None, Some("nodeLinker: pnp\n")));
+        assert!(!would_abort(None, Some("nodeLinker: pnp\n")));
     }
 
     // The brand-surface toggles (workspace-yaml list, manifest config
@@ -2478,7 +4944,17 @@ mod tests {
         }
 
         // ── undeclared: lockfile presence decides ────────────────────────
-        // A lone lock.yaml → nub identity, carrying the deciding dir.
+        // A lone nub.lock (nub's canonical name) → nub identity.
+        let d = root(&[
+            ("package.json", "{}"),
+            ("nub.lock", "lockfileVersion: '9.0'\n"),
+        ]);
+        assert_eq!(
+            resolve_config_surface(d.path()),
+            ConfigSurface::NubIdentity(d.path().to_path_buf())
+        );
+        // A lone legacy lock.yaml (read-both through the transition) → nub
+        // identity too, carrying the deciding dir.
         let d = root(&[
             ("package.json", "{}"),
             ("lock.yaml", "lockfileVersion: '9.0'\n"),
@@ -2585,6 +5061,61 @@ mod tests {
                 role: "yarn",
                 dir: d.path().to_path_buf()
             }
+        );
+    }
+
+    /// The gate on pnpm-11-only branded config: the global
+    /// `config.yaml`/`auth.ini` pair and scalar settings in
+    /// `pnpm-workspace.yaml`. Living in the user config home does not make the
+    /// global files PM-agnostic or version-agnostic, and only a declared major
+    /// proves v11.
+    #[test]
+    fn pnpm_v11_surfaces_need_a_declared_v11_incumbent() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let manifest = |json: &str| std::fs::write(root.path().join("package.json"), json).unwrap();
+
+        manifest(r#"{"packageManager":"pnpm@10.0.0"}"#);
+        assert!(!pnpm_v11_surface(&ConfigSurface::PnpmOrFresh, root.path()));
+
+        // Same length as the v10 manifest and, on Windows, often inside the same
+        // mtime tick, so only the manifest caches' racy-mtime guard
+        // (`config_cache`) makes this rewrite visible. The equal length is
+        // deliberate: it is the case that guard exists for.
+        manifest(r#"{"packageManager":"pnpm@11.0.0"}"#);
+        assert!(pnpm_v11_surface(&ConfigSurface::PnpmOrFresh, root.path()));
+        assert!(
+            !pnpm_v11_surface(&ConfigSurface::NubIdentity(dir.clone()), root.path()),
+            "Nub identity must not read pnpm's global files or workspace settings"
+        );
+        for role in ["npm", "yarn", "bun"] {
+            assert!(
+                !pnpm_v11_surface(
+                    &ConfigSurface::NonPnpmCompat {
+                        role,
+                        dir: dir.clone(),
+                    },
+                    root.path(),
+                ),
+                "{role} identity must not read pnpm's global files or workspace settings"
+            );
+        }
+
+        manifest(r#"{"packageManager":"vlt@1.0.0"}"#);
+        assert!(
+            !pnpm_v11_surface(&ConfigSurface::PnpmOrFresh, root.path()),
+            "the conservative CLI surface for an unknown tool is not pnpm incumbency"
+        );
+
+        manifest("{}");
+        std::fs::write(
+            root.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+        assert!(
+            !pnpm_v11_surface(&ConfigSurface::PnpmOrFresh, root.path()),
+            "a pnpm lockfile proves the incumbent name, not the major; unknown defaults to v10"
         );
     }
 
@@ -2719,7 +5250,7 @@ mod tests {
         // A populated augmentation (what `nub run`/`exec` compute) must convert
         // into the generic overlay aube applies to every lifecycle spawn:
         // NODE → the node shim (so a build script's `$NODE child.js` re-enters
-        // nub augmented), NODE_OPTIONS (preload + injected flags), NODE_PATH
+        // nub augmented), NODE_OPTIONS (preload + source maps; feature flags ride argv), NODE_PATH
         // (vendored helper resolution), npm_node_execpath PINNED to the
         // provisioned Node (the ABI fix — node-gyp must compile against the
         // project's Node, not ambient), and the shim dir leading PATH.
@@ -2728,8 +5259,11 @@ mod tests {
             shim_dir: Some("/shim".to_string()),
             node_path: Some(OsString::from("/rt/node_path")),
             neutralize_localstorage: true,
+            threadpool_size: Some("8".to_string()),
         };
-        let (overlay, prepends) = augmentation_to_lifecycle_overlay(&aug, "/pinned/bin/node");
+        let runtime_json = r#"{"nodeCompat":false}"#;
+        let (overlay, prepends) =
+            augmentation_to_lifecycle_overlay(&aug, "/pinned/bin/node", Some(runtime_json));
 
         let find = |k: &str| {
             overlay
@@ -2752,6 +5286,16 @@ mod tests {
         );
         assert_eq!(find("NODE_PATH").as_deref(), Some("/rt/node_path"));
         assert_eq!(
+            find(crate::project_config::RUNTIME_CONFIG_ENV).as_deref(),
+            Some(runtime_json),
+            "the Node-shim continuation must inherit the source-anchored runtime snapshot"
+        );
+        assert_eq!(
+            find("__NUB_AUGMENTED_NODE").as_deref(),
+            Some(expected_shim_node.as_str()),
+            "a fresh boundary may restore NODE only while it still holds the lifecycle shim"
+        );
+        assert_eq!(
             find("npm_node_execpath").as_deref(),
             Some("/pinned/bin/node"),
             "npm_node_execpath must pin the provisioned Node (ABI fix)"
@@ -2765,6 +5309,16 @@ mod tests {
             find("__NUB_NEUTRALIZE_LOCALSTORAGE").as_deref(),
             Some("1"),
             "neutralize signal must flow to build-script node children when set"
+        );
+        assert_eq!(
+            find("UV_THREADPOOL_SIZE").as_deref(),
+            Some("8"),
+            "the threadpool size must reach lifecycle node children"
+        );
+        assert_eq!(
+            find("__NUB_AUGMENTED_UV_THREADPOOL_SIZE").as_deref(),
+            Some("8"),
+            "a compat boundary may remove the pool size only while it still holds nub's value"
         );
     }
 
@@ -2780,8 +5334,9 @@ mod tests {
             shim_dir: None,
             node_path: None,
             neutralize_localstorage: false,
+            threadpool_size: None,
         };
-        let (overlay, prepends) = augmentation_to_lifecycle_overlay(&aug, "/pinned/bin/node");
+        let (overlay, prepends) = augmentation_to_lifecycle_overlay(&aug, "/pinned/bin/node", None);
         assert!(prepends.is_empty());
         assert!(
             !overlay
@@ -2821,15 +5376,27 @@ mod tests {
     }
 
     #[test]
+    fn x_is_an_alias_of_dlx() {
+        // `nub x <tool>` is the short fetch-and-run spelling — it resolves to the
+        // same `dlx` engine verb as `nub dlx`, so both share one dispatch path
+        // (`run_dlx` → `aube::commands::dlx`). It is NOT exec: `x` fetches a
+        // missing tool, exec does not.
+        let spec = lookup_verb("x").expect("x must be a registered verb");
+        assert_eq!(spec.canonical, "dlx");
+        assert_eq!(lookup_verb("dlx").map(|s| s.canonical), Some("dlx"));
+    }
+
+    #[test]
     fn verb_registry_excludes_reserved_and_tool_identity_verbs() {
         // nub-reserved spellings (collision policy) and aube tool-identity
         // verbs must never enter the registry — `upgrade` in particular is
-        // nub's self-update, not aube's update alias.
+        // nub's self-update, not aube's update alias. (`x` is deliberately
+        // ABSENT: it is a registered alias of `dlx` — asserted by
+        // `x_is_an_alias_of_dlx` — not a reserved exclusion.)
         for verb in [
             "run",
             "run-script",
             "exec",
-            "x",
             "test",
             "t",
             "start",
@@ -3023,8 +5590,109 @@ mod tests {
         // ...but a catalog-honoring bun does not refuse it.
         assert!(role_honors_catalog(Role::Bun, Some(1), Some(2)));
 
-        // npm / yarn never honor catalogs.
+        // npm never honors catalogs; classic yarn v1 doesn't either.
         assert!(!role_honors_catalog(Role::Npm, Some(10), Some(0)));
-        assert!(!role_honors_catalog(Role::Yarn, Some(4), Some(0)));
+        assert!(!role_honors_catalog(Role::Yarn, Some(1), Some(22)));
+    }
+
+    #[test]
+    fn yarn_berry_honors_catalogs_classic_v1_does_not() {
+        // yarn shipped catalogs in 4.10.0, declared in `.yarnrc.yml` with the
+        // same `catalog:`/`catalogs:` shape as pnpm; aube discovers them. We
+        // honor catalogs on ALL yarn-berry (v2+) rather than gating on a parsed
+        // 4.10 — nub's yarn-minor detection isn't reliable enough to split 4.10
+        // from earlier berry, and a `catalog:` only appears if the project uses
+        // the feature, so there's nothing to mis-resolve. Classic yarn v1 has no
+        // catalogs and must still refuse.
+        use config_scope::Role;
+
+        assert!(
+            role_honors_catalog(Role::Yarn, Some(4), Some(10)),
+            "yarn 4.10 (berry) implements catalogs"
+        );
+        assert!(
+            role_honors_catalog(Role::Yarn, Some(4), Some(0)),
+            "yarn 4.x (berry) honors — minor not gated"
+        );
+        assert!(
+            role_honors_catalog(Role::Yarn, Some(2), None),
+            "yarn 2 (berry) honors — all berry honors"
+        );
+        assert!(
+            role_honors_catalog(Role::Yarn, None, None),
+            "an undeclared/unparseable yarn version assumes modern berry and honors"
+        );
+        assert!(
+            !role_honors_catalog(Role::Yarn, Some(1), Some(22)),
+            "classic yarn v1 never had catalogs and must refuse"
+        );
+
+        // A yarn-berry fixture with a real `catalog:` ref: the specifier is
+        // detected, but a berry identity does not refuse it. (The catalog VALUES
+        // live in `.yarnrc.yml`, resolved by aube's `discover_catalogs`; here we
+        // only assert the per-role gate, not the resolution.)
+        let d = workspace(&[(
+            "package.json",
+            r#"{"name":"root","packageManager":"yarn@4.10.0","dependencies":{"is-odd":"catalog:"}}"#,
+        )]);
+        let m = root_manifest(d.path());
+        assert!(first_catalog_specifier(&m, d.path()).is_some());
+        assert!(role_honors_catalog(Role::Yarn, Some(4), Some(10)));
+    }
+
+    #[test]
+    fn a_member_install_resolves_the_workspace_roots_node_pin() {
+        // aube anchors install state and the virtual store at the workspace root,
+        // and a member install materializes that ONE shared tree. So the engine
+        // published for it has to name the root's Node: keyed off the member's own
+        // pin, the ABI caches describe a Node the root-anchored state file never
+        // saw, and alternating root/member installs each rebuild the other's tree.
+        let d = workspace(&[
+            (
+                "package.json",
+                r#"{"name":"ws","workspaces":["packages/*"]}"#,
+            ),
+            (".nvmrc", "22.15.0\n"),
+            ("packages/member/package.json", r#"{"name":"member"}"#),
+            ("packages/member/.nvmrc", "20.19.0\n"),
+        ]);
+        let member = d.path().join("packages/member");
+        let pin_at = |dir: &Path| {
+            nub_core::node::discovery::resolve_pin_chain(dir)
+                .expect("pin chain resolves")
+                .pin
+                .expect("a pin file is in scope")
+                .0
+        };
+
+        // Control: from the raw cwd the member's own pin wins — the key the engine
+        // carried before discovery was anchored.
+        assert_eq!(pin_at(&member), "20.19.0");
+        assert_eq!(
+            pin_at(&lifecycle_node_anchor(&member)),
+            "22.15.0",
+            "a member install builds the workspace's one shared tree, so anchoring \
+             Node discovery anywhere but the root keys the ABI caches to a Node the \
+             install state never saw"
+        );
+    }
+
+    #[test]
+    fn busybox_lifecycle_shell_leads_with_the_sh_applet_name() {
+        let spec = busybox_script_shell(r"C:\nub\bin\busybox.exe");
+        assert_eq!(spec.program, PathBuf::from(r"C:\nub\bin\busybox.exe"));
+        assert_eq!(
+            spec.args,
+            ["sh", "-X", "-c"],
+            "busybox dispatches on argv[0] or a leading applet name, so spawned as \
+             `busybox.exe` it needs `sh` before `-c` — `busybox.exe -c <body>` runs \
+             no shell — and `-X`, without which it rewrites `\\` to `/` in the \
+             environment every build tool inherits. Both mistakes are invisible off Windows."
+        );
+        assert!(
+            spec.restore_env_casing,
+            "busybox-w32 up-cases environment names, so `$npm_package_name` in a lifecycle \
+             body expands to nothing unless the spawn re-binds the lowercase names"
+        );
     }
 }

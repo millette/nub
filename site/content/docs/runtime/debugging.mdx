@@ -1,0 +1,55 @@
+---
+title: Debugging
+description: Attach the VS Code debugger to a program run through Nub, with breakpoints and stepping working while augmentation is on.
+---
+
+VS Code's Node debugger launches your program with its own `node`, which skips Nub. Point it at the `nub` binary instead.
+
+```json title=".vscode/launch.json"
+{
+  "type": "node",
+  "request": "launch",
+  "name": "Debug (nub)",
+  "runtimeExecutable": "nub",
+  "program": "${workspaceFolder}/src/index.ts",
+  "skipFiles": ["<node_internals>/**"]
+}
+```
+
+Set a breakpoint and run the configuration. VS Code passes `--inspect-brk` ahead of your file, Nub forwards it to Node, and the debugger attaches.
+
+<Callout title="If VS Code cannot find nub">
+VS Code resolves `runtimeExecutable` against its own `PATH`. Set the field to the absolute path that `which nub` prints, for example `~/.nub/bin/nub`.
+</Callout>
+
+## Program arguments
+
+Pass your program's arguments through `args`. They appear on `process.argv`, as they would after the file on the command line.
+
+```json title=".vscode/launch.json"
+{
+  "runtimeExecutable": "nub",
+  "program": "${workspaceFolder}/src/build.ts",
+  "args": ["--out", "./dist", "--verbose"]
+}
+```
+
+<Callout>
+Read the [full docs](https://code.visualstudio.com/docs/nodejs/nodejs-debugging) for launch configurations on code.visualstudio.com.
+</Callout>
+
+## TypeScript
+
+Breakpoints in `.ts` files resolve to the source line, through the inline [source maps](/docs/runtime/typescript#source-maps) Nub generates.
+
+## Running without augmentation
+
+To debug on plain Node, with the project's pinned version, add `--node` through `runtimeArgs`.
+
+```json title=".vscode/launch.json"
+{
+  "runtimeExecutable": "nub",
+  "runtimeArgs": ["--node"],
+  "program": "${workspaceFolder}/src/index.ts"
+}
+```

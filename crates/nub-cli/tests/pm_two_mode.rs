@@ -39,6 +39,9 @@ fn run(dir: &Path, args: &[&str]) -> (String, String, i32) {
     let out = Command::new(nub_binary())
         .args(args)
         .current_dir(dir)
+        // Fixtures pin a differing `nub@<v>` to exercise nub identity, not the
+        // self-shim — opt out so a PM verb doesn't try to provision that nub.
+        .env("NUB_SELF_SHIM", "0")
         .env("XDG_DATA_HOME", dir.join("xdg-data"))
         .env("XDG_CACHE_HOME", dir.join("xdg-cache"))
         .output()
@@ -76,23 +79,30 @@ fn use_nub_migrates_a_single_package_catalog_project_offline_and_idempotently() 
     let (stdout, stderr, code) = run(&dir, &["pm", "use", "nub"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
 
-    // Zero pnpm-named files; lock.yaml carries the exact prior bytes.
+    // Zero pnpm-named files; nub.lock carries the exact prior bytes.
     assert!(!dir.join("pnpm-workspace.yaml").exists(), "{stdout}");
     assert!(!dir.join("pnpm-lock.yaml").exists(), "{stdout}");
     assert_eq!(
-        std::fs::read_to_string(dir.join("lock.yaml")).unwrap(),
+        std::fs::read_to_string(dir.join("nub.lock")).unwrap(),
         EMPTY_LOCK,
         "the rename must be byte-identical"
     );
 
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap()).unwrap();
-    assert_eq!(
-        manifest["packageManager"],
-        format!("nub@{}", env!("CARGO_PKG_VERSION"))
+    // Bare `pm use nub` is the non-locking switch: the incumbent pnpm@ pin is
+    // cleared and only the devEngines caret range is written — never a hard
+    // `packageManager: nub@<v>` pin (that is `pm use nub@<exact>`'s opt-in).
+    assert!(
+        manifest.get("packageManager").is_none(),
+        "bare pm use nub writes no exact packageManager pin: {manifest}"
     );
     assert_eq!(manifest["devEngines"]["packageManager"]["name"], "nub");
-    assert_eq!(manifest["devEngines"]["packageManager"]["onFail"], "warn");
+    assert_eq!(manifest["devEngines"]["packageManager"]["onFail"], "ignore");
+    assert_eq!(
+        manifest["devEngines"]["packageManager"]["version"],
+        format!("^{}", env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(
         manifest["workspaces"]["catalog"]["left-pad"], "1.3.0",
         "single-package catalogs land as a packages-less workspaces object"
@@ -111,22 +121,24 @@ fn use_nub_migrates_a_single_package_catalog_project_offline_and_idempotently() 
         stdout.contains("production"),
         "the warn tail must name the transient key loudly: {stdout}"
     );
+    // The corepack line is gated to the exact-pin path; the pnpm-refuses line is
+    // the always-present consequence for the bare switch.
     assert!(
-        stdout.contains("corepack") && stdout.contains("nub pm use pnpm"),
-        "the summary must carry the teammates consequences block: {stdout}"
+        stdout.contains("nub pm use pnpm") && !stdout.contains("corepack"),
+        "bare switch carries the consequences block without the corepack (exact-pin) line: {stdout}"
     );
 
     // Idempotent rerun: same identity, lockfile kept, nothing new to migrate.
     let (stdout2, stderr2, code2) = run(&dir, &["pm", "use", "nub"]);
     assert_eq!(code2, 0, "stdout: {stdout2}\nstderr: {stderr2}");
     assert!(
-        stdout2.contains("lock.yaml: kept"),
+        stdout2.contains("nub.lock: kept"),
         "rerun must keep, not re-convert: {stdout2}"
     );
 }
 
 /// Crash-recovery for the one half-migrated window `use nub` can be killed in:
-/// the manifest edit (atomic — packageManager flipped, the yaml's catalog
+/// the manifest edit (atomic — devEngines range written, the yaml's catalog
 /// already copied into `workspaces`, the `pnpm` namespace dropped) and the
 /// lockfile rename both completed, but the process died BEFORE the final
 /// `pnpm-workspace.yaml` deletion. The project then declares nub identity yet
@@ -138,21 +150,21 @@ fn use_nub_migrates_a_single_package_catalog_project_offline_and_idempotently() 
 /// too fast to interrupt mid-write reliably).
 #[test]
 fn use_nub_recovers_from_a_crash_before_the_yaml_deletion() {
-    let nub_ver = env!("CARGO_PKG_VERSION");
     let dir = project(
         "use-nub-halfstate",
         &[
-            // Manifest as the atomic edit would have left it: nub identity,
-            // catalog migrated into the workspaces object, no pnpm namespace.
+            // Manifest as the atomic (bare) edit would have left it: nub identity
+            // via the devEngines range (no exact packageManager), catalog migrated
+            // into the workspaces object, no pnpm namespace.
             (
                 "package.json",
                 &format!(
-                    r#"{{"name":"app","version":"1.0.0","packageManager":"nub@{nub_ver}",{}}}"#,
+                    r#"{{"name":"app","version":"1.0.0",{}}}"#,
                     r#""devEngines":{"packageManager":{"name":"nub","version":"^0.0.0","onFail":"warn"}},"workspaces":{"catalog":{"left-pad":"1.3.0"}}"#
                 ),
             ),
-            // The rename already happened: lock.yaml present, no pnpm-lock.yaml.
-            ("lock.yaml", EMPTY_LOCK),
+            // The rename already happened: nub.lock present, no pnpm-lock.yaml.
+            ("nub.lock", EMPTY_LOCK),
             // The leftover the crash never got to delete — still carrying the
             // catalog that the atomic manifest edit already preserved.
             ("pnpm-workspace.yaml", "catalog:\n  left-pad: 1.3.0\n"),
@@ -162,21 +174,28 @@ fn use_nub_recovers_from_a_crash_before_the_yaml_deletion() {
     let (stdout, stderr, code) = run(&dir, &["pm", "use", "nub"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
 
-    // The leftover yaml is gone; lock.yaml is kept (not re-renamed); the
+    // The leftover yaml is gone; nub.lock is kept (not re-renamed); the
     // project is now in clean, fully-migrated nub identity.
     assert!(
         !dir.join("pnpm-workspace.yaml").exists(),
         "the recovery run must delete the stray yaml: {stdout}"
     );
     assert!(
-        dir.join("lock.yaml").is_file() && !dir.join("pnpm-lock.yaml").exists(),
-        "lock.yaml stays the lockfile, untouched: {stdout}"
+        dir.join("nub.lock").is_file() && !dir.join("pnpm-lock.yaml").exists(),
+        "nub.lock stays the lockfile, untouched: {stdout}"
     );
 
     // The migrated data survived the half-state — never silently dropped.
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap()).unwrap();
-    assert_eq!(manifest["packageManager"], format!("nub@{nub_ver}"));
+    assert!(
+        manifest.get("packageManager").is_none(),
+        "bare use nub leaves no exact packageManager pin after recovery: {manifest}"
+    );
+    assert_eq!(
+        manifest["devEngines"]["packageManager"]["version"],
+        format!("^{}", env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(
         manifest["workspaces"]["catalog"]["left-pad"], "1.3.0",
         "the catalog must remain in the manifest after recovery"
@@ -194,7 +213,6 @@ fn use_nub_recovers_from_a_crash_before_the_yaml_deletion() {
 /// byte-for-byte in the manifest.
 #[test]
 fn use_nub_migrates_with_injected_deps_and_preserves_meta() {
-    let nub_ver = env!("CARGO_PKG_VERSION");
     let dir = project(
         "injected",
         &[
@@ -211,14 +229,21 @@ fn use_nub_migrates_with_injected_deps_and_preserves_meta() {
 
     // The switch completed: yaml renamed, identity flipped, pnpm namespace gone.
     assert!(
-        dir.join("lock.yaml").is_file()
+        dir.join("nub.lock").is_file()
             && !dir.join("pnpm-lock.yaml").exists()
             && !dir.join("pnpm-workspace.yaml").exists(),
         "the migration must complete the lockfile rename + yaml deletion: {stdout}"
     );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap()).unwrap();
-    assert_eq!(manifest["packageManager"], format!("nub@{nub_ver}"));
+    assert!(
+        manifest.get("packageManager").is_none(),
+        "bare pm use nub writes no exact packageManager pin: {manifest}"
+    );
+    assert_eq!(
+        manifest["devEngines"]["packageManager"]["version"],
+        format!("^{}", env!("CARGO_PKG_VERSION"))
+    );
     // The injected dependenciesMeta survives untouched — the install path honors it.
     assert_eq!(
         manifest["dependenciesMeta"]["sibling"]["injected"], true,
@@ -228,7 +253,7 @@ fn use_nub_migrates_with_injected_deps_and_preserves_meta() {
 
 /// Under nub identity a stray pnpm-workspace.yaml is ignore-with-warning:
 /// exactly one warning naming it unread plus the remedies, and the install
-/// proceeds against lock.yaml.
+/// proceeds against nub.lock.
 #[test]
 fn stray_workspace_yaml_under_nub_identity_warns_once_and_install_proceeds() {
     let dir = project(
@@ -238,7 +263,7 @@ fn stray_workspace_yaml_under_nub_identity_warns_once_and_install_proceeds() {
                 "package.json",
                 r#"{"name":"app","version":"1.0.0","packageManager":"nub@0.0.1"}"#,
             ),
-            ("lock.yaml", EMPTY_LOCK),
+            ("nub.lock", EMPTY_LOCK),
             ("pnpm-workspace.yaml", "nodeLinker: hoisted\n"),
         ],
     );
@@ -256,8 +281,8 @@ fn stray_workspace_yaml_under_nub_identity_warns_once_and_install_proceeds() {
         "the warning must carry both remedies: {stderr}"
     );
     assert!(
-        dir.join("lock.yaml").is_file() && !dir.join("pnpm-lock.yaml").exists(),
-        "lock.yaml stays the lockfile"
+        dir.join("nub.lock").is_file() && !dir.join("pnpm-lock.yaml").exists(),
+        "nub.lock stays the lockfile"
     );
 }
 
@@ -299,7 +324,7 @@ fn lifecycle_ua_is_pnpm_first_in_compat_and_nub_first_under_nub_identity() {
                     r#"{{"name":"app","version":"1.0.0","packageManager":"nub@0.0.1",{postinstall}}}"#
                 ),
             ),
-            ("lock.yaml", EMPTY_LOCK),
+            ("nub.lock", EMPTY_LOCK),
         ],
     );
     let (stdout, stderr, code) = run(&dir, &["install"]);
@@ -311,7 +336,7 @@ fn lifecycle_ua_is_pnpm_first_in_compat_and_nub_first_under_nub_identity() {
     );
 }
 
-/// An empty-dependency, in-sync npm v3 package-lock — converts to lock.yaml
+/// An empty-dependency, in-sync npm v3 package-lock — converts to nub.lock
 /// offline (no graph to fetch), exercising the npm→nub `Convert` path.
 const EMPTY_NPM_LOCK: &str = r#"{
   "name": "app",
@@ -378,9 +403,10 @@ fn use_nub_warns_about_phantom_deps_only_when_leaving_a_hoisting_pm() {
 /// hooks rewrite the dep graph), so under a non-pnpm incumbent it's
 /// another tool's config and must not be honored. A `preResolution` hook
 /// writes a marker file when it runs — the cleanest cross-tool "did the
-/// hook fire?" signal. `--no-frozen-lockfile` forces the resolve so the
-/// hook actually gets a chance to run (a frozen/already-current install
-/// short-circuits before pnpmfile detection).
+/// hook fire?" signal. `--no-frozen-lockfile` keeps the rows on the
+/// resolve path, which is where every hook runs; `preResolution` alone
+/// now also fires on an already-current install, so what these rows
+/// isolate is the incumbent gate, not the install path.
 ///
 /// nub identity: the cwd-default `.pnpmfile` is gated off silently. Unlike
 /// `pnpm-workspace.yaml`, this stray pnpm-named file intentionally gets no
@@ -395,7 +421,7 @@ fn pnpmfile_ignored_silently_under_nub_identity() {
                 "package.json",
                 r#"{"name":"app","version":"1.0.0","packageManager":"nub@0.0.1"}"#,
             ),
-            ("lock.yaml", EMPTY_LOCK),
+            ("nub.lock", EMPTY_LOCK),
             (".pnpmfile.cjs", hook),
         ],
     );
@@ -477,5 +503,90 @@ fn pnpmfile_honored_under_pnpm_incumbent_without_warning() {
         stderr.matches("ignored").count(),
         0,
         "no ignore warning when pnpm is the incumbent: {stderr}"
+    );
+}
+
+/// `nub pm pin` — the lightweight lock. It writes ONLY the two nub identity
+/// fields (the exact corepack `packageManager: nub@<v>` pin that arms the
+/// self-shim, plus the beside-it devEngines caret) and touches nothing else:
+/// no lockfile, no pnpm-workspace.yaml, no settings migration, and — unlike the
+/// heavier `pm use nub` switch — NOT a project's `pnpm.*` config. Bare pins the
+/// running nub; an explicit exact version pins that and notes the delegation; a
+/// range/tag is refused; a missing manifest bails; reruns are idempotent. All
+/// offline — the pin never touches the network.
+#[test]
+fn pm_pin_locks_only_the_nub_identity_fields_offline() {
+    let running = env!("CARGO_PKG_VERSION");
+    let manifest = |d: &Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(d.join("package.json")).unwrap()).unwrap()
+    };
+
+    // A project carrying an unrelated pnpm.* config block: pin must NOT strip it
+    // (the full `use nub` migration moves then removes it; pin leaves it alone).
+    let dir = project(
+        "pm-pin",
+        &[(
+            "package.json",
+            r#"{"name":"app","version":"1.0.0","pnpm":{"overrides":{"left-pad":"1.3.0"}}}"#,
+        )],
+    );
+
+    // (a) bare `nub pm pin` locks the running nub — both fields, nothing else.
+    let (stdout, stderr, code) = run(&dir, &["pm", "pin"]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let m = manifest(&dir);
+    assert_eq!(m["packageManager"], format!("nub@{running}"));
+    assert_eq!(m["devEngines"]["packageManager"]["name"], "nub");
+    assert_eq!(
+        m["devEngines"]["packageManager"]["version"],
+        format!("^{running}")
+    );
+    assert_eq!(m["devEngines"]["packageManager"]["onFail"], "ignore");
+    assert_eq!(
+        m["pnpm"]["overrides"]["left-pad"], "1.3.0",
+        "pin must not touch the pnpm.* config it does not migrate: {m}"
+    );
+    assert!(
+        !stdout.contains("note:"),
+        "pinning the running nub emits no delegation note: {stdout}"
+    );
+
+    // (e) idempotent rerun — same state, exit 0.
+    let (stdout2, stderr2, code2) = run(&dir, &["pm", "pin"]);
+    assert_eq!(code2, 0, "stdout: {stdout2}\nstderr: {stderr2}");
+    assert_eq!(manifest(&dir)["packageManager"], format!("nub@{running}"));
+
+    // (b) an explicit exact version (≠ running) pins THAT and announces the
+    // delegation; the `nub@` prefix is forgiven (pin nub@<v> == pin <v>).
+    let (stdout3, stderr3, code3) = run(&dir, &["pm", "pin", "nub@0.0.1"]);
+    assert_eq!(code3, 0, "stdout: {stdout3}\nstderr: {stderr3}");
+    let m3 = manifest(&dir);
+    assert_eq!(m3["packageManager"], "nub@0.0.1");
+    assert_eq!(m3["devEngines"]["packageManager"]["version"], "^0.0.1");
+    assert!(
+        stdout3.contains("note:") && stdout3.contains("0.0.1"),
+        "a pin off the running version announces the provision+delegate: {stdout3}"
+    );
+
+    // (c) a range or dist-tag is refused — nub is the running binary, not a
+    // registry package, so there is nothing to resolve a non-exact spec against.
+    for bad in ["^1", "1.x", "next", "latest"] {
+        let (o, e, c) = run(&dir, &["pm", "pin", bad]);
+        assert_ne!(c, 0, "`pin {bad}` must fail: {o}\n{e}");
+        assert!(
+            e.contains("needs an exact version") && e.contains("running binary"),
+            "`pin {bad}` must name the exact-version rule: {e}"
+        );
+    }
+    // The failed pins wrote nothing — the last good pin still stands.
+    assert_eq!(manifest(&dir)["packageManager"], "nub@0.0.1");
+
+    // (d) no package.json → the write has no home, so it bails cleanly.
+    let empty = project("pm-pin-nomanifest", &[]);
+    let (o, e, c) = run(&empty, &["pm", "pin"]);
+    assert_ne!(c, 0, "pin with no manifest must fail: {o}\n{e}");
+    assert!(
+        e.contains("no package.json found"),
+        "the missing-manifest bail must name the cause: {e}"
     );
 }

@@ -73,6 +73,13 @@ pub(super) struct CiState {
     /// no packument fetch happens). The display gates the
     /// `/ ~13.8 MB` estimated-total segment on this being non-zero.
     pub(super) estimated_bytes: AtomicU64,
+    /// Live count of files the linker has materialized so far, bumped by
+    /// the link pass through the shared counter the install driver hands
+    /// it (see `InstallProgress::link_progress_counter`). Shared as an
+    /// `Arc` because the linker holds its own clone; the heartbeat reads
+    /// it to render the ticking `N files` count during linking so a slow
+    /// link re-emits every ~2s instead of looking wedged.
+    pub(super) files_linked: Arc<AtomicUsize>,
     /// Snapshot of `reused + downloaded` at the moment
     /// `set_phase("fetching")` first fires. Used as the baseline for
     /// the fetch-window ETA so the displayed estimate reflects
@@ -137,7 +144,7 @@ pub(super) fn term_width() -> usize {
 }
 
 impl CiState {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(files_linked: Arc<AtomicUsize>) -> Self {
         Self {
             phase: AtomicUsize::new(0),
             resolved: AtomicUsize::new(0),
@@ -146,6 +153,7 @@ impl CiState {
             downloaded: AtomicUsize::new(0),
             downloaded_bytes: AtomicU64::new(0),
             estimated_bytes: AtomicU64::new(0),
+            files_linked,
             completed_at_fetch_start: AtomicUsize::new(usize::MAX),
             start: Instant::now(),
             fetch_start: OnceLock::new(),
@@ -178,6 +186,7 @@ impl CiState {
             downloaded: self.downloaded.load(Ordering::Relaxed),
             bytes: self.downloaded_bytes.load(Ordering::Relaxed),
             estimated: self.estimated_bytes.load(Ordering::Relaxed),
+            files_linked: self.files_linked.load(Ordering::Relaxed),
             fetch_elapsed_ms,
             // `usize::MAX` means the baseline hasn't been captured yet
             // (still pre-fetching). Render layer treats that as
@@ -206,56 +215,67 @@ impl CiState {
 
     pub(super) fn spawn_heartbeat(state: &Arc<Self>) {
         let thread_state = state.clone();
-        let handle = thread::spawn(move || {
-            let state = thread_state;
-            loop {
-                let guard = state.wake_lock.lock().unwrap();
-                // Re-check `done` *before* sleeping. `stop()` sets `done`
-                // and then `notify_all()`s without holding `wake_lock`, so
-                // a notification that races with the tick body would
-                // otherwise be lost and the thread would sleep a full
-                // `CI_HEARTBEAT_INTERVAL` before noticing shutdown.
-                if state.done.load(Ordering::Relaxed) {
-                    break;
+        // The heartbeat is a cosmetic progress ticker — never load-bearing for the
+        // install. Use `Builder::spawn` (returns `io::Result`) instead of
+        // `thread::spawn` (which PANICS on OS thread-create failure) so that under
+        // peak PID/thread pressure an EAGAIN degrades to "no ticker" rather than
+        // taking the process down. This matters acutely under `panic = "abort"`:
+        // an unguarded panic here would abort the whole install. `stop()` already
+        // tolerates a `None` heartbeat handle, so skipping it is fully safe.
+        let spawned = thread::Builder::new()
+            .name("aube-ci-heartbeat".into())
+            .spawn(move || {
+                let state = thread_state;
+                loop {
+                    let guard = state.wake_lock.lock().unwrap();
+                    // Re-check `done` *before* sleeping. `stop()` sets `done`
+                    // and then `notify_all()`s without holding `wake_lock`, so
+                    // a notification that races with the tick body would
+                    // otherwise be lost and the thread would sleep a full
+                    // `CI_HEARTBEAT_INTERVAL` before noticing shutdown.
+                    if state.done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let (guard, _timeout) = state
+                        .wake
+                        .wait_timeout(guard, CI_HEARTBEAT_INTERVAL)
+                        .unwrap();
+                    drop(guard);
+                    if state.done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let snap = state.snapshot();
+                    // Don't make noise until an install is actually underway.
+                    // Until then there's nothing to bar-graph and no reason to
+                    // print anything — a no-op install should remain
+                    // completely silent.
+                    if snap.resolved == 0 || snap.phase == 0 {
+                        continue;
+                    }
+                    let line = Self::render(snap);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let mut last = state.last_printed.lock().unwrap();
+                    if *last == line {
+                        // Same rendered line as before — stay quiet.
+                        continue;
+                    }
+                    *last = line.clone();
+                    drop(last);
+                    // First time we actually print, emit the unframed
+                    // `aube VERSION by jdx.dev` header above the bar so
+                    // the CI log shows the aube banner. Only printed
+                    // once per install — `shown` flips true here.
+                    if !state.shown.swap(true, Ordering::Relaxed) {
+                        let _ = writeln!(std::io::stderr(), "{}", Self::render_header());
+                    }
+                    let _ = writeln!(std::io::stderr(), "{line}");
                 }
-                let (guard, _timeout) = state
-                    .wake
-                    .wait_timeout(guard, CI_HEARTBEAT_INTERVAL)
-                    .unwrap();
-                drop(guard);
-                if state.done.load(Ordering::Relaxed) {
-                    break;
-                }
-                let snap = state.snapshot();
-                // Don't make noise until an install is actually underway.
-                // Until then there's nothing to bar-graph and no reason to
-                // print anything — a no-op install should remain
-                // completely silent.
-                if snap.resolved == 0 || snap.phase == 0 {
-                    continue;
-                }
-                let line = Self::render(snap);
-                if line.is_empty() {
-                    continue;
-                }
-                let mut last = state.last_printed.lock().unwrap();
-                if *last == line {
-                    // Same rendered line as before — stay quiet.
-                    continue;
-                }
-                *last = line.clone();
-                drop(last);
-                // First time we actually print, emit the unframed
-                // `aube VERSION by jdx.dev` header above the bar so
-                // the CI log shows the aube banner. Only printed
-                // once per install — `shown` flips true here.
-                if !state.shown.swap(true, Ordering::Relaxed) {
-                    let _ = writeln!(std::io::stderr(), "{}", Self::render_header());
-                }
-                let _ = writeln!(std::io::stderr(), "{line}");
-            }
-        });
-        *state.heartbeat.lock().unwrap() = Some(handle);
+            });
+        // On spawn failure (e.g. EAGAIN under thread/PID exhaustion) leave the
+        // handle `None` — the install proceeds without the cosmetic ticker.
+        *state.heartbeat.lock().unwrap() = spawned.ok();
     }
 
     pub(super) fn set_phase(&self, phase: &str) {
@@ -397,6 +417,11 @@ pub(super) struct Snap {
     pub(super) downloaded: usize,
     pub(super) bytes: u64,
     pub(super) estimated: u64,
+    /// Live count of files materialized by the link pass. Drives the
+    /// ticking `N files` count shown during the linking phase (phase 3)
+    /// when the embedder opts into the redesigned progress UX. `0` in
+    /// every other phase.
+    pub(super) files_linked: usize,
     pub(super) fetch_elapsed_ms: u64,
     /// Numerator (`reused + downloaded`) at the moment fetching
     /// started. `None` until phase=2 first fires; render layer falls

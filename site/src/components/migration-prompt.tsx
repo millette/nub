@@ -2,11 +2,10 @@
 
 import { useState } from 'react';
 
-/* Minimal fallback used only if the start.md read fails at build time, so the
-   button still copies something actionable rather than an empty string. The
-   real payload is start.md's full text, sourced from the file and passed in via
-   the `prompt` prop (see the home page) — start.md is the single source of
-   truth and the button reproduces it verbatim. */
+/* Minimal fallback used only if the `prompt` prop is missing, so the button
+   still copies something actionable rather than an empty string. The real
+   payload is the START_PROMPT constant, passed in via the `prompt` prop (see
+   the home page) — a two-sentence pointer at the adoption guide (start.md). */
 const FALLBACK_PROMPT =
   'Adopt Nub (https://nubjs.com) in this Node.js project: read https://nubjs.com/start.md and follow the steps there. The full docs are at https://nubjs.com/llms.txt.';
 
@@ -14,7 +13,7 @@ export function MigrationPrompt({
   prompt,
   className = '',
 }: {
-  /* The exact text the button copies — start.md's content, read at build time.
+  /* The exact text the button copies — the short START_PROMPT constant.
      Omitted/empty falls back to the pointer above. */
   prompt?: string;
   className?: string;

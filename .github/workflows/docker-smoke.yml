@@ -19,29 +19,42 @@ on:
       - "crates/**"
       - "runtime/**"
       - "vendor/aube/**"
+      - "vendor/libsui/**"
       - "tests/docker-smoke/**"
+      - ".dockerignore"
       - ".github/workflows/docker-smoke.yml"
   pull_request:
+    # Not part of plain `ci`: request a run with `gh pr edit <n> --add-label ci-full`. Rationale: ci.yml.
+    types: [labeled]
     branches: [main]
     paths:
       - "crates/**"
       - "runtime/**"
       - "vendor/aube/**"
+      - "vendor/libsui/**"
       - "tests/docker-smoke/**"
+      - ".dockerignore"
       - ".github/workflows/docker-smoke.yml"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event.label.name != 'ci-full' && github.event.label.name || '' }}
   cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   glibc:
     name: Docker smoke (glibc, node:22-slim)
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-latest
     # Rust compile inside Docker + the smoke install can take a while on a cold runner.
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
       - name: Build glibc image
@@ -58,10 +71,15 @@ jobs:
 
   musl:
     name: Docker smoke (musl, node:22-alpine)
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
       - name: Build musl image

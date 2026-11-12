@@ -1,0 +1,60 @@
+---
+title: Plugins
+description: Extend the Nub CLI with your own subcommands, using the same executable-name convention as git and cargo plugins.
+---
+
+Nub runs an unknown verb as a plugin. For `nub <verb>`, it finds an executable named `nub-<verb>` and runs it with the remaining arguments, the same convention as `git-foo` and `cargo-foo`.
+
+```bash
+nub changeset publish      # runs nub-changeset publish
+nub release --tag beta     # runs nub-release --tag beta
+```
+
+## Installing a plugin
+
+A plugin is any package that installs a `nub-<verb>` bin. There is no manifest and no registration step.
+
+```bash
+nub add -D nub-changeset   # ships a nub-changeset bin
+nub changeset              # now resolves and runs it
+```
+
+## Resolution
+
+Nub looks for `nub-<verb>` in two places, in order:
+
+- `node_modules/.bin`, walking up from the current directory
+- `PATH`, for a globally installed plugin
+
+Nub never looks up the bare verb.
+
+## Built-in precedence
+
+A plugin never shadows a built-in command. Nub matches `run`, `install`, `add`, and every other built-in verb before it looks for a plugin.
+
+Script names also come first. A verb that names a script in the local `package.json`, or one of `dev`, `build`, `test`, `start`, and `lint`, gets a `nub run <verb>` hint instead of a plugin lookup. Name a plugin after something that is not a script, or run it through its bin.
+
+## Writing a plugin
+
+A plugin is an executable: a JavaScript bin or a native binary. Installed bins are not transpiled, so a plugin written in TypeScript publishes its compiled output.
+
+```js title="nub-changeset"
+#!/usr/bin/env node
+const target = process.argv[2] ?? "staging";
+console.log(`releasing ${target}`);
+```
+
+A JavaScript plugin runs under Nub's runtime augmentation, as a `nub run` script does. A native plugin runs directly. Nub exits with the plugin's exit code.
+
+To run a plugin without augmentation, put `--node` before the verb. After the verb, every argument goes to the plugin untouched.
+
+```bash
+nub --node changeset       # plain Node
+nub changeset --node       # passes --node to the plugin
+```
+
+## Related
+
+- [Bin runner](/docs/nubx) — `nubx`, for running a tool by name without installing it as a subcommand.
+- [Script runner](/docs/run) — `nub run`, which shares the bin-resolution chain.
+- [Runtime](/docs/runtime) — the augmentation a JavaScript plugin inherits.

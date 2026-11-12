@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import type { Metadata } from 'next';
 import { blog } from '@/lib/source';
+import { renderInlineCode } from '@/lib/inline-code';
 
 const blogOgImage = `/og?${new URLSearchParams({ title: 'Blog', eyebrow: 'Blog' }).toString()}`;
 
@@ -23,12 +24,28 @@ export const metadata: Metadata = {
   },
 };
 
+// Newest first: by date, then by release version so same-day releases (two posts
+// sharing a `date`) still order by version rather than falling back to glob order.
+function versionRank(url: string): number {
+  const m = url.match(/nub-(\d+)-(\d+)-(\d+)/);
+  if (!m) return 0;
+  const [, major, minor, patch] = m;
+  return Number(major) * 1_000_000 + Number(minor) * 1_000 + Number(patch);
+}
+
 export default function BlogIndex() {
-  const posts = [...blog.getPages()].sort(
-    (a, b) =>
+  // `date` accepts an ISO 8601 UTC timestamp (e.g. 2026-07-07T12:00:00Z) to
+  // order same-day posts; a date-only value parses as UTC midnight. Same-day
+  // release posts tie-break by version; the URL compare is a last-resort guard
+  // against nondeterministic file order.
+  const posts = [...blog.getPages()].sort((a, b) => {
+    const byDate =
       new Date(b.data.date ?? 0).getTime() -
-      new Date(a.data.date ?? 0).getTime(),
-  );
+      new Date(a.data.date ?? 0).getTime();
+    if (byDate !== 0) return byDate;
+    const byVersion = versionRank(b.url) - versionRank(a.url);
+    return byVersion !== 0 ? byVersion : b.url.localeCompare(a.url);
+  });
 
   return (
     <div className="mx-auto max-w-3xl px-6 py-24">
@@ -53,7 +70,7 @@ export default function BlogIndex() {
               <span>{post.data.author}</span>
             </div>
             <h2 className="mt-3 font-display text-2xl font-medium leading-snug transition group-hover:text-ember md:text-3xl">
-              {post.data.title}
+              {renderInlineCode(post.data.title)}
             </h2>
             {post.data.description ? (
               <p className="mt-2 max-w-2xl text-fd-muted-foreground">

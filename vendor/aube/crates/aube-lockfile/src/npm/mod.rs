@@ -25,6 +25,7 @@ pub(crate) use layout::{
     dep_value_as_version, segments_to_install_path,
 };
 pub use read::parse;
+pub(crate) use source::local_git_source_from_resolved;
 pub use write::write;
 
 #[cfg(test)]

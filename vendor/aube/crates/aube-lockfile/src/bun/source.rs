@@ -1,7 +1,8 @@
+use super::raw::RawBunWorkspace;
 use crate::{Error, GitSource, LocalSource, RemoteTarballSource};
 use aube_util::path::normalize_lexical;
-use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// Extract the alias name bun uses as the hoist key. bun's `packages`
 /// key is `<alias_name>` hoisted or `<parent>/<alias_name>` nested,
@@ -33,11 +34,16 @@ pub(super) fn bun_key_to_alias_name(key: &str) -> String {
 /// The alias name wins as `LockedPackage.name` whenever it differs
 /// from the ident's name (npm-alias case). `alias_of` records the
 /// registry-side name only then.
+///
+/// `workspace_dirs` is the lockfile's own `workspaces` map keyed by
+/// member directory — the authoritative answer to "is this
+/// `workspace:` tail a directory?", which no lexical test can give.
 pub(super) fn classify_bun_ident(
     alias_name: &str,
     raw_name: &str,
     raw_version: &str,
     integrity: Option<&str>,
+    workspace_dirs: &BTreeSet<&str>,
 ) -> Result<(String, String, Option<LocalSource>, Option<String>), Error> {
     // npm-alias tail: bun writes the registry identity into the ident,
     // so the raw name is the real registry name and the alias key is
@@ -55,13 +61,20 @@ pub(super) fn classify_bun_ident(
         // `workspace:*` / `workspace:^` / `workspace:~` are version-
         // range selectors, not directory paths — a `PathBuf::from("*")`
         // would silently become `{project_root}/*` under any caller
-        // that does `project_root.join(link.path())`. Bun's `packages`
-        // entries for workspace members use root-relative paths like
-        // `workspace:packages/lib`, so keep slash-bearing tails as paths.
-        // Otherwise fall back to `.` so range selectors point at the
-        // workspace root and the caller resolves the actual location
-        // from the graph's workspace map.
-        let is_path = rel.starts_with('.') || rel.starts_with('/') || rel.contains('/');
+        // that does `project_root.join(link.path())`. A selector falls
+        // back to `.` so it points at the workspace root and the caller
+        // resolves the actual location from the graph's workspace map;
+        // a directory tail is kept verbatim.
+        //
+        // Ask the lockfile's own `workspaces` map first — a member at a
+        // TOP-LEVEL directory has no separator in its tail
+        // (`workspace:plugin`), so the lexical shape alone reads it as a
+        // selector and links the member to the workspace ROOT, an
+        // install that exits 0 having resolved the wrong package.
+        let is_path = workspace_dirs.contains(rel)
+            || rel.starts_with('.')
+            || rel.starts_with('/')
+            || rel.contains('/');
         let path_buf = std::path::PathBuf::from(if rel.is_empty() || !is_path { "." } else { rel });
         return Ok((
             name,
@@ -150,39 +163,76 @@ pub(super) fn classify_bun_ident(
     Ok((name, raw_version.to_string(), None, alias_of))
 }
 
-pub(super) fn rebase_workspace_scoped_local_source(
+/// Rebase a member's tarball onto the project root, where the graph keeps
+/// local paths. bun spells a tarball as the member that declares it does
+/// (`../../vendor/x.tgz`), under that member's scope or, once hoisted, under
+/// the bare name. A `file:` directory needs nothing: bun writes those from the
+/// workspace root (`file:../shared`, `file:apps/sibling`) whichever member
+/// declares them. Measured on bun 1.2, 1.3 and 1.4.
+pub(super) fn rebase_member_tarball(
     key: &str,
     local: LocalSource,
+    workspaces: &BTreeMap<String, RawBunWorkspace>,
     workspace_scopes: &[(&str, &str)],
 ) -> LocalSource {
-    let Some(local_path) = local.path() else {
+    let LocalSource::Tarball(path) = &local else {
         return local;
     };
-    // Bun may write workspace-name-scoped local entries with
-    // root-relative bare paths (`vendor/local-dir`) or
-    // importer-relative climbs (`../../vendor/local.tgz`). Only the
-    // latter needs rebasing to project-root form.
-    if !local_path
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
-        return local;
+    let member = workspace_scopes
+        .iter()
+        .find(|(name, _)| {
+            key.strip_prefix(*name)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+        .map(|(_, ws_path)| *ws_path)
+        .or_else(|| hoisted_tarball_member(key, path, workspaces));
+    match member {
+        Some(ws_path) => LocalSource::Tarball(normalize_lexical(&Path::new(ws_path).join(path))),
+        None => local,
     }
-    let Some((_, ws_path)) = workspace_scopes.iter().find(|(name, _)| {
-        key.strip_prefix(*name)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-    }) else {
-        return local;
+}
+
+/// The member a hoisted tarball's path is relative to. Several manifests can
+/// spell the same path for different archives, and bun then installs one of
+/// them for all: a concrete dependency over a peer and, within each, the
+/// root's, else the member whose package name sorts first (measured on bun
+/// 1.2, 1.3 and 1.4; workspace path and declaration order do not matter). The
+/// root's spelling is already project-relative.
+fn hoisted_tarball_member<'a>(
+    name: &str,
+    path: &Path,
+    workspaces: &'a BTreeMap<String, RawBunWorkspace>,
+) -> Option<&'a str> {
+    let spec = format!("file:{}", path.to_string_lossy());
+    let concrete = |ws: &RawBunWorkspace| {
+        [
+            &ws.dependencies,
+            &ws.dev_dependencies,
+            &ws.optional_dependencies,
+        ]
+        .iter()
+        .any(|deps| deps.get(name) == Some(&spec))
     };
-    let rebased = normalize_lexical(&Path::new(ws_path).join(local_path));
-    match local {
-        LocalSource::Directory(_) => LocalSource::Directory(rebased),
-        LocalSource::Tarball(_) => LocalSource::Tarball(rebased),
-        LocalSource::Link(_) => LocalSource::Link(rebased),
-        LocalSource::Portal(_) => LocalSource::Portal(rebased),
-        LocalSource::Exec(_) => LocalSource::Exec(rebased),
-        LocalSource::Git(_) | LocalSource::RemoteTarball(_) => local,
-    }
+    let peer = |ws: &RawBunWorkspace| {
+        ws.extra
+            .get("peerDependencies")
+            .and_then(|peers| peers.get(name))
+            .and_then(serde_json::Value::as_str)
+            == Some(spec.as_str())
+    };
+    let pick = |declares: &dyn Fn(&RawBunWorkspace) -> bool| {
+        workspaces
+            .iter()
+            .filter(|(_, ws)| declares(ws))
+            .min_by_key(|(ws_path, ws)| {
+                let ws_name = ws.extra.get("name").and_then(serde_json::Value::as_str);
+                (!ws_path.is_empty(), ws_name)
+            })
+            .map(|(ws_path, _)| ws_path.as_str())
+    };
+    pick(&concrete)
+        .or_else(|| pick(&peer))
+        .filter(|ws_path| !ws_path.is_empty())
 }
 
 pub(super) fn split_committish(spec: &str) -> (String, Option<String>) {
@@ -223,10 +273,16 @@ pub(super) fn bin_value_to_map(
 /// We walk up the key's ancestors, first checking the package's own nested
 /// scope then each ancestor's, finally falling back to the hoisted entry
 /// at just the bare `dep_name`.
+///
+/// `contains` abstracts the key set being walked: the reader passes the
+/// parsed `key_info` for normal resolution, and (under
+/// `strict_unsupported_source`) re-walks with the unsupported-entry set
+/// so an edge whose target was withheld as unsupported is distinguished
+/// from a genuinely absent one.
 pub(super) fn resolve_nested_bun(
     pkg_key: &str,
     dep_name: &str,
-    key_info: &BTreeMap<String, (String, String)>,
+    contains: impl Fn(&str) -> bool,
 ) -> Option<String> {
     let mut base = pkg_key.to_string();
     loop {
@@ -235,7 +291,7 @@ pub(super) fn resolve_nested_bun(
         } else {
             format!("{base}/{dep_name}")
         };
-        if key_info.contains_key(&candidate) {
+        if contains(&candidate) {
             return Some(candidate);
         }
         if base.is_empty() {
@@ -274,21 +330,21 @@ pub(super) fn resolve_workspace_dep(
     ws_path: &str,
     ws_name: Option<&str>,
     dep_name: &str,
-    key_info: &BTreeMap<String, (String, String)>,
+    contains: impl Fn(&str) -> bool,
 ) -> Option<String> {
     if let Some(ws_name) = ws_name {
         let ws_specific = format!("{ws_name}/{dep_name}");
-        if key_info.contains_key(&ws_specific) {
+        if contains(&ws_specific) {
             return Some(ws_specific);
         }
     }
     if !ws_path.is_empty() {
         let ws_specific = format!("{ws_path}/{dep_name}");
-        if key_info.contains_key(&ws_specific) {
+        if contains(&ws_specific) {
             return Some(ws_specific);
         }
     }
-    if key_info.contains_key(dep_name) {
+    if contains(dep_name) {
         return Some(dep_name.to_string());
     }
     None

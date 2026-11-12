@@ -3,7 +3,7 @@
 This page lists every security-relevant feature in aube, its default, and the
 one-line config to turn it on or off.
 
-To report a vulnerability, see the [security policy](https://github.com/jdx/aube/security/policy).
+To report a vulnerability, see the [security policy](https://github.com/aubepkg/aube/security/policy).
 
 ## The `paranoid` switch
 
@@ -18,15 +18,17 @@ configured individually:
 
 - [`jailBuilds = true`](#jailed-lifecycle-scripts)
 - [`trustPolicy = no-downgrade`](#trust-policy) (overrides explicit `off`)
-- `minimumReleaseAgeStrict = true` — turns the age gate into a hard fail
-  instead of "fall back to the lowest satisfying version"
-- `strictStoreIntegrity = true` — fail when a tarball ships without
-  `dist.integrity` instead of warning
-- `strictDepBuilds = true` — fail the install when a dep has unreviewed
-  build scripts instead of silently skipping
+- [`minimumReleaseAgeStrict = true`](#minimum-release-age) — turns the age
+  gate into a hard fail instead of "fall back to the lowest satisfying
+  version"
+- [`strictStoreIntegrity = true`](/settings/#setting-strictstoreintegrity) —
+  fail when a tarball ships without `dist.integrity` instead of warning
+- [`strictDepBuilds = true`](/settings/#setting-strictdepbuilds) — fail the
+  install when a dep has unreviewed build scripts instead of silently
+  skipping them
 - [`advisoryCheck = required`](#typosquat-and-impersonation-protection) —
-  fail `aube add` if OSV can't be reached instead of falling back to
-  download-count signal alone
+  fail any live-API OSV check when OSV can't be reached, instead of warning
+  and continuing
 
 Use it when you want maximum protection without listing each setting.
 
@@ -53,43 +55,50 @@ aube approve-builds
 Root-package lifecycle scripts (your own project's) still run normally; only
 dependency scripts need approval.
 
+For a Git dependency that tracks a branch, approve the package and repository
+URL rather than a resolved commit. The rule remains limited to that repository;
+a package-name-only rule never approves Git-sourced code:
+
+```yaml
+allowBuilds:
+  native-addon@git+https://github.com/acme/native-addon.git: true
+```
+
 Settings: [`allowBuilds`](/settings/#setting-allowbuilds). Install adds
 unreviewed build packages to `aube-workspace.yaml` (or `pnpm-workspace.yaml`
 if one already exists) as `false`; approving them flips the entry to `true`.
 
 ### Suspicious-script content sniff
 
-Before the warm-up nudge to run `aube approve-builds`, aube runs a
-small pattern matcher against each unreviewed dep's `preinstall` /
-`install` / `postinstall` script bodies and surfaces a
-`WARN_AUBE_SUSPICIOUS_LIFECYCLE_SCRIPT` for any that match a
-known-dangerous shape:
+Before nudging you to run `aube approve-builds`, aube runs a small pattern
+matcher against each unreviewed dep's `preinstall` / `install` /
+`postinstall` script bodies and surfaces a
+`WARN_AUBE_SUSPICIOUS_LIFECYCLE_SCRIPT` for any that match a known-dangerous
+shape:
 
 - `curl … | sh` / `wget … | bash` — fetch-and-pipe-to-shell.
 - `eval(atob(…))` / `Function(atob(…))` / `eval(Buffer.from(…))` —
-  base64-decode-then-evaluate. Common dropper shape.
-- Reads of `~/.ssh`, `~/.aws`, `~/.npmrc`, `~/.config/gh` —
-  credential files a lifecycle script has no business touching.
-- `process.env.*TOKEN`, `*SECRET`, `*API_KEY`, etc. — secret-shaped
-  env vars exfilled from CI.
-- Discord webhooks, Telegram bot API, OAST collaborator hosts —
-  known exfil channels.
+  base64-decode-then-evaluate, a common dropper shape.
+- Reads of `~/.ssh`, `~/.aws`, `~/.npmrc`, `~/.config/gh` — credential files
+  a lifecycle script has no business touching.
+- `process.env.*TOKEN`, `*SECRET`, `*API_KEY`, etc. — secret-shaped env vars
+  exfiltrated from CI.
+- Discord webhooks, Telegram bot API, OAST collaborator hosts — known exfil
+  channels.
 - `http://1.2.3.4/…` bare-IP HTTP targets.
 
-The sniff is **advisory** — it never blocks an install or write.
-The `allowBuilds` allowlist remains the only gate on whether
-scripts actually execute. The signal is intended to give the user
-something more than `name@version` to judge by when deciding
-whether to approve a build. `aube approve-builds` repeats the same
-warnings inline next to each picker entry, and `aube
-ignored-builds` lists them under each `name@version` line.
+The sniff is **advisory** — it never blocks an install or write. The
+`allowBuilds` allowlist remains the only gate on whether scripts actually
+execute; the sniff just gives you more than `name@version` to judge by when
+deciding whether to approve a build. `aube approve-builds` repeats the same
+warnings inline next to each picker entry, and `aube ignored-builds` lists
+them under each `name@version` line.
 
-False positives are possible (an SDK that legitimately hits a
-Discord webhook from a `postinstall` would flag), but lifecycle
-script bodies are short and almost never contain bare
-`curl … | sh` legitimately. To bypass for a known-good package,
-add it to `allowBuilds: true` once you've inspected the script —
-the warning has done its job.
+False positives are possible (an SDK that legitimately hits a Discord
+webhook from a `postinstall` would flag), but lifecycle script bodies are
+short and almost never contain a bare `curl … | sh` legitimately. Once
+you've inspected a flagged script and decided it's fine, add the package to
+`allowBuilds: true` — the warning has done its job.
 
 ## Jailed lifecycle scripts
 
@@ -123,7 +132,8 @@ Full reference: [Jailed builds](/package-manager/jailed-builds).
 
 `trustPolicy = no-downgrade` blocks installs of a version that carries weaker
 trust evidence than any earlier-published version of the same package. aube
-only counts the structured metadata shape npm emits after registry-side checks:
+recognizes three tiers of evidence, strongest first, and only counts the
+structured metadata shapes npm emits after registry-side checks:
 
 1. **npm staged publish approval** — package metadata carries an `approver`
    field from the registry-side approval flow.
@@ -136,6 +146,10 @@ only counts the structured metadata shape npm emits after registry-side checks:
 This install-time policy validates the registry metadata shape; it does not
 cryptographically verify the attached attestation bundle.
 
+The policy runs when aube resolves a package version. Versions already present
+in the active lockfile are trusted, so frozen and repeat installs do not
+re-fetch publishing evidence for packages the project has already accepted.
+
 A trust downgrade may indicate a supply-chain incident: publisher account
 takeover, repository tampering, or a malicious co-maintainer publishing
 without the original CI flow.
@@ -144,19 +158,30 @@ without the original CI flow.
 trustPolicy: no-downgrade
 ```
 
-Exempt specific packages or versions when needed (only exact versions, no
-ranges):
+Exempt specific packages or versions when needed:
 
 ```yaml
 trustPolicyExclude:
-  - "@vendor/legacy-pkg"            # all versions
-  - "old-thing@1.0.0"                # one version
-  - "things@1.0.0 || 1.0.1"          # version union
-  - "is-*"                           # name glob (no version)
+  - "@vendor/legacy-pkg"       # every version of one package
+  - "old-thing@1.0.0"          # one exact version
+  - "things@^1.0.0 || >=2 <3"  # union of semver ranges
+  - "is-*"                     # name glob (globs take no version)
 ```
+
+Version selectors are npm-style semver ranges.
 
 Default: `no-downgrade`. Set `trustPolicy: off` to disable, or use
 `trustPolicyExclude` for per-package opt-outs.
+
+aube also ships a small built-in exclude list for well-known packages whose
+maintainers legitimately publish provenance-inconsistent releases (e.g.
+maintaining multiple major-version lines and backporting to older ones without
+attestation), so common installs don't fail on a known-benign downgrade. Your
+own `trustPolicyExclude` entries are added on top of these defaults.
+
+See [Trust policy downgrades](/trust-policy-exceptions) for an investigation
+checklist, guidance for reporting packaging failures upstream, and the
+dynamically generated list of built-in exceptions.
 
 Settings: [`trustPolicy`](/settings/#setting-trustpolicy),
 [`trustPolicyExclude`](/settings/#setting-trustpolicyexclude),
@@ -164,8 +189,9 @@ Settings: [`trustPolicy`](/settings/#setting-trustpolicy),
 
 ## Minimum release age
 
-Wait a configurable period before installing newly published versions. Catches
-typo-squat and dependency-confusion attacks that get unpublished within hours.
+Wait a configurable period before installing newly published versions. This
+24-hour release quarantine is intentionally separate from the longer
+package-name quarantine used for slopsquatting protection.
 
 ```yaml
 minimumReleaseAge: 4320  # 3 days
@@ -183,16 +209,15 @@ Settings: [`minimumReleaseAge`](/settings/#setting-minimumreleaseage),
 
 ## Typosquat and impersonation protection
 
-`aube add` checks every package you name on the command line *and* the
-full post-resolve transitive closure against [OSV](https://osv.dev) for
-`MAL-*` malicious-package advisories — same check `aube update` and any
-other install path runs where the resolver picks a version that wasn't
-already pinned by the lockfile. Plain reinstalls (the lockfile was
-authoritative) skip the live API for latency; an opt-in local mirror
-(see [Install-time OSV check](#install-time-osv-check) below) covers
-that path.
+`aube add` checks every package you name on the command line — and, after
+resolution, the full transitive closure — against [OSV](https://osv.dev) for
+`MAL-*` malicious-package advisories. The same check runs on `aube update`
+and on any install where the resolver picks a version the lockfile didn't
+already pin. Plain reinstalls (where the lockfile was authoritative) skip
+the live API for latency; two opt-in local backends cover that path — see
+[Install-time OSV check](#install-time-osv-check) below.
 
-Two signals, with different response levels:
+Four signals, with different response levels:
 
 **Known-malicious advisories.** aube batch-queries [OSV](https://osv.dev) for
 `MAL-*` advisories on every name about to be added. A hit fails the install
@@ -201,6 +226,10 @@ the OSV API can't be reached, the default (`advisoryCheck: on`) warns and
 continues; `advisoryCheck: required` upgrades that to a fail-closed
 `ERR_AUBE_ADVISORY_CHECK_FAILED` so CI can tell a network outage from a
 confirmed-malicious advisory.
+
+**Similar package name.** For each requested package subject to the reputation gates, aube verifies that the name exists before comparing it with a monthly snapshot of the 100,000 most-downloaded npm packages. Exempt names skip this preflight and are checked during normal resolution. A missing name fails with `ERR_AUBE_PACKAGE_NOT_FOUND` without a confirmation prompt; for a typo on the public npm registry, the error may include a suggestion. Unscoped packages are compared only with unscoped packages, and packages in different scopes are compared by their full names. Packages within the same scope are not compared because npm scopes are owned namespaces. This catches existing lookalikes such as `lodahs` → `lodash` without treating packages controlled by one scope owner as impersonations.
+
+An existing lookalike shows a “did you mean?” prompt in interactive sessions. Non-interactive sessions fail with `ERR_AUBE_SIMILAR_PACKAGE_NAME` unless `--allow-similar-name` is passed. The popularity corpus contains names only, is compressed into release binaries, and is generated from the continuously updated ecosyste.ms npm registry index rather than an infrequently published npm data package.
 
 **Low download count.** A typosquat or impersonation has approximately zero
 installs on day one regardless of how cleverly it's named, so a
@@ -217,17 +246,36 @@ aube add supabase-javascript
 
 In non-interactive contexts the prompt becomes a hard refusal with
 `ERR_AUBE_LOW_DOWNLOAD_PACKAGE` unless `--allow-low-downloads` is passed.
+Packages already present in the active lockfile are trusted for this
+download-count check, regardless of which supported lockfile format the
+project uses. Lockfile membership does not bypass the OSV check.
 
-**Private packages skip both gates automatically.** Any package routed
+**New package name.** Before adding a direct dependency, aube reads npm's
+`time.created` timestamp and challenges names registered within
+`minimumPackageAge` (30 days by default). Interactive sessions require
+confirmation; non-interactive sessions fail with
+`ERR_AUBE_NEW_PACKAGE_NAME` unless `--allow-new-name` is passed. Packages
+already present in the active lockfile and names matched by
+`allowedUnpopularPackages` are trusted.
+Missing or unavailable creation-time metadata fails closed with
+`ERR_AUBE_PACKAGE_AGE_CHECK_FAILED`.
+`--allow-low-downloads` bypasses all three reputation challenges after the
+package has been verified out of band.
+
+```yaml
+minimumPackageAge: 43200 # 30 days
+```
+
+**Private packages skip all four gates automatically.** Any package routed
 through a non-`registry.npmjs.org` registry — whether by a scoped
 override (`@myorg:registry=https://npm.internal.example/`) or by
 replacing the default `registry=` URL outright — is exempted from
-the OSV check and the downloads gate, because npmjs has no signal on
+the OSV check and the reputation gates, because npmjs has no signal on
 it. Workspace deps and git/local specs are also skipped.
 
 For names that *do* route through public npmjs but are known-internal
 (e.g. you publish a low-traffic helper under your own brand), list
-them in `allowedUnpopularPackages` to skip the downloads gate alone:
+them in `allowedUnpopularPackages` to skip all three reputation gates:
 
 ```yaml
 advisoryCheck: on            # default; fail open on network error
@@ -248,34 +296,47 @@ Settings: [`advisoryCheck`](/settings/#setting-advisorycheck),
 
 ## Install-time OSV check
 
-OSV `MAL-*` checks are routed three ways post-resolve so the freshest
-signal lands when it matters most without paying for a per-install
+After resolution, every install picks exactly one OSV `MAL-*` backend, so
+the freshest signal lands when it matters most without paying a per-install
 network round-trip when it doesn't:
 
-| Install path                                      | Backend       | Setting                       |
-| ------------------------------------------------- | ------------- | ----------------------------- |
-| `aube add`, `aube update`                         | Live API      | `advisoryCheck` (default `on`)|
-| Missing lockfile / resolver picked new version    | Live API      | `advisoryCheck` (default `on`)|
-| `advisoryCheckEveryInstall = true`                | Live API      | `advisoryCheck` (default `on`)|
-| Plain reinstall (lockfile authoritative)          | Local mirror  | `advisoryCheckOnInstall` (default `off`) |
-| Anything else                                     | No check      | —                             |
+| Install path                                   | Backend         | Setting                                   |
+| ---------------------------------------------- | --------------- | ----------------------------------------- |
+| `aube add`, `aube update`                      | Live API        | `advisoryCheck` (default `on`)            |
+| Missing lockfile / resolver picked new version | Live API        | `advisoryCheck` (default `on`)            |
+| `advisoryCheckEveryInstall = true`             | Live API        | `advisoryCheck` (default `on`)            |
+| Plain reinstall (lockfile authoritative)       | Bloom prefilter | `advisoryBloomCheck` (default `off`)      |
+| Plain reinstall, bloom disabled                | Local mirror    | `advisoryCheckOnInstall` (default `off`)  |
+| Plain reinstall, both disabled                 | No check        | —                                         |
 
-The mirror lives at `$XDG_CACHE_HOME/aube/osv/npm/` (the bulk zip from
-`osv-vulnerabilities.storage.googleapis.com/npm/all.zip`, roughly tens
-of MB) and lazily refreshes with an ETag-conditional GET every 24
-hours. Hits map to the same `ERR_AUBE_MALICIOUS_PACKAGE` exit as the
-live-API gate.
+The two local backends cover plain reinstalls without a live round-trip:
 
-Trade-off: the mirror lags reality by up to ~24h. An advisory published
-in the last day won't be in your local index unless a refresh happens to
-fall after it. Fresh-resolution installs always go through the live API
-so that lag doesn't matter for new picks; plain reinstalls trade
-sub-day staleness for sub-millisecond lookups.
+**Bloom prefilter** (`advisoryBloomCheck`) downloads a ~380 KB bloom filter
+built from OSV's malicious-package archive (regenerated upstream every 10
+minutes), probes the resolved graph against it, and escalates only the hits
+(~0.1% false-positive rate) to the live API for exact `(name, version)`
+confirmation. A typical lockfile costs zero or one extra live-API round
+trip per install. When both local backends are enabled, the bloom wins —
+it's far cheaper on the wire and its confirmed hits go through the same
+live-API oracle.
+
+**Local mirror** (`advisoryCheckOnInstall`) keeps the bulk zip from
+`osv-vulnerabilities.storage.googleapis.com/npm/all.zip` (roughly tens of
+MB) at `$XDG_CACHE_HOME/aube/osv/npm/`, lazily refreshed with an
+ETag-conditional GET every 24 hours. Lookups are sub-millisecond, but the
+index lags reality by up to ~24h — an advisory published in the last day
+won't be in it unless a refresh happens to fall after it. Fresh-resolution
+installs always go through the live API, so that lag never affects new
+picks.
+
+Confirmed hits from any backend fail the install with the same
+`ERR_AUBE_MALICIOUS_PACKAGE` exit.
 
 ```yaml
-# Default: live API on aube add / update / fresh-resolution. Mirror
-# disabled — plain reinstalls skip OSV entirely.
+# Default: live API on aube add / update / fresh-resolution.
+# Plain reinstalls skip OSV entirely.
 advisoryCheck: on
+advisoryBloomCheck: off
 advisoryCheckOnInstall: off
 advisoryCheckEveryInstall: false
 ```
@@ -287,23 +348,23 @@ advisoryCheckEveryInstall: true
 ```
 
 ```yaml
-# Cheap fallback: live API on fresh-resolution, local mirror covers
-# plain reinstalls so even CI re-runs see SOME OSV coverage.
+# Cheap always-on coverage: bloom prefilter covers plain reinstalls
+# with a ~380 KB download; hits escalate to the live API.
 advisoryCheck: on
-advisoryCheckOnInstall: on
+advisoryBloomCheck: on
 ```
 
-Refresh-failure semantics for the mirror:
+Both local backends share the same refresh-failure semantics:
 
-- `advisoryCheckOnInstall = on`: `WARN_AUBE_OSV_MIRROR_REFRESH_FAILED`,
-  install continues against the prior on-disk index (or empty on first
-  sync).
-- `advisoryCheckOnInstall = required`: mirror refresh failures map to
-  `ERR_AUBE_ADVISORY_CHECK_FAILED`. Use when a stale or unreachable
-  mirror should block.
+- `on`: warn (`WARN_AUBE_OSV_BLOOM_REFRESH_FAILED` /
+  `WARN_AUBE_OSV_MIRROR_REFRESH_FAILED`) and continue against the prior
+  on-disk copy (or empty on first sync).
+- `required`: refresh failures map to `ERR_AUBE_ADVISORY_CHECK_FAILED`. Use
+  in hardened CI where a stale or unreachable index should block.
 
 Settings:
 [`advisoryCheck`](/settings/#setting-advisorycheck),
+[`advisoryBloomCheck`](/settings/#setting-advisorybloomcheck),
 [`advisoryCheckOnInstall`](/settings/#setting-advisorycheckoninstall),
 [`advisoryCheckEveryInstall`](/settings/#setting-advisorycheckeveryinstall).
 
@@ -345,10 +406,11 @@ scrubbed from the script environment unless explicitly granted via
 
 ## Pluggable security scanner
 
-`securityScanner` runs a [Bun-compatible security scanner](https://bun.sh/docs/pm/security-scanner-api)
-against the resolved install graph. Point the setting at the same
-npm package you'd put in Bun's `bunfig.toml#install.security.scanner`
-and aube loads it through a `node` bridge — the
+`securityScanner` runs a
+[Bun-compatible security scanner](https://bun.sh/docs/pm/security-scanner-api)
+against the resolved install graph. Point the setting at the same npm
+package you'd put in Bun's `bunfig.toml#install.security.scanner` and aube
+loads it through a `node` bridge — the
 [oven-sh template](https://github.com/oven-sh/security-scanner-template)
 and [`@socketsecurity/bun-security-scanner`](https://github.com/SocketDev/bun-security-scanner)
 both run unchanged.
@@ -358,11 +420,10 @@ both run unchanged.
 securityScanner: "@acme/bun-security-scanner"
 ```
 
-The scanner fires post-resolve, sees the full transitive graph
-with resolved versions, and **fails closed** on any scanner
-failure (missing `node`, unresolvable module, timeout, etc.).
-Requires Node 22.6+. Set `securityScanner: ""` to disable when
-bootstrapping.
+The scanner fires post-resolve, sees the full transitive graph with
+resolved versions, and **fails closed** on any scanner failure (missing
+`node`, unresolvable module, timeout, etc.). Requires Node 22.6+. Set
+`securityScanner: ""` to disable when bootstrapping.
 
 Full reference: [Security scanner](/package-manager/security-scanner).
 
@@ -391,7 +452,7 @@ allowBuilds:
   # ...whatever your project actually needs to build
 ```
 
-`trustPolicy=no-downgrade` and `minimumReleaseAge: 1440` (24h) are already
+`trustPolicy: no-downgrade` and `minimumReleaseAge: 1440` (24h) are already
 default-on; `paranoid: true` adds the rest of the bundle on top. Pair this
 with `aube audit` in CI so a newly disclosed CVE fails the build instead of
 silently shipping.

@@ -8,16 +8,20 @@
 //!   workspace-level mutation.
 //! - [`mutations`] — the domain-specific mutations: `allowBuilds`
 //!   and `patchedDependencies`.
-//! - [`yaml_patch`] — comment-preserving diff-and-apply on top of
-//!   `yamlpatch`, with a manual injector for new sub-mappings (which
-//!   `yamlpatch::Op::Add` mishandles).
+//! - `yaml_patch` — optional comment-preserving diff-and-apply on top
+//!   of `yamlpatch`, with a manual injector for new sub-mappings (which
+//!   `yamlpatch::Op::Add` mishandles). Enabled by the
+//!   `workspace-yaml-preserve` feature.
 //!
 //! The submodules are private; the public API is re-exported from
 //! this module so callers continue to use `aube_manifest::workspace::X`.
 
+use std::path::{Path, PathBuf};
+
 mod config;
 mod edits;
 mod mutations;
+#[cfg(feature = "workspace-yaml-preserve")]
 mod yaml_patch;
 
 pub use config::{
@@ -26,12 +30,54 @@ pub use config::{
     workspace_yaml_target,
 };
 pub use edits::{
-    edit_setting_map, edit_workspace_yaml, remove_map_entry, remove_setting_entry, upsert_map_entry,
+    edit_setting_map, edit_workspace_yaml, read_workspace_yaml_string_list, remove_map_entry,
+    remove_setting_entry, set_workspace_yaml_string_list, upsert_map_entry,
 };
 pub use mutations::{
     ALLOW_BUILDS_REVIEW_PLACEHOLDER, add_to_allow_builds, remove_workspace_patched_dependency,
     set_allow_builds, upsert_workspace_patched_dependency,
 };
+
+/// Walk upward from `start` to the nearest workspace root: an ancestor (or
+/// `start` itself) holding a workspace yaml from [`workspace_yaml_names`], or a
+/// `package.json` with a `workspaces` field (npm / yarn / bun). Uncached.
+///
+/// Any workspace yaml is a hard boundary, matching pnpm: a file with no
+/// `packages:` list configures a single-package workspace rather than meaning
+/// "keep walking to an enclosing one". The walk stops at `$HOME` so a stray
+/// command in an empty scratch dir never attaches to a workspace above it.
+pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    let stop = aube_util::env::home_dir();
+    for dir in start.ancestors() {
+        if workspace_yaml_existing(dir).is_some() {
+            return Some(dir.to_path_buf());
+        }
+        let pkg = dir.join("package.json");
+        if pkg.is_file() && package_json_has_workspaces(&pkg) {
+            return Some(dir.to_path_buf());
+        }
+        if stop.as_deref() == Some(dir) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Shape-only check for a `package.json`'s `workspaces` field, skipping the
+/// full `PackageJson` parse for every ancestor in the walk.
+fn package_json_has_workspaces(path: &Path) -> bool {
+    #[derive(serde::Deserialize)]
+    struct ShapeOnly {
+        #[serde(default)]
+        workspaces: Option<serde::de::IgnoredAny>,
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    serde_json::from_slice::<ShapeOnly>(&bytes)
+        .map(|s| s.workspaces.is_some())
+        .unwrap_or(false)
+}
 
 #[cfg(test)]
 mod tests {
@@ -538,6 +584,39 @@ updateConfig:
     }
 
     #[test]
+    fn edit_workspace_yaml_invalidates_loaded_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aube-workspace.yaml");
+        std::fs::write(&path, "catalog:\n  is-odd: 0.1.2\n").unwrap();
+
+        let before = WorkspaceConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            before.catalog.get("is-odd").map(String::as_str),
+            Some("0.1.2")
+        );
+
+        edit_workspace_yaml(&path, |map| {
+            let catalog = map
+                .get_mut(yaml_serde::Value::String("catalog".to_string()))
+                .and_then(yaml_serde::Value::as_mapping_mut)
+                .unwrap();
+            catalog.insert(
+                yaml_serde::Value::String("is-odd".to_string()),
+                yaml_serde::Value::String("3.0.1".to_string()),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let after = WorkspaceConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            after.catalog.get("is-odd").map(String::as_str),
+            Some("3.0.1")
+        );
+    }
+
+    #[cfg(feature = "workspace-yaml-preserve")]
+    #[test]
     fn edit_workspace_yaml_preserves_comments_around_unchanged_keys() {
         // The whole point of going through yamlpatch: a structural
         // change to one key must not strip comments attached to keys
@@ -584,6 +663,7 @@ allowBuilds:
         );
     }
 
+    #[cfg(feature = "workspace-yaml-preserve")]
     #[test]
     fn upsert_workspace_patched_dependency_preserves_comments_on_real_change() {
         // patch-commit on a workspace yaml that already documents
@@ -827,6 +907,7 @@ patchedDependencies:
         );
     }
 
+    #[cfg(feature = "workspace-yaml-preserve")]
     #[test]
     fn remove_workspace_patched_dependency_preserves_comments_on_real_remove() {
         // Removing one patch entry from a multi-entry list must keep
@@ -851,6 +932,49 @@ patchedDependencies:
         assert!(
             !written.contains("a@1.0.0"),
             "removed entry still present:\n{written}"
+        );
+    }
+
+    #[test]
+    fn workspace_yaml_string_list_read_set_roundtrip_and_preserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-workspace.yaml");
+        std::fs::write(&path, "packages:\n  - 'src/*'\n").unwrap();
+
+        // Absent key reads empty.
+        assert!(read_workspace_yaml_string_list(&path, "minimumReleaseAgeExclude").is_empty());
+
+        // Set creates the sequence key; read returns it; unrelated keys survive.
+        set_workspace_yaml_string_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &["caniuse-lite@1.0.0".to_string(), "vite@6.0.0".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            read_workspace_yaml_string_list(&path, "minimumReleaseAgeExclude"),
+            vec!["caniuse-lite@1.0.0", "vite@6.0.0"]
+        );
+        let cfg = WorkspaceConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            cfg.minimum_release_age_exclude.as_deref(),
+            Some(["caniuse-lite@1.0.0".to_string(), "vite@6.0.0".to_string()].as_slice())
+        );
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("src/*"),
+            "packages lost"
+        );
+
+        // Replace semantics: set overwrites the whole sequence (canonical form).
+        set_workspace_yaml_string_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &["caniuse-lite@1.0.0 || 2.0.0".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            read_workspace_yaml_string_list(&path, "minimumReleaseAgeExclude"),
+            vec!["caniuse-lite@1.0.0 || 2.0.0"]
         );
     }
 }

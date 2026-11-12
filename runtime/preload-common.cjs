@@ -1,11 +1,11 @@
 // Shared preload machinery for BOTH tiers — CommonJS, zero top-level await.
 //
-// The fast tier (Node 22.15+) loads this from a `--require` CJS preload
-// (preload.cjs) so Node keeps its synchronous `Module.runMain` CJS entry path
+// The fast tier (Node 22.15+, minus 23.0–23.4) loads this from a `--require` CJS
+// preload (preload.cjs) so Node keeps its synchronous `Module.runMain` CJS entry path
 // (top-level `executionAsyncId()===1`, sync exception origin, `require.main.id`
 // `'.'`, `module.parent` `null`) — all of which the old `--import` ESM preload
 // broke by forcing eager ESM-loader init that routed even a CJS entry through the
-// async ESM module-job (R1). The compat tier (18.19–22.14) loads this from its
+// async ESM module-job (R1). The compat tier (18.19–22.14 and 23.0–23.4) loads this from its
 // async `--import` preload.mjs and reuses the same hook/require/watch/Temporal
 // logic; only hook REGISTRATION differs (sync `module.registerHooks` on the fast
 // tier vs async `module.register` loader worker on compat), which each entry owns.
@@ -15,10 +15,129 @@
 // on the fast tier; the compat entry passes its already-imported core bindings in
 // (it imported them as ESM), so this module never require()s the core there.
 
-const module_ = require("node:module");
-const { readdirSync } = require("node:fs");
-const { fileURLToPath, pathToFileURL } = require("node:url");
-const { join, dirname, extname: pathExtname } = require("node:path");
+const {
+  ArrayIsArray,
+  ArrayPrototypeIncludes,
+  ArrayPrototypeSome,
+  ArrayPrototypePush,
+  ArrayPrototypeSplice,
+  Boolean,
+  Date,
+  JSONParse,
+  Number,
+  ObjectCreate,
+  ObjectDefineProperty,
+  ObjectFreeze,
+  ObjectGetOwnPropertyNames,
+  ObjectGetOwnPropertySymbols,
+  ObjectHasOwn,
+  ObjectKeys,
+  Promise,
+  PromisePrototypeThen,
+  PromiseResolve,
+  ReflectApply,
+  RegExpPrototypeTest,
+  Set,
+  SetPrototypeAdd,
+  SetPrototypeHas,
+  String,
+  StringPrototypeSplit,
+  StringPrototypeStartsWith,
+  SymbolFor,
+  SymbolToStringTag,
+} = require("./primordials.cjs");
+
+const compileBootstrap = process[SymbolFor("nub.compile.bootstrap")];
+const getBuiltin = typeof compileBootstrap?.getBuiltin === "function"
+  ? compileBootstrap.getBuiltin
+  : require;
+const module_ = getBuiltin("node:module");
+const { readdirSync, existsSync } = getBuiltin("node:fs");
+const { fileURLToPath, pathToFileURL } = getBuiltin("node:url");
+const { join, dirname, extname: pathExtname, resolve: pathResolve } = getBuiltin("node:path");
+
+// Hide nub's ARGV-only V8 flags from `process.execArgv`, FIRST — before any user
+// code, and before anything here can hand the array out.
+//
+// Those flags are precisely the ones Node REFUSES in NODE_OPTIONS, which is why nub
+// puts them on argv. But a lot of real tooling forwards `process.execArgv` into a
+// Worker or into a child's NODE_OPTIONS, and Node then rejects nub's own flag with
+// ERR_WORKER_INVALID_EXEC_ARGV and kills the build — that is exactly how a Next.js
+// 16 + Turbopack build died on `--js-defer-import-eval`. V8 parses these flags at
+// startup, so dropping them here keeps the feature ON while restoring the execArgv a
+// plain-Node user would have seen. Only flags NUB injected are removed; a user's own
+// `v8Flags` stay visible, because those are the user's choice to reason about. (The
+// set is empty today — `--js-defer-import-eval` moved to a runtime flip, see
+// transform-core `noteRuntimeV8FlagSource` — but the hygiene stays for any future
+// argv-only row.)
+// The flags have to be hidden on two boundaries, and no single channel spans both.
+//
+// The ENV VAR crosses a PROCESS boundary: the Rust spawn layer sets it on a Node it
+// starts. Deleting it after use is what stops a descendant from hiding a flag its own
+// user passed, so that hygiene stays.
+//
+// WORKER ENVIRONMENT DATA crosses a THREAD boundary, which the env var cannot. Node
+// starts a worker from the process's REAL exec argv — flags and all — whatever the main
+// thread filtered, so the worker has to filter again, and this preload runs there to do
+// it. Three measured properties make this the right channel and an env copy the wrong
+// one (verified on 18.19 and 26.7): it survives `new Worker(…, { env: {} })`, which
+// REPLACES the environment outright and would otherwise strand that worker with the flags
+// visible; it is transitive to nested workers; and it does NOT cross a process boundary,
+// so a thread of this process is separated from a descendant structurally rather than by
+// guesswork.
+const ARGV_ONLY_FLAGS_KEY = "nub.argv-only-flags";
+// A compiled artifact whose sealed graph cannot reach Worker or worker_threads has
+// no second thread, so nothing can have written this channel and nobody can read
+// what we publish to it — only the env var below carries flags into such a process.
+// Asking anyway loads the builtin, and its subgraph is eight internal modules on
+// every run. This module's EVALUATION is part of the compile preamble's static
+// import graph, so no call-gating reaches that cost; the same signal and the same
+// deliberately over-detecting build-time scan gate the preamble's own Worker branch.
+// The record is published by the bootstrap's `--require`, ahead of any ESM here,
+// and is absent outside a compiled artifact — so this reads false there and the
+// load stays eager, which is the only behaviour an ordinary run ever had.
+const workerless = compileBootstrap?.needsWorker === false;
+try {
+  const workerThreads = workerless ? null : getBuiltin("node:worker_threads");
+  const fromEnv = process.env.__NUB_ARGV_ONLY_FLAGS;
+  const injectedArgvFlags = fromEnv || workerThreads?.getEnvironmentData(ARGV_ONLY_FLAGS_KEY);
+  if (injectedArgvFlags) {
+    if (fromEnv) {
+      delete process.env.__NUB_ARGV_ONLY_FLAGS;
+      workerThreads?.setEnvironmentData(ARGV_ONLY_FLAGS_KEY, fromEnv);
+    }
+    const injected = new Set(String(injectedArgvFlags).split(" ").filter(Boolean));
+    if (ArrayIsArray(process.execArgv)) {
+      process.execArgv = process.execArgv.filter((arg) => !injected.has(arg));
+    }
+  }
+} catch {
+  // Never let execArgv hygiene break startup.
+}
+
+// Internal `__NUB_*` plumbing var carrying the running binary's version (set by
+// the Rust spawn layer, coupled to preload injection). Read by installVersionMarker.
+const VERSION_ENV = "__NUB_VERSION";
+
+// Whether this Node natively supports import-text (`--experimental-import-text`,
+// added Node 26.5.0 (#62300), backported to 24.19.0). Feature-DETECTED via the
+// accepted-flag set rather than version-parsed — the flag is in
+// `allowedNodeEnvironmentFlags` iff Node knows it. When true, the load hook steps
+// aside and lets Node's own textStrategy own `type:"text"` imports (nub injects the
+// flag in spawn.rs), per the additive contract; where the flag does not exist nub
+// polyfills them via `loadTextImport`. Stepping aside is only safe while the
+// feature-matrix `import-text` bands cover every release that KNOWS the flag: on a
+// version nub steps aside on but does not inject for, the import falls through to
+// Node's default loader and dies with ERR_UNKNOWN_FILE_EXTENSION (#688).
+// Read LAZILY. The first touch of `process.allowedNodeEnvironmentFlags` materialises
+// Node's entire accepted-flag set, and as a top-level const that cost 0.355 ms of
+// this module's evaluation (child CPU, 200 runs, against a 0.000 ms control) on
+// every nub process and inside every compiled artifact — where this module is a
+// static import of the preamble, so nothing call-gated can reach it. Both readers
+// sit inside the load hook's `type: "text"` arm, which most programs never take.
+let __nativeImportText;
+const nativeImportText = () =>
+  (__nativeImportText ??= process.allowedNodeEnvironmentFlags.has("--experimental-import-text"));
 
 // ── data: URL unknown-format fidelity helpers ───────────────────────
 // Mirror Node's internal/modules/esm/get_format.js so nub's sync registerHooks load
@@ -99,13 +218,13 @@ function installWatchReporting(core) {
   function flushWatchDeps() {
     watchFlushScheduled = false;
     if (watchPending.length === 0) return;
-    const batch = watchPending.splice(0, watchPending.length);
+    const batch = ArrayPrototypeSplice(watchPending, 0, watchPending.length);
     try { process.send({ "watch:require": batch }); } catch {}
   }
   function reportWatchDep(path) {
-    if (!WATCH_REPORTING || !path || watchReported.has(path)) return;
-    watchReported.add(path);
-    watchPending.push(path);
+    if (!WATCH_REPORTING || !path || SetPrototypeHas(watchReported, path)) return;
+    SetPrototypeAdd(watchReported, path);
+    ArrayPrototypePush(watchPending, path);
     if (!watchFlushScheduled) {
       watchFlushScheduled = true;
       // A scheduled immediate is drained before the loop would exit, so even a
@@ -118,8 +237,8 @@ function installWatchReporting(core) {
   // per directory, lazily.
   const watchEnvScannedDirs = new Set();
   function reportEnvFilesIn(dir) {
-    if (!WATCH_REPORTING || watchEnvScannedDirs.has(dir)) return;
-    watchEnvScannedDirs.add(dir);
+    if (!WATCH_REPORTING || SetPrototypeHas(watchEnvScannedDirs, dir)) return;
+    SetPrototypeAdd(watchEnvScannedDirs, dir);
     let entries;
     try { entries = readdirSync(dir); } catch { return; }
     for (const name of entries) {
@@ -144,6 +263,10 @@ function installWatchReporting(core) {
 // `type` (transpile — there is no user hook to do it, and Node's strip-only mode
 // can't handle enums/namespaces). See makeHooks().load.
 let __userHooksRegistered = false;
+// Narrower: a user registration that brought a `load` hook, so it can transform
+// what nub hands back. A resolve-only user hook that labels a `.ts` file with a
+// bare `commonjs`/`module` still relies on nub as the transformer.
+let __userLoadHookRegistered = false;
 function installUserHookDetector() {
   if (typeof module_.registerHooks !== "function") return;
   const orig = module_.registerHooks;
@@ -151,9 +274,12 @@ function installUserHookDetector() {
   let seen = 0;
   const wrapped = function (...args) {
     // Call #1 is nub's own preload registration; #2+ are user hooks.
-    if (seen >= 1) __userHooksRegistered = true;
+    if (seen >= 1) {
+      __userHooksRegistered = true;
+      if (args[0] && typeof args[0].load === "function") __userLoadHookRegistered = true;
+    }
     seen += 1;
-    return orig.apply(this, args);
+    return ReflectApply(orig, this, args);
   };
   wrapped.__nubWrapped = true;
   try { module_.registerHooks = wrapped; } catch {}
@@ -176,7 +302,7 @@ function installUserAsyncLoaderDetector() {
     // require(esm)-off path, which does not run the fast-tier sync load hook that
     // performs the commonjs-sync relabel, so a false positive there is harmless.)
     __userAsyncLoaderRegistered = true;
-    return orig.apply(this, args);
+    return ReflectApply(orig, this, args);
   };
   wrapped.__nubAsyncWrapped = true;
   try { module_.register = wrapped; } catch {}
@@ -186,21 +312,27 @@ function installUserAsyncLoaderDetector() {
 // `--experimental-loader` / `--loader` register a loader directly; `--import` runs a
 // module that commonly calls `module.register()` (tsx, ts-node/esm). Read once from
 // `process.execArgv` — these flags appear before any user code runs, so this is a
-// reliable preload-time signal. Conservative on `--import`: a `--import` that does NOT
-// register a loader is harmless to relabel, but presence of the flag declines the
-// optimization rather than risk interop breakage (correctness over coverage).
+// reliable preload-time signal FOR THAT CHANNEL ONLY: `execArgv` carries the flags
+// passed on the command line, and NONE of the NODE_OPTIONS ones (verified on Node
+// 26.5.0 for `--import`/`--loader`/`--experimental-loader`/`--require`). Callers that
+// must see a loader however it was delivered want foreignAsyncLoaderFlagPresent(),
+// which scans both channels — reading only this one is what caused #669.
+// Conservative on `--import`: a `--import` that does NOT register a loader is harmless
+// to relabel, but presence of the flag declines the optimization rather than risk
+// interop breakage (correctness over coverage).
 let __cliAsyncLoaderCache;
 function cliAsyncLoaderPresent() {
   if (__cliAsyncLoaderCache !== undefined) return __cliAsyncLoaderCache;
   let present = false;
   try {
     const argv = process.execArgv;
-    if (Array.isArray(argv)) {
+    if (ArrayIsArray(argv)) {
       for (const a of argv) {
         if (typeof a !== "string") continue;
         if (
           a === "--loader" || a.startsWith("--loader=") ||
           a === "--experimental-loader" || a.startsWith("--experimental-loader=") ||
+          a === "--experimental_loader" || a.startsWith("--experimental_loader=") ||
           a === "--import" || a.startsWith("--import=")
         ) { present = true; break; }
       }
@@ -213,10 +345,208 @@ function cliAsyncLoaderPresent() {
 // The guard for the `commonjs-sync` relabel: is a USER async ESM loader active on the
 // import-of-CJS path? Relabel ONLY when nub is the sole loader (the common case —
 // next build/dev) so we never route a user loader's inner require()s through its own
-// ESM resolve hook (the interop break documented at the load hook below). Either a CLI
+// ESM resolve hook (the interop break documented at the load hook below). Either a
 // loader flag OR a runtime module.register() disqualifies the optimization.
-function userAsyncLoaderActive() {
-  return __userAsyncLoaderRegistered || cliAsyncLoaderPresent();
+//
+// Goes through foreignAsyncLoaderFlagPresent (BOTH delivery channels), not the
+// execArgv-only cliAsyncLoaderPresent: `--experimental-loader` registers its loader
+// NATIVELY, so it never calls module.register() and never trips the runtime detector
+// either. With the flag delivered via NODE_OPTIONS — which is how OpenTelemetry's own
+// docs prescribe the ESM attach — both of the old channels missed it, the relabel ran
+// against a user async loader, and Node rejected the `commonjs-sync`+null-source pair
+// (#669). That helper also excludes nub's OWN preload chainer, which rides NODE_OPTIONS
+// as `--import`; a raw scan here would read it as a user loader and silently decline
+// the relabel for every chained project. The standalone loader supplies its
+// value-aware flag scan instead, excluding its own --import entrypoint too.
+function userAsyncLoaderActive(foreignLoaderFlagPresent) {
+  return __userAsyncLoaderRegistered || foreignLoaderFlagPresent;
+}
+
+// The Node band where the async `module.register` loader's `resolveSync`/`loadSync`
+// are unimplemented stubs that throw `ERR_METHOD_NOT_IMPLEMENTED`: 22.15.0 ..= 24.11.0
+// (fixed in 24.11.1, nodejs/node#59666). Mirrors the Rust `node_hook_compose_broken`
+// (spawn.rs) for every RELEASE version; a pre-release like `22.15.0-rc.1` reads as in-band
+// here (the numeric parse ignores the `-rc` tag) where the Rust semver sorts it just below
+// the 22.15.0 floor — a harmless over-selection (the async tier is always correct and the
+// two signals are OR'd), never a crash. Outside this band a foreign async loader composes
+// with nub's sync hooks natively, so the fast tier stays.
+function nodeHookComposeBroken() {
+  const p = String(process.versions.node).split(".");
+  const maj = parseInt(p[0], 10) || 0;
+  const min = parseInt(p[1], 10) || 0;
+  const pat = parseInt(p[2], 10) || 0;
+  const geFloor = maj > 22 || (maj === 22 && min >= 15);
+  const leCeil = maj < 24 || (maj === 24 && (min < 11 || (min === 11 && pat === 0)));
+  return geFloor && leCeil;
+}
+
+// Does a foreign async ESM loader flag (`--import` / `--loader` / `--experimental-loader`)
+// ride in THIS process's own startup flags, via EITHER channel? tsx/ts-node deliver their
+// loader through one of two paths, and they land in different places:
+//   • re-exec argv → `process.execArgv` (tsx's bin re-execs `node --import <loader>`), and
+//   • `NODE_OPTIONS="--import tsx/esm"` → `process.env.NODE_OPTIONS` (NOT hoisted into
+//     execArgv — verified on Node 24.x), the common CI/shell-config delivery.
+// Both must be scanned. nub's own fast-tier injection is `--require` (never `--import`/
+// `--loader`) on this band, and its compat-tier `--import preload.mjs` lives below 22.15
+// (outside the broken band this gates on), so any such flag here is FOREIGN.
+// nub's OWN preload chainer is not a foreign loader. It rides `--import` like one, so
+// a plain regex over NODE_OPTIONS matches it and nub forces ITSELF onto the async
+// tier — which spawns a loader worker, and Node re-runs every `--require` preload in
+// that worker's realm, so the CJS chain runs twice. Recognise and skip it.
+const NUB_CHAIN_MARKER = /[\\/]\.nub[\\/]preload-chain\./;
+
+// Memoized like cliAsyncLoaderPresent, and for the same reason: the flags are fixed
+// before any user code runs, and the relabel guard now calls this per import-of-CJS,
+// so a later mutation of process.env.NODE_OPTIONS must not make two modules in one
+// process take different branches.
+let __foreignAsyncLoaderCache;
+function foreignAsyncLoaderFlagPresent() {
+  if (__foreignAsyncLoaderCache !== undefined) return __foreignAsyncLoaderCache;
+  __foreignAsyncLoaderCache = computeForeignAsyncLoaderFlagPresent();
+  return __foreignAsyncLoaderCache;
+}
+
+function computeForeignAsyncLoaderFlagPresent() {
+  if (cliAsyncLoaderPresent()) return true; // execArgv channel
+  const opts = process.env.NODE_OPTIONS;
+  if (typeof opts !== "string" || opts === "") return false;
+  const re = /(?:^|\s)--(?:experimental[-_])?(?:import|loader)(?:=|\s)("[^"]*"|\S*)/g;
+  for (const match of opts.matchAll(re)) {
+    const value = (match[1] || "").replace(/^"|"$/g, "");
+    if (!NUB_CHAIN_MARKER.test(value)) return true;
+  }
+  return false;
+}
+
+// Should nub auto-select its async loader-worker tier at PRELOAD time because a foreign
+// async ESM loader (tsx/ts-node) rides in THIS process's own startup flags, on the
+// broken-compose band? This is the INTRINSIC counterpart to the launcher's predictive argv
+// scan (`__NUB_FORCE_ASYNC_TIER`, spawn.rs): because it reads the process's OWN flags, it
+// fires regardless of how the process was launched — a nested `nub run`, a `child_process`
+// spawn (Playwright's globalSetup), or a shell wrapper — all spawn shapes the launcher-side
+// scan cannot see (nub#460). nub's `--require` preload runs before `--import` executes, so
+// the flag is observable here before the foreign loader registers, letting nub pick the
+// composable tier up front (a mid-flight sync→async swap is impossible — the loader-worker
+// cannot be registered from inside another loader's registration on this band). Deliberately
+// conservative: any such flag on the band takes the async tier, even the rare one that
+// registers no loader — a small worker-startup cost on a shrinking Node band, never a crash.
+function shouldAutoAsyncTierAtPreload() {
+  return nodeHookComposeBroken() && foreignAsyncLoaderFlagPresent();
+}
+
+// Does this Node's load validator refuse a missing source for CommonJS? Measured per
+// release: every registerHooks release through 22.22.2, 23.x, and 24.x through 24.11.0.
+function nodeLoadValidatorStrict() {
+  const p = StringPrototypeSplit(String(process.versions.node), ".");
+  const maj = parseInt(p[0], 10) || 0;
+  const min = parseInt(p[1], 10) || 0;
+  const pat = parseInt(p[2], 10) || 0;
+  if (maj === 22) return min < 22 || (min === 22 && pat < 3);
+  return maj === 23 || (maj === 24 && (min < 11 || (min === 11 && pat === 0)));
+}
+
+// On the async tier a user's `registerHooks` call moves every load onto `#loadSync`,
+// whose default step asks the async default load, and that returns no source for
+// CommonJS (nodejs/node#57327). Where Node's validator is strict it then throws inside
+// the register's own `next()`, so one pass-through hook breaks every CJS file in a run
+// where plain `node --import` works. Answer that one failure from disk, beneath every
+// user hook, as `commonjs`, which matches plain Node there: `commonjs-sync` would give a
+// real `require.cache` but dies on a required `.cts`, because this tier has no
+// main-thread require shim. Where the validator is permissive the missing source passes
+// and a hook reading `source` finds nothing, so fill it in, as `commonjs-sync` because
+// plain Node keeps a real `require.cache` on those releases.
+//
+// This hook lives exactly as long as a user load hook does, because on a strict release
+// it moves CommonJS onto the translator whose `require` has no `.cache`: a run with no
+// user load hook, whether it never registered one, registered only `resolve`, or
+// deregistered it, must keep Node's own path, as plain Node does.
+//
+// Only Node's own "no source" result qualifies: a user loader's wrong-typed `source`
+// names that loader's hook and surfaces as under plain Node. A loader's nullish `source`
+// on a CommonJS file reads the same and cannot be told apart on a strict release, and
+// elsewhere the only failure this message can name is a loader's, so it stays an error
+// there. Matching the message is tolerable because this validator exists only on frozen
+// release lines, and a change in its wording fails closed to the crash.
+const ASYNC_TIER_NO_SOURCE = /"source" from the "load" hook but got (undefined|null)\b/;
+function installAsyncTierCjsSource() {
+  if (typeof module_.registerHooks !== "function") return;
+  const orig = module_.registerHooks;
+  const strict = nodeLoadValidatorStrict();
+  const isFileUrl = (url) => typeof url === "string" && StringPrototypeStartsWith(url, "file:");
+  const readSource = (url) => getBuiltin("node:fs").readFileSync(fileURLToPath(url));
+  // A user hook expects the `commonjs` that plain Node reports, so it never sees the
+  // `commonjs-sync` beneath it, which is restored for Node on the way back out.
+  const showCommonjsFormat = (load) => function (url, context, next) {
+    let filled = false;
+    const result = ReflectApply(load, this, [url, context, (...args) => {
+      const inner = ReflectApply(next, undefined, args);
+      if (inner?.format !== "commonjs-sync") return inner;
+      filled = true;
+      return { ...inner, format: "commonjs" };
+    }]);
+    return filled && result?.format === "commonjs" && result.source != null
+      ? { ...result, format: "commonjs-sync" }
+      : result;
+  };
+  let recovery = null;
+  let userLoadHooks = 0;
+  const release = () => {
+    if (--userLoadHooks === 0) {
+      recovery.deregister();
+      recovery = null;
+    }
+  };
+  module_.registerHooks = function (hooks) {
+    if (typeof hooks?.load !== "function") return ReflectApply(orig, this, arguments);
+    userLoadHooks++;
+    // Registered first, because hooks run last-registered first and this one has to
+    // sit beneath every user hook.
+    recovery ??= ReflectApply(orig, this, [{
+      load(url, context, next) {
+        let result;
+        try {
+          result = next(url, context);
+        } catch (err) {
+          if (strict && err && err.code === "ERR_INVALID_RETURN_PROPERTY_VALUE" &&
+              RegExpPrototypeTest(ASYNC_TIER_NO_SOURCE, err.message) &&
+              context.format !== "module" && isFileUrl(url)) {
+            return { format: "commonjs", source: readSource(url), shortCircuit: true };
+          }
+          throw err;
+        }
+        // A permissive release lets the missing source through, which leaves a user
+        // hook that reads or rewrites `source` with nothing where plain Node has bytes.
+        if (result && result.format === "commonjs" && result.source == null && isFileUrl(url)) {
+          return { ...result, format: "commonjs-sync", source: readSource(url) };
+        }
+        return result;
+      },
+    }]);
+    let handle;
+    try {
+      handle = strict
+        ? ReflectApply(orig, this, arguments)
+        : ReflectApply(orig, this, [{ resolve: hooks.resolve, load: showCommonjsFormat(hooks.load) }]);
+    } catch (err) {
+      release();
+      throw err;
+    }
+    // Node freezes the handle, so its `deregister` can only be shadowed by a new object.
+    let released = false;
+    return ObjectFreeze(ObjectCreate(handle, {
+      deregister: {
+        value() {
+          handle.deregister();
+          if (!released) {
+            released = true;
+            release();
+          }
+        },
+      },
+    }));
+  };
+  // A register's `import { registerHooks } from "node:module"` reads the live binding.
+  module_.syncBuiltinESMExports();
 }
 
 // ── Internal `module.register()` without the DEP0205 leak ────────────
@@ -249,7 +579,7 @@ function registerLoaderWorker(specifier, parentURL, options) {
       // else (including any non-DEP0205 deprecation) straight through.
       const code = typeof rest[0] === "object" && rest[0] !== null ? rest[0].code : rest[1];
       if (code === "DEP0205") return;
-      return realEmitWarning.call(this, warning, ...rest);
+      return ReflectApply(realEmitWarning, this, [warning, ...rest]);
     };
     return module_.register(specifier, parentURL, options);
   } finally {
@@ -327,12 +657,156 @@ function resolveViaParentRequire(specifier, parentURL) {
   }
 }
 
-function makeHooks(core, watchReporting) {
+// Phantom-dependency remediation for nub's isolated layout. The isolated layout
+// (the post-flip default for npm/yarn/bun incumbents, and the standing default
+// for pnpm/fresh projects) exposes only DECLARED packages at the importer's
+// node_modules, so an UNDECLARED transitive that resolved under a flat
+// node_modules fails. When a BARE specifier hits (ERR_)MODULE_NOT_FOUND,
+// `phantomDepHint` returns the one-line opt-out to append — but ONLY when the
+// package is genuinely a phantom dep.
+//
+// Two conditions, both required, so the hint fires ONLY for a true phantom dep:
+//   (1) the bare package is in the project's graph — nub names every graph
+//       package `<name>@<version>` (scoped `/` → `+`) under `node_modules/.store`,
+//       so a matching entry means it's installed (GVS: symlinks into the global
+//       store; non-GVS: real dirs);
+//   (2) the bare package is NOT reachable at any `node_modules/<pkg>` up the
+//       tree — otherwise the package resolves and the MODULE_NOT_FOUND is a
+//       missing SUBPATH/file inside it (`react-dom/client-typo`), not a phantom.
+// A genuine typo / absent dep fails (1); a subpath miss of a declared dep fails
+// (2); the hoisted opt-out leaves no `<name>@*` entries (only internal state),
+// and node-suite / plain-Node trees have no `.store` at all — none get the hint.
+// NOT COVERED: the compat-tier ESM loader (Node 18.19–22.14 `import`) resolves
+// in preload-async-hooks.mjs and can't reach this CJS helper, so that band
+// surfaces Node's standard error without the hint; the fast tier (22.15+) and
+// CommonJS `require()` on every tier are covered.
+function phantomDepHint(specifier, fromPath) {
+  if (!specifier || !fromPath) return null;
+  const c = specifier[0];
+  if (c === "." || c === "/" || c === "#" || c === "\\") return null;
+  if (specifier.startsWith("node:") || module_.isBuiltin(specifier)) return null;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(specifier)) return null; // file:/data:/http:/C:\ …
+  const parts = specifier.split("/");
+  const pkg = c === "@" ? parts.slice(0, 2).join("/") : parts[0];
+  if (!pkg) return null;
+  let dir;
+  try {
+    dir = dirname(String(fromPath).startsWith("file:") ? fileURLToPath(fromPath) : fromPath);
+  } catch {
+    return null;
+  }
+  const prefix = pkg.replace(/\//g, "+") + "@";
+  let inStore = false;
+  for (let i = 0; i < 40 && dir; i++) {
+    const nm = join(dir, "node_modules");
+    // Reachable here ⇒ the bare package resolves, so this miss is a subpath/file
+    // inside it, not a phantom dep — suppress. existsSync follows the isolated
+    // layout's top-level symlink to the real package.
+    if (existsSync(join(nm, pkg))) return null;
+    if (!inStore) {
+      try {
+        inStore = readdirSync(join(nm, ".store")).some((e) => e.startsWith(prefix));
+      } catch {
+        /* no `.store` at this level */
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // In the graph's virtual store yet never reachable up the tree → phantom dep.
+  return inStore
+    ? `\n\n"${pkg}" is installed but not reachable here — it's a phantom dependency (an ` +
+        `undeclared transitive). nub's isolated node_modules exposes only the packages ` +
+        `declared in package.json. Add "${pkg}" to your dependencies, or add ` +
+        "`node-linker=hoisted` to .npmrc to use a flat node_modules."
+    : null;
+}
+
+// Append `hint` to a thrown error's message AND its printed `.stack`. V8
+// materializes `.stack` LAZILY from the current `.message`, so the original
+// hint-free stack MUST be read before `.message` is mutated — reading it after
+// would already contain the new message and the `.replace` would double the
+// hint. The marker makes it idempotent if the same error passes two catch
+// sites. Best-effort: a frozen/exotic error is left verbatim.
+function annotateError(err, hint) {
+  try {
+    if (!err || typeof err !== "object" || err.__nubPhantomHinted) return;
+    ObjectDefineProperty(err, "__nubPhantomHinted", { value: true, configurable: true });
+    const oldStack = typeof err.stack === "string" ? err.stack : null;
+    const oldMsg = err.message;
+    err.message = oldMsg + hint;
+    if (oldStack !== null) {
+      err.stack = oldStack.includes(oldMsg) ? oldStack.replace(oldMsg, err.message) : oldStack + hint;
+    }
+  } catch {
+    /* read-only error: leave verbatim */
+  }
+}
+
+// Upstream Node bug: CJS `require()` of a SCHEME-ONLY builtin (`node:test`,
+// `node:sqlite`, `node:sea`, `node:test/reporters`) throws
+// ERR_INVALID_RETURN_PROPERTY_VALUE ("… but got null") whenever ANY sync resolve
+// hook is registered. Measured per-release: broken on 22.15.0–22.17.1,
+// 23.5.0–23.11.1 and 24.0.0–24.3.0; fixed in 22.18.0+, 24.4.0+ and 25+ by
+// nodejs/node#58612 (bfc68c8ae8, for nodejs/node#58607). The 23.x
+// line reached end-of-life without the backport, and below 22.15/23.5
+// `module.registerHooks` does not exist at all, so the bug is unreachable there. A
+// plain-Node pass-through hook reproduces it exactly — nub only makes it
+// unconditional, by always hooking on the fast tier.
+//
+// Mechanism: with hooks present, `resolveForCJSWithHooks` leaves its fast path and
+// recomputes the URL as `convertCJSFilenameToURL(<normalized id>)`. The old helper
+// keyed on `BuiltinModule.normalizeRequirableId(id)`, which is FALSE for a bare
+// scheme-only id — `require("test")` is not legal — so `test` matched neither the
+// builtin branch nor `isAbsolute` and came back VERBATIM. That bare id then rides
+// into the load chain, where `validateLoad` waives the string-source requirement
+// only for a `node:`-prefixed url, so the default step's own correct
+// `{ format: "builtin", source: null }` is rejected. Upstream's fix was to strip any
+// `node:` prefix and test `canBeRequiredByUsers` instead. A REGULAR builtin was
+// never affected: `normalizeRequirableId("fs")` is truthy, so it already round-
+// tripped to `node:fs`.
+//
+// Re-prefixing reproduces the fixed helper's output at the one place nub can reach.
+// It is a provable no-op on a fixed Node, where the url already starts with `node:`
+// and the guard cannot fire, and `isBuiltin("node:" + url)` selects exactly the
+// scheme-only set — a `file:`/`data:` url, a Windows path and a bare regular builtin
+// all fail it.
+//
+// This hook is SHARED with ESM: a `registerHooks` resolve hook fires for `import`
+// too, on every version (verified on 22.15.0, 24.3.0 and 26.7.0 — both
+// `import("node:test")` and a relative `import` reach it). What keeps ESM safe is
+// not unreachability but the colon guard: ESM resolution always yields a
+// scheme-bearing URL (`node:test`, `file:///…`), so the rewrite short-circuits
+// before it can apply. Only the CJS `require()` path ever produces a bare id.
+function restoreSchemeOnlyBuiltinURL(result) {
+  try {
+    const url = result && result.url;
+    if (typeof url !== "string" || url === "" || url.includes(":")) return result;
+    if (!module_.isBuiltin(`node:${url}`)) return result;
+    return { ...result, url: `node:${url}` };
+  } catch {
+    return result;
+  }
+}
+
+function makeHooks(core, watchReporting, foreignLoaderFlagPresent = foreignAsyncLoaderFlagPresent()) {
   installUserHookDetector();
   installUserAsyncLoaderDetector();
+  const { resolveUtilRateFacade } = require("./util/rate.cjs");
 
   function resolve(specifier, context, nextResolve) {
-    const r = core.resolveSpec(specifier, context.parentURL);
+    // The fetch-handler pass tells the entry's own load from a preload's import of
+    // the same file by Node resolving it first as the main, with no parent.
+    noteEntryResolve(specifier, context);
+    const utilFacade = resolveUtilRateFacade(specifier, context, !!process.versions.nub);
+    if (utilFacade) return utilFacade;
+    // Unlike `module.register` hooks, these also run for `require()`. Node passes
+    // `importAttributes` for every import (static, dynamic, `import.meta.resolve`)
+    // and leaves it undefined for `require()` and `createRequire()`. The conditions
+    // cannot tell the two apart: a user may add "require" as a custom condition.
+    const fromRequire = context.importAttributes === undefined;
+    const r = core.resolveSpec(specifier, context.parentURL, fromRequire);
     if (r) return r;
     // Yarn PnP (ESM): PnP doesn't patch the ESM loader, so `import` of a PnP dep must
     // be resolved explicitly — through `pnpapi.resolveRequest`, passing Node's
@@ -349,11 +823,15 @@ function makeHooks(core, watchReporting) {
       } catch { /* fall through to Node's resolver */ }
     }
     try {
-      return nextResolve(specifier, context);
+      return restoreSchemeOnlyBuiltinURL(nextResolve(specifier, context));
     } catch (err) {
       if (isAsyncLoaderSyncStub(err)) {
         const fallback = resolveViaParentRequire(specifier, context.parentURL);
         if (fallback) return fallback;
+      }
+      if (err && err.code === "ERR_MODULE_NOT_FOUND") {
+        const hint = phantomDepHint(specifier, context.parentURL);
+        if (hint) annotateError(err, hint);
       }
       throw err;
     }
@@ -370,22 +848,39 @@ function makeHooks(core, watchReporting) {
   function loadViaDisk(url, ext) {
     try {
       const path = fileURLToPath(url);
-      if (core.TRANSPILE_EXTS.has(ext) && !core.isNodeModules(url)) {
+      if (SetPrototypeHas(core.TRANSPILE_EXTS, ext) && !core.isDependency(url)) {
         return core.loadTranspile(url, ext);
       }
-      if (ext in core.DATA_EXTS) return core.loadData(url, ext);
-      const { readFileSync } = require("node:fs");
+      // Plain JS: transpile only when transformable; else fall through to the raw-
+      // source path below (which hands CJS back as `source:null` → Node's native
+      // CJS loader), byte-identical to a non-intercepted file.
+      if (SetPrototypeHas(core.PLAIN_JS_EXTS, ext) && !core.isDependency(url)) {
+        const r = core.maybeTranspilePlainJs(url, ext);
+        if (r) return r;
+      }
+      if (ext in core.dataExtsFor(url)) return core.loadData(url, ext);
+      const { readFileSync } = getBuiltin("node:fs");
       const source = readFileSync(path);
       const pkgType = core.getPackageType(dirname(path));
       const format = core.moduleFormatFor(ext, pkgType, path, source.toString("utf8"));
-      if (format === "commonjs") return { format: "commonjs", source: null, shortCircuit: true };
-      return { format, source, shortCircuit: true };
+      if (format === "commonjs") return { format: "commonjs", source: null, responseURL: url, shortCircuit: true };
+      return { format, source, responseURL: url, shortCircuit: true };
     } catch {
       return null;
     }
   }
 
+  // Every load result passes through the runtime-V8-flag scan BEFORE Node compiles
+  // it, whichever branch of loadInner produced it — see transform-core
+  // `noteRuntimeV8FlagSource`. A no-op (one null check) unless the spawn layer armed
+  // a flag for this Node.
   function load(url, context, nextLoad) {
+    // The fetch-handler pass may be waiting for Node to start loading the entry.
+    noteEntryLoad(url);
+    return core.noteRuntimeV8FlagSource(loadInner(url, context, nextLoad));
+  }
+
+  function loadInner(url, context, nextLoad) {
     const ext = core.extname(url);
 
     // Watch mode: surface this file's nearest config files (tsconfig.json,
@@ -398,6 +893,33 @@ function makeHooks(core, watchReporting) {
         core.getTsconfigForDir(dir);
         core.getPackageType(dir);
       } catch {}
+    }
+
+    // Import Text (attribute-keyed): honor `with { type: "text" }` on ANY extension,
+    // ahead of extension dispatch so `import s from "./c.yaml" with {type:"text"}`
+    // returns raw text, not parsed YAML. Where Node knows the flag (`nativeImportText()`
+    // — 24.19+ on the 24.x line, 26.5+ on 26.x) step aside and let Node's own
+    // textStrategy own it — nub injects --experimental-import-text there, so the
+    // additive "would plain Node + the flag do the same?" test holds and users get
+    // Node's exact semantics. Elsewhere Node has no text-import support, so nub
+    // polyfills via loadTextImport (placed after watch reporting so a text file gets
+    // the same watch treatment, and before the extension/data dispatch so the attribute
+    // wins over the `.txt`/`.yaml`/… data loaders and Node-native JSON; it shortCircuits
+    // so Node's own unknown-'text'-attribute validation never runs). The compat-tier
+    // hook in preload-async-hooks.mjs always polyfills — that tier tops out at Node
+    // 22.14, below every flag-bearing release, so native import-text is never reachable
+    // there.
+    // (Node 18.20+ parses the `with` syntax; the 18.19.x floor cannot.)
+    // The scheme gate applies only to the POLYFILL leg: this branch precedes
+    // extension dispatch, so `extname`'s gate does not cover it, and the polyfill
+    // reads the bytes off disk — only a `file:` URL has bytes there. The native
+    // leg needs no scheme restriction: it hands the URL straight back to the
+    // chain, and gating it would drop `data:text/plain` + `type: "text"` into
+    // the unknown-data-URL-format trap below instead of Node's own text answer.
+    // A non-`file:` URL on the polyfill tier falls through to `nextLoad` with
+    // every other unclaimed URL.
+    if (context?.importAttributes?.type === "text" && (nativeImportText() || core.isFileUrl(url))) {
+      return nativeImportText() ? nextLoad(url, context) : core.loadTextImport(url);
     }
 
     // A USER resolve hook (a ts-node/tsx-style transpiler registered AFTER nub's
@@ -418,7 +940,22 @@ function makeHooks(core, watchReporting) {
     // user's outer hook, which does the real ESM->CJS conversion, matching Node.
     // Native 'module-typescript'/'commonjs-typescript' formats still fall through to
     // nub's transpile below, so normal augmentation is unchanged.
-    if (__userHooksRegistered && context && context.format === "typescript") {
+    //
+    // tsx 4.2x writes the bare `commonjs`/`module` form instead of 'typescript'
+    // (`outerHookOwnsFormat`), and the hook that wrote it must also be able to
+    // transform what it gets back: a user registration WITH a load hook
+    // (`__userLoadHookRegistered`), or a loader registered through
+    // `module.register` (`userAsyncLoaderActive`), which the registerHooks counter
+    // cannot see and which nub has no way to inspect. A resolve-only user hook
+    // that labels a `.ts` file keeps nub as its transformer. The 'typescript'
+    // branch keeps its own narrower gate: a non-transpiling async loader (a
+    // telemetry `--import`) must not turn a bare 'typescript' from Node's own
+    // CJS loader into a step-aside.
+    if (context && (
+      (__userHooksRegistered && context.format === "typescript") ||
+      ((__userLoadHookRegistered || userAsyncLoaderActive(foreignLoaderFlagPresent)) &&
+        core.outerHookOwnsFormat(context.format, ext) && !core.isDependency(url))
+    )) {
       return nextLoad(url, context);
     }
 
@@ -429,10 +966,21 @@ function makeHooks(core, watchReporting) {
     // handling (and its error) applies. (The TS-parent extensionless resolution in
     // the resolve hook is intended and stays — only this load-time transpile is
     // gated.)
-    if (core.TRANSPILE_EXTS.has(ext) && !core.isNodeModules(url)) {
+    if (SetPrototypeHas(core.TRANSPILE_EXTS, ext) && !core.isDependency(url)) {
       return core.loadTranspile(url, ext);
     }
-    if (ext in core.DATA_EXTS) return core.loadData(url, ext);
+    // Project-source plain JS (`.js`/`.mjs`/`.cjs`): transpile ONLY when it carries
+    // transformable syntax. A no-op plain-JS file returns null here and falls through
+    // to Node's native loader (the `nextLoad`/relabel path below) BYTE-FOR-BYTE — it
+    // is never intercepted, so native CJS/ESM behavior (the relabel, require.cache,
+    // the require-of-ESM-syntax-`.cjs` error) is preserved. node_modules excluded.
+    if (SetPrototypeHas(core.PLAIN_JS_EXTS, ext) && !core.isDependency(url)) {
+      const r = core.maybeTranspilePlainJs(url, ext);
+      if (r) return r;
+    }
+    // Data-format imports. dataExtsFor pins node_modules to nub's BUILT-IN loaders, so
+    // the project's `loader` config can't redefine how a dependency's imports load.
+    if (ext in core.dataExtsFor(url)) return core.loadData(url, ext);
 
     // Fidelity: a `data:` URL whose MIME maps to no module format (e.g.
     // `data:application/x-unknown,…`) must surface Node's ERR_UNKNOWN_MODULE_FORMAT.
@@ -481,6 +1029,7 @@ function makeHooks(core, watchReporting) {
           if (recovered) return recovered;
         }
       }
+      core.explainMappedExtension(err, url);
       throw err;
     }
 
@@ -516,12 +1065,21 @@ function makeHooks(core, watchReporting) {
     //      (the source-backfill EXCEPTION block below documents the same hazard). When
     //      nub is the SOLE loader (the next-build/dev common case) the path is nub's
     //      own, so the relabel is safe; otherwise leave the native-CJS handoff intact.
+    //
+    //  (3) A REAL SOURCE. Node's validateSourcePermissive exempts a null source for
+    //      'commonjs' ONLY, so relabeling a null-source result to 'commonjs-sync'
+    //      makes Node throw ERR_INVALID_RETURN_PROPERTY_VALUE out of nub's own hook.
+    //      The default load step yields a Buffer here whenever nub is the sole loader,
+    //      and null only on the async-loader defaultLoad quirk — i.e. exactly when (2)
+    //      should already have declined. Keeping this as an independent precondition
+    //      means a future gap in (2)'s detection degrades to "no optimization" rather
+    //      than to a crash, which is how #669 reached users.
     if (
-      r && r.format === "commonjs" &&
+      r && r.format === "commonjs" && r.source != null &&
       typeof url === "string" && url.startsWith("file:") &&
-      Array.isArray(context && context.conditions) &&
-      context.conditions.includes("import") &&
-      !__userHooksRegistered && !userAsyncLoaderActive()
+      ArrayIsArray(context && context.conditions) &&
+      ArrayPrototypeIncludes(context.conditions, "import") &&
+      !__userHooksRegistered && !userAsyncLoaderActive(foreignLoaderFlagPresent)
     ) {
       return { ...r, format: "commonjs-sync" };
     }
@@ -556,7 +1114,7 @@ function makeHooks(core, watchReporting) {
       typeof url === "string" && url.startsWith("file:")
     ) {
       try {
-        const { readFileSync } = require("node:fs");
+        const { readFileSync } = getBuiltin("node:fs");
         return { ...r, source: readFileSync(fileURLToPath(url)) };
       } catch { /* fall through with the original result */ }
     }
@@ -564,6 +1122,27 @@ function makeHooks(core, watchReporting) {
   }
 
   return { resolve, load };
+}
+
+// Give a Node internal we are about to wrap the name its own frame used to print.
+// V8 derives a CallSite's method name by finding the function as a property of its
+// receiver, so once `Module._resolveFilename` points at our wrapper, delegating to
+// the saved original through `.call()` prints `Module.<anonymous>` instead of
+// `Module._resolveFilename`, and `CallSite.getFunctionName()` goes null (these
+// internals carry no own name). The null is what breaks the REPL: node:repl cuts a
+// trace at the LAST null-named frame — normally its own `REPL1:1` eval frame — and
+// the frames nub adds to a CJS resolve push that one past the default
+// `Error.stackTraceLimit` of 10, leaving the delegated original as the only
+// null-named frame, so `require("./missing")` prints with no trace at all. Naming
+// the original restores Node's exact frame text. The REPL's own frame is still past
+// the capture limit, so no null-named frame remains and node:repl's `findLastIndex`
+// returns -1 — `slice(0, -1)` then drops just the outermost frame instead of the
+// whole trace.
+function nameInternalFrame(fn, name) {
+  try {
+    ObjectDefineProperty(fn, "name", { value: name, configurable: true });
+  } catch { /* frozen/exotic: leave verbatim */ }
+  return fn;
 }
 
 // ── CommonJS require() augmentation (BOTH tiers) ────────────────────
@@ -608,7 +1187,78 @@ function requireEsmError(filename) {
 // `require("./esm.ts")`), and the resolve shim below plus the tier's load hook
 // already cover resolution + transpile.
 function installCjsRequireHooks(core, withClassicTranspile) {
-  const origResolveFilename = module_._resolveFilename;
+  const origResolveFilename = nameInternalFrame(module_._resolveFilename, "_resolveFilename");
+
+  // The classic transpile handlers registered below put `.ts`/`.cts`/`.mts`/`.tsx`/
+  // `.jsx` into `Module._extensions`, and Node's `_findPath` runs `tryExtensions` over
+  // EVERY key of that object during LOAD_AS_FILE — before it ever tries
+  // LOAD_AS_DIRECTORY. Registering them therefore reorders Node's own resolution
+  // INSIDE dependencies: `require("pkg/sub")` picks a dep's unshipped `sub.ts` over the
+  // `sub/index.js` Node loads, and a dep's internal `require("./util")` picks `util.ts`
+  // where Node reports it missing. Both hand back a silently different module.
+  //
+  // Deps are NEVER transpiled — the same invariant the `.js`/`.cjs` handler below
+  // states — and the fast tier already resolves both shapes Node's way, so this keeps
+  // the two tiers in agreement. The check is on Node's ANSWER rather than a guess about
+  // the request, so nothing is re-resolved unless our own keys actually changed the
+  // outcome; the retry then reports whatever Node itself would, error included.
+  //
+  // Every extension nub adds to `Module._extensions` that Node does not have of its
+  // own. `.cjs` belongs here with the TypeScript family: Node registers only `.js`,
+  // `.json` and `.node`, so nub's `.cjs` handler likewise widens LOAD_AS_FILE and
+  // lets `require("dep/x/sub")` find a dependency's `sub.cjs` that plain Node reports
+  // missing. An explicit `require("dep/x/sub.cjs")` is unaffected either way — an
+  // exact path is found by stat, without consulting the extension list at all.
+  const NUB_ADDED_EXTS = [".ts", ".cts", ".mts", ".tsx", ".jsx", ".cjs"];
+  // A `require.extensions` handler that is ALREADY registered for one of these
+  // when this runs belongs to a transpiler the user chose, and it stays in charge
+  // of that extension: nub's classic shim neither replaces it nor pre-judges its
+  // files as ES modules at resolve time. Every `--require` runs before any `--import`, so on
+  // the compat tier — where nub's own preload is an `--import` — tsx's
+  // `--require`d preflight installs its `.ts` handler FIRST; nub then overwrote
+  // it, and a file tsx would have compiled to CJS (mixed `import` + `require`,
+  // the shape its ESM hook hands to the CJS loader) died in nub's handler as
+  // "Cannot require() this file — it is an ES module". Node itself registers only
+  // `.js`/`.json`/`.node`, so nothing but a user transpiler holds one of these
+  // keys here.
+  const foreignExts = new Set(
+    [...core.TRANSPILE_EXTS, ...core.allDataExts(), ...NUB_ADDED_EXTS].filter((ext) =>
+      ext !== ".js" && ext !== ".json" && ext !== ".node" && ObjectHasOwn(module_._extensions, ext)),
+  );
+  // Ownership of a key is decided per lookup, never frozen at start-up: user code
+  // may install or replace a handler after nub's preload (`--import tsx` runs
+  // after every `--require`), and from then on that key is the user's own
+  // widening of LOAD_AS_FILE, exactly as under plain Node plus their handler —
+  // `require("dep/sub")` finding a dependency's `sub.ts` through it is the answer
+  // to preserve. A key is nub's only while BOTH hold: nub introduced it (it was
+  // not in `foreignExts` — a user's `.cjs` handler that nub merely wraps still
+  // counts as theirs) and it still holds a function nub registered below
+  // (`nubHandlers`). Anything else is not nub's to strip, nor to pre-judge.
+  const nubHandlers = new Set();
+  const nubOwnsExt = (ext) => !SetPrototypeHas(foreignExts, ext) && SetPrototypeHas(nubHandlers, module_._extensions[ext]);
+  const withoutNubAddedExtensions = (fn) => {
+    const saved = [];
+    for (let i = 0; i < NUB_ADDED_EXTS.length; i++) {
+      const ext = NUB_ADDED_EXTS[i];
+      if (nubOwnsExt(ext)) {
+        ArrayPrototypePush(saved, [ext, module_._extensions[ext]]);
+        delete module_._extensions[ext];
+      }
+    }
+    try {
+      return fn();
+    } finally {
+      for (let i = 0; i < saved.length; i++) {
+        const pair = saved[i];
+        module_._extensions[pair[0]] = pair[1];
+      }
+    }
+  };
+  const isDepAddedExtHit = (filename) =>
+    typeof filename === "string" &&
+    nubOwnsExt(pathExtname(filename)) &&
+    core.isDependency(pathToFileURL(filename).href);
+
   module_._resolveFilename = function (request, parent, isMain, options) {
     let resolved = null;
     try {
@@ -616,7 +1266,21 @@ function installCjsRequireHooks(core, withClassicTranspile) {
       resolved = core.resolveCjsPath(request, parentPath);
     } catch { /* fall through to Node */ }
     if (resolved) {
-      if (withClassicTranspile && core.requireTargetIsEsm(resolved, pathExtname(resolved))) {
+      // This pre-check stays at RESOLVE time even though `_resolveFilename` also
+      // answers `require.resolve()`, for which a path lookup is not a load. Below the
+      // Node #60380 fix, `require()` of a transpiled ES module dies inside the
+      // loader-worker translator with an opaque `cjsCache.get(...)` TypeError, and
+      // that happens before any load hook of ours can run — so a load-time refusal
+      // never gets its turn and Node's own crash is what the user sees.
+      //
+      // The cost is that `require.resolve()` of an ESM-syntax TS target throws here
+      // instead of returning the path. Telling the two callers apart is not reliable
+      // across the band this is live on: Node passes 3 arguments from `Module._load`
+      // and 4 from `require.resolve` up to 22.14, but 22.15 and 22.16 pass 4 for both
+      // while still lacking native TS — and the translator crash is present on
+      // exactly those versions. A clean error beats an opaque crash, so this stays.
+      if (withClassicTranspile && nubOwnsExt(pathExtname(resolved)) &&
+          core.requireTargetIsEsm(resolved, pathExtname(resolved))) {
         throw requireEsmError(resolved);
       }
       return resolved;
@@ -642,7 +1306,23 @@ function installCjsRequireHooks(core, withClassicTranspile) {
       delete options.conditions;
     }
     try {
-      return origResolveFilename.call(this, request, parent, isMain, options);
+      const byNode = ReflectApply(origResolveFilename, this, [request, parent, isMain, options]);
+      if (withClassicTranspile && isDepAddedExtHit(byNode)) {
+        // `_findPath` memoizes into `Module._pathCache` and returns that entry before
+        // it ever consults the extension list, so the retry would be handed the same
+        // TS hit and the removal below would look like a no-op. Drop the memo first.
+        // Purging by VALUE rather than rebuilding the cache key keeps this off Node's
+        // internal key format, which differs across the supported range.
+        const keys = ObjectKeys(module_._pathCache);
+        for (let i = 0; i < keys.length; i++) {
+          const key = keys[i];
+          if (module_._pathCache[key] === byNode) delete module_._pathCache[key];
+        }
+        return withoutNubAddedExtensions(() =>
+          ReflectApply(origResolveFilename, this, [request, parent, isMain, options]),
+        );
+      }
+      return byNode;
     } catch (e) {
       // Under PnP, an in-tree issuer requiring a dep NOT in its manifest makes PnP
       // throw. That is nub's OWN transpile helpers (e.g. `@oxc-project/runtime`),
@@ -653,6 +1333,11 @@ function installCjsRequireHooks(core, withClassicTranspile) {
         const lookupPaths = module_._resolveLookupPaths(request, parent) || [];
         const found = module_._findPath(request, lookupPaths, isMain);
         if (found) return found;
+      }
+      if (e && e.code === "MODULE_NOT_FOUND") {
+        const fromPath = parent && typeof parent.filename === "string" ? parent.filename : null;
+        const hint = phantomDepHint(request, fromPath);
+        if (hint) annotateError(e, hint);
       }
       throw e;
     }
@@ -665,13 +1350,130 @@ function installCjsRequireHooks(core, withClassicTranspile) {
   // decorator guard, and module-format detection are all identical to the fast
   // tier. The path is already a real TS file (Module._resolveFilename ran first).
   // A module-format source can't be _compile'd as CJS — same clean error as above.
+  //
+  // A dependency's TypeScript is never transpiled — the same invariant the `.js`/
+  // `.cjs` handler below states as its case (1). The resolution-side retry keeps
+  // most dep TS from ever reaching here, but an explicit path (`require(
+  // "./node_modules/pkg/inner.ts")`) names the file directly and skips resolution
+  // entirely, so the bail has to live at the load step too. Delegating to the native
+  // `.js` handler rather than throwing is what Node itself does: an extension it has
+  // no handler for falls back to `.js` via `findLongestRegisteredExtension`, so this
+  // reproduces plain Node's own error instead of inventing one nub would have to own.
+  const nativeJs = module_._extensions[".js"];
   const transpileExtension = (mod, filename) => {
+    if (core.isDependency(pathToFileURL(filename).href)) {
+      return ReflectApply(nativeJs, module_._extensions, [mod, filename]);
+    }
     const { source, format } = core.loadTranspile(pathToFileURL(filename).href, pathExtname(filename));
     if (format === "module") throw requireEsmError(filename);
     mod._compile(source, filename);
   };
-  for (const ext of [".ts", ".cts", ".mts", ".tsx", ".jsx"]) {
-    module_._extensions[ext] = transpileExtension;
+  // Serve a data document the way the ESM load hook's `dataExtsFor` branch does.
+  // Without any handler Node has none for `.yaml`/`.toml`/`.json5`/`.jsonc`/
+  // `.txt`, so `findLongestRegisteredExtension` falls back to `.js` and compiles
+  // the document AS JavaScript — `a: 1` is a valid labeled statement, so
+  // `require("./x.yaml")` silently produced `{}` instead of the parsed document.
+  const dataExtension = (mod, filename, url, ext) => {
+    // Compiled from the same expression the ESM path exports, so a NaN, a
+    // BigInt or a Date reaches `require()` exactly as it reaches `import`.
+    // `{__esModule, default}` is the shape require(esm) already yields on the
+    // fast tier, so the same file destructures identically on both.
+    mod._compile(`module.exports = { __esModule: true, default: ${core.dataExpression(url, ext)} };`, filename);
+  };
+
+  // ONE handler, dispatching PER URL rather than per extension — because the
+  // right answer genuinely differs between two files sharing an extension. A
+  // project that redirects `.yaml` to `ts` still has dependencies whose own
+  // `.yaml` must parse as data, since `dataExtsFor` pins node_modules to the
+  // built-in loaders so a project's `loader` cannot redefine how a dependency
+  // reads its files. Two extension-keyed loops cannot express that: whichever
+  // ran second simply won, which is how `{".yaml":"ts"}` came to compile
+  // TypeScript as raw JavaScript here while the ESM path transpiled it.
+  //
+  // Data first, then transpile: `dataExtsFor` has already resolved the config
+  // for this URL, so an extension it claims is data for this file, and anything
+  // left that the config-aware transpile set claims is code.
+  const nubExtension = (mod, filename) => {
+    const url = pathToFileURL(filename).href;
+    const ext = pathExtname(filename);
+    if (ext in core.dataExtsFor(url)) return dataExtension(mod, filename, url, ext);
+    if (SetPrototypeHas(core.TRANSPILE_EXTS, ext)) return transpileExtension(mod, filename);
+    return ReflectApply(nativeJs, module_._extensions, [mod, filename]);
+  };
+  SetPrototypeAdd(nubHandlers, nubExtension);
+
+  // Registered for every extension either path may claim, so the dispatcher is
+  // reached at all; `nubExtension` then decides. Node's own `.js`/`.json`/`.node`
+  // are never replaced — a project `loader` may redefine how nub reads a file,
+  // not how Node reads `package.json`.
+  //
+  // ENUMERABILITY IS THE LOAD-BEARING PART. Node builds EXTENSIONLESS resolution
+  // from `ObjectKeys(Module._extensions)` (cjs/loader.js `tryExtensions`), so a
+  // plain assignment also enrolls the extension there. The TS family keeps the
+  // enumerable registration it has always had, so extensionless `require("./m")`
+  // still finds `m.ts`. Everything else is NON-ENUMERABLE: making `.yaml`
+  // enumerable would let `require("./config")` resolve `config.yaml` on this tier
+  // while the fast tier — which registers nothing and serves these through
+  // require(esm) — still throws MODULE_NOT_FOUND, trading one tier divergence for
+  // another. Dispatch reads the property directly
+  // (`findLongestRegisteredExtension`, `Module.prototype.load`), so hiding it
+  // from `ObjectKeys` serves an explicit `require("./x.yaml")` while leaving
+  // resolution identical across tiers.
+  const CODE_EXTS = new Set([".ts", ".cts", ".mts", ".tsx", ".jsx"]);
+  for (const ext of new Set([...core.TRANSPILE_EXTS, ...core.allDataExts()])) {
+    if (ext === ".js" || ext === ".json" || ext === ".node" || SetPrototypeHas(foreignExts, ext)) continue;
+    ObjectDefineProperty(module_._extensions, ext, {
+      value: nubExtension,
+      enumerable: SetPrototypeHas(CODE_EXTS, ext),
+      configurable: true,
+      writable: true,
+    });
+  }
+
+  // Project-source plain JS (`.js`/`.cjs`) routes through the SAME pipeline so
+  // `using`/`v`-flag-RegExp/decorators lower uniformly on the classic require tier —
+  // but ONLY when the file carries transformable syntax. THREE cases, each preserving
+  // Node's native behavior where it must:
+  //   (1) node_modules dep → native handler (deps are NEVER transpiled). Node has no
+  //       own `_extensions['.cjs']` (only `.js`/`.json`/`.node`), and compiles `.cjs`
+  //       through the same CJS path as `.js`, so the `.cjs` bail falls back to the
+  //       `.js` handler (`|| nativeJs`) — without it a node_modules `.cjs` require
+  //       would call `undefined` and crash.
+  //   (2) project file with transformable syntax → transpile (lower it).
+  //   (3) project file with NOTHING to lower → the ORIGINAL native handler, raw bytes
+  //       compiled exactly as Node would. We never serve our own source for a no-op
+  //       file, so require.cache / the require-of-ESM-syntax-`.cjs` SyntaxError / every
+  //       native CJS behavior is byte-identical.
+  // `.mjs` is ESM-only; Node registers no require.extensions handler for it, so a
+  // `require()` of `.mjs` throws ERR_REQUIRE_ESM as before — we don't override it.
+  // (`nativeJs` is captured above, before the TS handlers are registered.)
+  for (const ext of [".js", ".cjs"]) {
+    const origExtension = module_._extensions[ext] || nativeJs;
+    const plainJsExtension = (mod, filename) => {
+      // (0) The project pointed this extension at a data loader (`{".js":"text"}`),
+      // which the ESM path honors. These two extensions are skipped by the
+      // registration loop above because THIS wrapper owns them and runs after it,
+      // so the check has to live here or the setting is silently dropped on this
+      // tier alone. `dataExtsFor` is URL-keyed and pins node_modules to the
+      // built-ins, so a dependency's own `.js` can never be captured this way.
+      const url = pathToFileURL(filename).href;
+      const fileExt = pathExtname(filename);
+      if (fileExt in core.dataExtsFor(url)) {
+        return dataExtension(mod, filename, url, fileExt);
+      }
+      if (core.isDependency(url)) {
+        return ReflectApply(origExtension, module_._extensions, [mod, filename]); // (1)
+      }
+      const r = core.maybeTranspilePlainJs(pathToFileURL(filename).href, pathExtname(filename));
+      if (r) {
+        if (r.format === "module") throw requireEsmError(filename); // (2)
+        mod._compile(r.source, filename);
+        return;
+      }
+      return ReflectApply(origExtension, module_._extensions, [mod, filename]); // (3)
+    };
+    module_._extensions[ext] = plainJsExtension;
+    SetPrototypeAdd(nubHandlers, plainJsExtension);
   }
 }
 
@@ -705,17 +1507,61 @@ function preloadPolyfillPackages(reqFromRuntime) {
 // a program inspecting `RegExp.$_` on its first line would otherwise see a leaked
 // path (test-startup-empty-regexp-statics). Deferring the resolve keeps `RegExp.$_`
 // empty at user-code start; the cost is paid only by a program that touches Temporal.
-function installTemporalLazyGlobal(reqFromRuntime) {
-  if (typeof globalThis.Temporal !== "undefined") return;
+const defineTemporal = (value) =>
+  ObjectDefineProperty(globalThis, "Temporal", {
+    value,
+    configurable: true,
+    writable: true,
+    enumerable: false,
+  });
 
-  const defineTemporal = (value) =>
-    Object.defineProperty(globalThis, "Temporal", {
-      value,
+function installTemporalValue(polyfill) {
+  // @js-temporal/polyfill exports `toTemporalInstant` as a function but does
+  // NOT auto-install it on Date.prototype (you assign it yourself). Install it
+  // here so that on the floor (no native Temporal) `date.toTemporalInstant()`
+  // AND the package clobber's re-export of `Date.prototype.toTemporalInstant`
+  // both work — matching native Node. Guarded so we never replace a native
+  // implementation on a runtime that ships Temporal.
+  if (
+    typeof Date.prototype.toTemporalInstant !== "function" &&
+    typeof polyfill.toTemporalInstant === "function"
+  ) {
+    ObjectDefineProperty(Date.prototype, "toTemporalInstant", {
+      value: polyfill.toTemporalInstant,
       configurable: true,
       writable: true,
       enumerable: false,
     });
-  Object.defineProperty(globalThis, "Temporal", {
+  }
+  // The library exports a frozen module namespace; the global needs the
+  // ordinary Temporal object's built-in property attributes and prototype.
+  const T = {};
+  for (const name of ObjectGetOwnPropertyNames(polyfill.Temporal)) {
+    ObjectDefineProperty(T, name, {
+      value: polyfill.Temporal[name],
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  ObjectDefineProperty(T, SymbolToStringTag, {
+    value: "Temporal",
+    writable: false,
+    enumerable: false,
+    configurable: true,
+  });
+  defineTemporal(T);
+  return T;
+}
+
+function installTemporalGlobal(polyfill) {
+  if (typeof globalThis.Temporal !== "undefined") return globalThis.Temporal;
+  return installTemporalValue(polyfill);
+}
+
+function installTemporalLazyGlobal(reqFromRuntime) {
+  if (typeof globalThis.Temporal !== "undefined") return;
+  ObjectDefineProperty(globalThis, "Temporal", {
     configurable: true,
     enumerable: false,
     get() {
@@ -723,26 +1569,7 @@ function installTemporalLazyGlobal(reqFromRuntime) {
       try { temporalPath = reqFromRuntime.resolve("@js-temporal/polyfill"); } catch {}
       if (!temporalPath) return undefined;
       const polyfill = reqFromRuntime(temporalPath);
-      // @js-temporal/polyfill exports `toTemporalInstant` as a function but does
-      // NOT auto-install it on Date.prototype (you assign it yourself). Install it
-      // here so that on the floor (no native Temporal) `date.toTemporalInstant()`
-      // AND the package clobber's re-export of `Date.prototype.toTemporalInstant`
-      // both work — matching native Node. Guarded so we never replace a native
-      // implementation on a runtime that ships Temporal.
-      if (
-        typeof Date.prototype.toTemporalInstant !== "function" &&
-        typeof polyfill.toTemporalInstant === "function"
-      ) {
-        Object.defineProperty(Date.prototype, "toTemporalInstant", {
-          value: polyfill.toTemporalInstant,
-          configurable: true,
-          writable: true,
-          enumerable: false,
-        });
-      }
-      const T = polyfill.Temporal;
-      defineTemporal(T);
-      return T;
+      return installTemporalValue(polyfill);
     },
     set: defineTemporal,
   });
@@ -802,7 +1629,7 @@ function compileCacheSentinelPath() {
 
 function restoreCompileCacheEnv() {
   try {
-    const { readFileSync, rmSync } = require("node:fs");
+    const { readFileSync, rmSync } = getBuiltin("node:fs");
     const value = readFileSync(compileCacheSentinelPath(), "utf8");
     try { rmSync(compileCacheSentinelPath()); } catch {}
     if (value) process.env.NODE_COMPILE_CACHE = value;
@@ -831,13 +1658,32 @@ function restoreCompileCacheEnv() {
 // require() has zero added overhead. If the user never requires child_process, the
 // module is never loaded and the builtins stay out of the load list — matching Node.
 let __cpWrapArmed = false;
+// Compiled artifacts spawn children whose NODE_COMPILE_CACHE needs the same R8
+// treatment as an ordinary Nub run. Their fork IDENTITY policy (real executable,
+// bootstrap-first execArgv, private env channel) is NOT here: it has to be armed
+// before the entry chunk's static builtin imports evaluate, so compile-bootstrap.cjs
+// owns it. See the note there before adding fork behavior to this file.
+let __compiledArtifact = false;
+
+function installCompiledChildProcess() {
+  __compiledArtifact = true;
+  // ESM `import { spawn } from "node:child_process"` bypasses Module._load, so a
+  // compiled artifact must eagerly load + patch the builtin and synchronize its
+  // named ESM exports. This startup cost is compiled-only; normal Nub preloads
+  // continue to defer child_process until CommonJS user code requires it.
+  try {
+    wrapChildProcessCompileCache(getBuiltin("node:child_process"));
+    module_.syncBuiltinESMExports();
+  } catch {}
+}
+
 function armChildProcessCompileCacheWrap() {
   if (__cpWrapArmed || __cpWrapped) return;
   __cpWrapArmed = true;
   if (typeof module_._load !== "function") return;
-  const origLoad = module_._load;
+  const origLoad = nameInternalFrame(module_._load, "_load");
   module_._load = function (request, parent, isMain) {
-    const exports = origLoad.call(this, request, parent, isMain);
+    const exports = ReflectApply(origLoad, this, [request, parent, isMain]);
     if (request === "child_process" || request === "node:child_process") {
       module_._load = origLoad; // restore: one-shot, no steady-state overhead
       try { wrapChildProcessCompileCache(exports); } catch {}
@@ -860,14 +1706,28 @@ let __cpWrapped = false;
 function wrapChildProcessCompileCache(cp) {
   if (__cpWrapped || !cp) return;
   __cpWrapped = true;
-  const { writeFileSync } = require("node:fs");
-  const { basename } = require("node:path");
+  const { writeFileSync } = getBuiltin("node:fs");
+  const { basename } = getBuiltin("node:path");
 
   const isNodeTarget = (command) => {
     if (typeof command !== "string" || command.length === 0) return false;
     if (command === process.execPath) return true;
     const base = basename(command).toLowerCase();
     return base === "node" || base === "node.exe";
+  };
+
+  // The fresh-invocation protocol attributes each rewritten environment value to
+  // Nub. This preload is another Nub-owned writer: when it strips the live
+  // compile-cache value for R8, move an existing current-protocol marker to the
+  // exact absent state, so a later compat boundary restores the captured user
+  // value instead of mistaking this removal for a user mutation. Legacy parents
+  // carry neither marker and keep their legacy fallback.
+  const CCACHE_MARKER = "__NUB_AUGMENTED_NODE_COMPILE_CACHE";
+  const CCACHE_PRESENT_MARKER = `${CCACHE_MARKER}_PRESENT`;
+  const markCompileCacheAbsent = (env) => {
+    if (!ObjectHasOwn(env, CCACHE_MARKER) && !ObjectHasOwn(env, CCACHE_PRESENT_MARKER)) return;
+    env[CCACHE_MARKER] = "";
+    env[CCACHE_PRESENT_MARKER] = "0";
   };
 
   // Returns a possibly-rewritten options object with NODE_COMPILE_CACHE stripped
@@ -897,6 +1757,7 @@ function wrapChildProcessCompileCache(cp) {
       } catch { return options; }
       const newEnv = { ...env };
       delete newEnv.NODE_COMPILE_CACHE;
+      markCompileCacheAbsent(newEnv);
       return { ...opts, env: newEnv };
     }
     // Inherited env path: only act when this process actually carries a live cache
@@ -908,6 +1769,7 @@ function wrapChildProcessCompileCache(cp) {
     } catch { return options; }
     const newEnv = { ...process.env };
     delete newEnv.NODE_COMPILE_CACHE;
+    markCompileCacheAbsent(newEnv);
     return { ...opts, env: newEnv };
   };
 
@@ -920,7 +1782,7 @@ function wrapChildProcessCompileCache(cp) {
   // result shape (broke test-child-process-promisified / -abortController /
   // util-promisify-custom-names / sync-io-option / test-output-abort).
   const preserveSymbols = (wrapped, orig) => {
-    for (const s of Object.getOwnPropertySymbols(orig)) {
+    for (const s of ObjectGetOwnPropertySymbols(orig)) {
       try { wrapped[s] = orig[s]; } catch { /* read-only symbol: skip */ }
     }
     return wrapped;
@@ -930,13 +1792,13 @@ function wrapChildProcessCompileCache(cp) {
       let optIdx = -1;
       for (let i = rest.length - 1; i >= 0; i--) {
         const a = rest[i];
-        if (a && typeof a === "object" && !Array.isArray(a)) { optIdx = i; break; }
+        if (a && typeof a === "object" && !ArrayIsArray(a)) { optIdx = i; break; }
         if (typeof a === "function") continue; // execFile callback
-        if (Array.isArray(a)) break; // args array — no options object present
+        if (ArrayIsArray(a)) break; // args array — no options object present
       }
       if (optIdx >= 0) rest[optIdx] = stripFromOptions(rest[optIdx]);
     }
-    return orig.call(this, command, ...rest);
+    return ReflectApply(orig, this, [command, ...rest]);
   }, orig);
 
   cp.spawn = wrapSpawnLike(cp.spawn);
@@ -944,18 +1806,28 @@ function wrapChildProcessCompileCache(cp) {
   cp.execFile = wrapSpawnLike(cp.execFile);
   cp.execFileSync = wrapSpawnLike(cp.execFileSync);
 
-  // fork() always runs `process.execPath`, so it is always a node target. Its
-  // signature is (modulePath, args?, options?); reuse the same options rewrite.
+  // fork() always launches a node target, so the compile-cache rewrite applies to
+  // every (modulePath, args?, options?) shape — but only where the caller passed an
+  // options object, matching what the spawn-like wrappers do. Restricted to compiled
+  // artifacts because an ordinary Nub run reaches fork through the same
+  // `restoreCompileCacheEnv` path its children already use.
   const origFork = cp.fork;
   cp.fork = function (modulePath, ...rest) {
     let optIdx = -1;
-    for (let i = rest.length - 1; i >= 0; i--) {
-      const a = rest[i];
-      if (a && typeof a === "object" && !Array.isArray(a)) { optIdx = i; break; }
-      if (Array.isArray(a)) break;
+    if (rest.length === 1) {
+      const [arg] = rest;
+      if (arg !== null && typeof arg === "object" && !ArrayIsArray(arg)) optIdx = 0;
+    } else if (rest.length === 2) {
+      const [args, options] = rest;
+      if ((ArrayIsArray(args) || args == null) &&
+          options !== null && typeof options === "object" && !ArrayIsArray(options)) {
+        optIdx = 1;
+      }
     }
-    if (optIdx >= 0) rest[optIdx] = stripFromOptions(rest[optIdx]);
-    return origFork.call(this, modulePath, ...rest);
+    if (__compiledArtifact && optIdx >= 0) {
+      rest[optIdx] = stripFromOptions(rest[optIdx]);
+    }
+    return ReflectApply(origFork, this, [modulePath, ...rest]);
   };
 }
 
@@ -977,7 +1849,7 @@ function coverageActiveInProcess() {
   const hasCovFlag = (a) =>
     typeof a === "string" &&
     (a === "--experimental-test-coverage" || a.startsWith("--test-coverage"));
-  return (process.execArgv || []).some(hasCovFlag) || (process.argv || []).some(hasCovFlag);
+  return ArrayPrototypeSome(process.execArgv || [], hasCovFlag) || ArrayPrototypeSome(process.argv || [], hasCovFlag);
 }
 
 function reenableUserCompileCache() {
@@ -1035,13 +1907,767 @@ function reenableUserCompileCache() {
   try { module_.enableCompileCache(dir); } catch {}
 }
 
+// Publish `process.versions.nub` = the running binary's version — the universal
+// `process.versions.<runtime>` self-identification convention (cf. `.bun`,
+// `.electron`). A read-only DETECTION marker, never an importable/callable API.
+// The value comes from the Rust spawn layer's `__NUB_VERSION` (env!("CARGO_PKG_VERSION"),
+// coupled to preload injection), so it always matches the running binary; under
+// `--node`/`NODE_COMPAT` no preload runs and the var is unset, so the marker is
+// absent (plain-Node fingerprint). Shape mirrors Node's own `process.versions`
+// entries: enumerable + configurable + non-writable. Called once per main-thread
+// preload entry (fast + compat), so a single mechanism covers both tiers.
+function installVersionMarker() {
+  const v = process.env[VERSION_ENV];
+  if (!v) return;
+  try {
+    ObjectDefineProperty(process.versions, "nub", {
+      value: v,
+      writable: false,
+      enumerable: true,
+      configurable: true,
+    });
+  } catch {}
+}
+
+// ── libuv threadpool policy ──────────────────────────────────────────
+// The launcher sized the pool (`UV_THREADPOOL_SIZE = max(4, cores)`, spawn.rs) by
+// putting the variable in the environment, and libuv reads it LAZILY, at the first
+// pool use. Three things remain:
+//
+//  1. The program may still choose its own size. Under plain Node an assignment
+//     to `process.env.UV_THREADPOOL_SIZE` before the first pool use sizes the pool
+//     (a `process.env` write reaches the C environment), so on the fast tier the
+//     pool is NOT built here: the addon's `onFirstLoopTurn` settles it at the
+//     event loop's first turn, after the entry's synchronous top level, and
+//     whichever pool use comes first reads the environment as the program left
+//     it. Until then nub's value is visible to the program, as an exported value
+//     would be, so a program that only fills the variable in when it is unset
+//     defers to it. A program that set or removed it owns the pool, and nub
+//     leaves it be. Every way JS has to run later is itself visible to user code
+//     (see the addon's threadpool.rs), hence the native hook. The compat tier's
+//     `--import` preload is read through the pool, which therefore already
+//     exists, so there it is settled at once. So is a Linux pool whose workers
+//     libuv does not name (before 1.50): a pool the program built first could not
+//     be told apart from its other threads, and nothing would be demoted.
+//  2. Children keep Node's default. A `cluster` or PM2 fork, or any `child_process`
+//     spawn, inherits `process.env`; N workers each carrying a cores-sized pool is
+//     the oversubscription Node's own maintainers closed nodejs/node#61533 over.
+//     So once the pool exists nub's OWN value is deleted from `process.env`. A
+//     child spawned before then inherits it, so this process first marks the
+//     value taken (THREADPOOL_TAKEN_ENV), and a preload that finds the mark
+//     deletes the value before its own first pool use. The ownership markers
+//     stay, which is how a nested `nub` knows to size its child again; it sheds
+//     the taken mark with the rest of the parent's (spawn.rs). Ownership is
+//     two markers the launcher stamps (spawn.rs `RestorableVar`): the value equals
+//     the `__NUB_AUGMENTED_*` record of what the launcher handed Node, AND the
+//     compat presence mask says the variable was ABSENT before the outermost nub
+//     ran (bit 1 << 5 is this variable's slot). A shell value, an env-file value,
+//     or a value the launcher merely passed through fails one of the two and
+//     inherits as it would under plain Node. A pool of four is Node's default, so
+//     the variable goes at once and nothing is demoted.
+//  3. The threads beyond Node's four run at a lower priority on Linux, so they only
+//     take cycles nothing else on the box wants (Chromium's best-effort tier, nice
+//     10). Measured on 16 vCPU beside twelve busy processes: the neighbours keep
+//     98.6% of their CPU instead of 92.5%, the server still gains 20% over four
+//     threads, and an idle box loses nothing. libuv creates every worker
+//     synchronously inside the first pool submit, so one submit makes them all
+//     exist; the new thread ids (or the `libuv-worker` name, for a pool the
+//     program built first) name them, and `os.setPriority(tid)` targets one thread
+//     on Linux. On the compat tier the launcher `--require`s
+//     threadpool-snapshot.cjs ahead of the `--import` preload to build the pool
+//     and record its threads there.
+//
+// The submit is the addon's `warmThreadpool`: one no-op task on a private libuv
+// loop, run to completion inside the call, so nothing is left on Node's loop for
+// user code to see. A JS submit (`fs.access`) completes AFTER user code has
+// started: its callback is a `before` for an id `async_hooks` never saw born,
+// `process.getActiveResourcesInfo()` lists it, and the loop stays alive one turn
+// longer than plain Node's, which fires an unref'd `setImmediate`. Node's own
+// suite asserts on all three (49 files). `fs.access` remains the fallback when
+// the addon is absent, because it never takes libuv's io_uring path, which stat,
+// read and open do where io_uring is on (Node 20.3–20.11.0 by default, opt-in
+// since), building no pool at all.
+const THREADPOOL_ENV = "UV_THREADPOOL_SIZE";
+const THREADPOOL_MARK_ENV = "__NUB_AUGMENTED_UV_THREADPOOL_SIZE";
+const THREADPOOL_TAKEN_ENV = "__NUB_UV_THREADPOOL_SIZE_TAKEN";
+const COMPAT_PRESENT_ENV = "__NUB_COMPAT_PRESENT";
+const THREADPOOL_PRESENT_BIT = 1 << 5;
+const THREADPOOL_NODE_DEFAULT = 4;
+const THREADPOOL_EXTRA_NICE = 10;
+const THREADPOOL_WORKERS = SymbolFor("nub.threadpool.workers");
+
+// The addon that owns the submit, or null where it cannot be loaded. It is the
+// sibling transform-core loads moments later, through the same filename, so Node's
+// module cache hands out one instance. Loaded BEFORE the thread-id snapshot around
+// the submit: loading it starts threads of its own (a native runtime's pool), and a
+// snapshot that spans the load counts those among the pool's workers — measured on
+// an 8-core Linux box as every worker demoted, and its first four spared instead.
+function loadNativeAddon() {
+  try {
+    const addon = require(require("node:path").join(__dirname, "addons", "nub-native.node"));
+    return typeof addon.warmThreadpool === "function" ? addon : null;
+  } catch {
+    return null;
+  }
+}
+
+// One pool submit, and nothing else: the addon's private-loop task, or `fs.access`
+// when the addon is missing.
+function buildThreadpool(addon) {
+  if (addon !== null && addon.warmThreadpool()) return;
+  require("node:fs").access("/", () => {});
+}
+
+// libuv names its workers `libuv-worker` from 1.50.
+function libuvNamesWorkers() {
+  const [major, minor] = process.versions.uv.split(".").map(Number);
+  return major > 1 || (major === 1 && minor >= 50);
+}
+
+// `deferred`: the caller is the fast tier's `--require` preload, which runs before
+// anything has used the pool.
+function installThreadpoolPolicy(deferred) {
+  const size = process.env[THREADPOOL_ENV];
+  if (size === undefined || size !== process.env[THREADPOOL_MARK_ENV]) return;
+  if ((Number(process.env[COMPAT_PRESENT_ENV]) || 0) & THREADPOOL_PRESENT_BIT) return;
+  if (!(Number(size) > THREADPOOL_NODE_DEFAULT)) {
+    // Node's own size: nothing to demote, and libuv builds the same four whether
+    // it still finds the variable or not, so it goes at once.
+    delete process.env[THREADPOOL_ENV];
+    return;
+  }
+  try {
+    // The `--require` preload re-runs inside every loader worker; the pool is
+    // process-wide, so only the main thread touches it.
+    if (!require("node:worker_threads").isMainThread) return;
+    if (process.env[THREADPOOL_TAKEN_ENV] !== undefined) {
+      // Inherited from a process that had not yet settled its own pool.
+      delete process.env[THREADPOOL_ENV];
+      delete process.env[THREADPOOL_TAKEN_ENV];
+      return;
+    }
+    const linux = process.platform === "linux";
+    const workers = linux ? process[THREADPOOL_WORKERS] : undefined;
+    const addon = workers === undefined ? loadNativeAddon() : null;
+    if (
+      deferred &&
+      typeof addon?.onFirstLoopTurn === "function" &&
+      (!linux || libuvNamesWorkers())
+    ) {
+      process.env[THREADPOOL_TAKEN_ENV] = "1";
+      if (addon.onFirstLoopTurn(() => settleThreadpool(addon, size))) return;
+      delete process.env[THREADPOOL_TAKEN_ENV];
+    }
+    releaseThreadpool(addon, workers);
+  } catch {}
+}
+
+// The deferred half: the first loop turn has come, so the entry's top level has run.
+function settleThreadpool(addon, size) {
+  try {
+    delete process.env[THREADPOOL_TAKEN_ENV];
+    if (process.env[THREADPOOL_ENV] !== size) return;
+    releaseThreadpool(addon, undefined);
+  } catch {}
+}
+
+// Build the pool unless something already has, THEN take nub's value out of
+// `process.env`: libuv reads the variable at the first submit, and a delete reaches
+// the C environment, so a pool built after it would be Node's four. On Linux, demote
+// the workers beyond four.
+function releaseThreadpool(addon, workers) {
+  const fs = require("node:fs");
+  const linux = process.platform === "linux";
+  const tids = () => fs.readdirSync("/proc/self/task").map(Number).filter(Boolean);
+  if (workers === undefined) {
+    const before = linux ? new Set(tids()) : null;
+    buildThreadpool(addon);
+    const isWorker = (t) => {
+      if (!SetPrototypeHas(before, t)) return true;
+      try {
+        return fs.readFileSync(`/proc/self/task/${t}/comm`, "latin1").trim() === "libuv-worker";
+      } catch {
+        return false;
+      }
+    };
+    if (linux) workers = tids().filter(isWorker);
+  }
+  delete process.env[THREADPOOL_ENV];
+  if (!linux) return;
+  const os = require("node:os");
+  for (const t of workers.sort((a, b) => a - b).slice(THREADPOOL_NODE_DEFAULT)) {
+    try {
+      os.setPriority(t, THREADPOOL_EXTRA_NICE);
+    } catch {}
+  }
+}
+
+// ── Default-export `fetch` handler (the auto-listener) ───────────────
+// An entry whose default export is an object with a `fetch` method is served over
+// HTTP rather than merely evaluated — the handler shape Cloudflare Workers, Bun,
+// Deno (`deno serve`) and Vercel converge on, so the same file runs on all of them
+// and under `nub <file>`. The shape of the user's own module is the whole gate: a
+// file without it runs and exits byte-for-byte as it does on plain Node, which is
+// what keeps this additive.
+//
+// The launcher sets SERVE_ENTRY_ENV for a top-level `nub <file>` and `nub watch`
+// only (never `--node`, never a bin launch, never the `node` hijack), and the
+// application's preload DELETES it before any user code runs. That delete is the
+// whole containment: a `child_process` spawn or a Worker copies `process.env` after
+// it is gone, so a server entry that forks a worker pool does not hand every worker
+// its own listener — no `worker_threads` probe needed here to tell the realms apart.
+// A launched process that never runs nub's preload cannot delete it. A test runner on
+// the compat tier is one, and `nodeRunsArgvAsProgram` answers for its children.
+//
+// Its value is the launcher's argv as a JSON array, and that is what makes "the
+// application's preload" a process this code can identify: see `markedLaunchFlags`.
+const SERVE_ENTRY_ENV = "__NUB_SERVE_ENTRY";
+
+// The entry this process was marked to serve, from `claimServeEntry` on: the file as
+// Node resolved it, the URLs a load hook may see it under, whether a preload may
+// still follow nub's own, and the state the late pass waits on — whether a hook has
+// seen Node resolve the entry as its main and then start loading it, the URL it saw
+// it loaded under, and what to run when one does. Null in every process that is not
+// the marked application.
+let serveEntry = null;
+
+// FIRST in each preload entry, before any user code — the configured preload chain
+// included: consume the marker, so nothing the user wrote ever sees it, and resolve
+// the entry, so the hooks know which URL announces it — unless Node is in a mode that
+// never runs it (`nodeRunsArgvAsProgram`). Arming the pass itself waits for
+// `installServeEntry`, at the very end of the preload.
+function claimServeEntry() {
+  const marker = process.env[SERVE_ENTRY_ENV];
+  if (marker === undefined) return;
+  const launchFlags = markedLaunchFlags(marker);
+  if (launchFlags === null) return;
+  delete process.env[SERVE_ENTRY_ENV];
+  if (!nodeRunsArgvAsProgram(launchFlags)) return;
+  const file = mainEntryPath();
+  if (!file) return;
+  serveEntry = {
+    file,
+    urls: entryUrls(file),
+    mayFollow: anotherPreloadMayFollow(),
+    taken: false,
+    mainResolved: false,
+    loadSeen: false,
+    loadUrl: null,
+    onLoad: null,
+    channel: null,
+  };
+}
+
+// NEVER START THE ENTRY OURSELVES BEFORE NODE WOULD HAVE. The inspection below can
+// reach the entry through `import()`, and an `import()` that lands while a preload is
+// still pending EVALUATES THE ENTRY EARLY — ahead of the very preloads that exist to
+// set its realm up. That is not theoretical: a single `setImmediate` here put the
+// entry between two chained preload entries on Node 18.19 and 20.11, which is exactly
+// the additivity guarantee this feature is supposed to preserve. So the pass runs on
+// three triggers, none of which can get there first:
+//
+//   1. The first pass, which reads a CommonJS entry straight off `process.mainModule`
+//      and imports NOTHING. It may only `import()` when no preload can still follow
+//      nub's own (`anotherPreloadMayFollow`), or when a hook has already seen Node
+//      start loading the entry. WHEN it runs differs by tier, and the difference is
+//      what user code can see of it. A `--require` preload runs before Node calls
+//      `Module.runMain`, which loads a CommonJS entry synchronously, so the fast tier
+//      wraps that call once and runs the pass as it returns: a CommonJS entry is
+//      inspected in the same tick, with no timer, request or promise left for the
+//      program to observe — `async_hooks` sees no `before` it never saw an `init` for,
+//      `process.getActiveResourcesInfo()` is empty as under plain Node, and the loop
+//      does not turn an extra time (which ran an unref'd `setImmediate` plain Node
+//      never would; Node's own suite asserts on each). An ES module entry has only
+//      been started by then, so its pass is a microtask, which Node's own loader
+//      already leaves such an entry a dozen of. The compat tier's `--import` preload
+//      runs inside `runMain`, after it, so a `setImmediate` still carries its pass:
+//      a microtask queued there would run ahead of Node's own import of the entry.
+//      Neither is `.unref()`d or skippable: a synchronous script must still reach
+//      the pass, or a server whose module body does nothing asynchronous would exit
+//      before binding.
+//   2. The load hook seeing the entry (`noteEntryLoad`): Node imports the entry only
+//      after awaiting the last `--import`, so by then every preload has run and an
+//      `import()` can only join the job Node already made. This fires whatever the
+//      loop is doing, which is what serves a handler whose preload or module body
+//      holds a timer, a socket or a Worker for good.
+//   3. `beforeExit`, for the hook configuration in which nub's hooks never see the
+//      entry at all — a foreign resolve hook that rewrites the entry's URL, say. It
+//      fires only once the loop drains, so it is the last resort and never the only
+//      one.
+//
+// Nothing here holds the loop open to wait for trigger 2. The loader worker's channel
+// stays unreferenced: a loop the entry or a preload keeps alive delivers its message
+// regardless, and a loop that drains reaches trigger 3, which inspects the entry
+// without it. Referencing the port instead held EVERY process whose hooks never saw
+// the entry's URL open for good, a finished plain script included.
+//
+// Declining to serve remains the right side to fail on where none of the three can
+// fire: reordering a user's preloads is a correctness break, and not binding a port
+// is not.
+function installServeEntry(beforeMain) {
+  const entry = serveEntry;
+  if (entry === null) return;
+  const report = (err) => {
+    // A throwing entry is handled inside, so nothing here is expected to reject and
+    // anything that does is nub's own defect, named as such. Leaving the promise
+    // unhandled instead would change the process's exit path.
+    process.stderr.write(`nub: could not inspect the entry for a fetch handler: ${err}\n`);
+  };
+  // Whichever late trigger fires, the other is withdrawn with it, so the process
+  // carries neither once the entry has been inspected.
+  const late = () => {
+    process.removeListener("beforeExit", late);
+    return serveEntryIfHandler(entry, true).then(() => closeEntryChannel(entry)).catch(report);
+  };
+  const pass = () =>
+    serveEntryIfHandler(entry, entry.loadSeen || !entry.mayFollow)
+      .then((deferred) => {
+        if (!deferred) {
+          closeEntryChannel(entry);
+          return;
+        }
+        // Registered ONLY when the pass above declined for want of permission to
+        // import — never on an ordinary run. A `beforeExit` listener added up front
+        // is observable to the user's own code (`process.listenerCount("beforeExit")`
+        // reads 1 where plain Node reads 0), and an unconditional one made every
+        // `nub <file>` run carry it.
+        entry.onLoad = late;
+        if (entry.loadSeen) fireEntryLoad(entry);
+        process.once("beforeExit", late);
+      })
+      .catch(report);
+  if (!beforeMain) {
+    setImmediate(pass);
+    return;
+  }
+  const runMain = module_.runMain;
+  if (typeof runMain !== "function") return;
+  // Node reads `Module.runMain` at the call, for exactly this kind of wrap. Restored
+  // as it runs: one entry, one pass. An entry that throws propagates out of the call
+  // as it would have, uninspected. A later preload that REPLACES the property rather
+  // than wrapping it withdraws the pass with it, and the entry goes unserved: the
+  // declining side, by the rule above, and the only alternative would be a resource
+  // every ordinary run carried.
+  module_.runMain = function (...args) {
+    module_.runMain = runMain;
+    const result = ReflectApply(runMain, this, args);
+    let served;
+    try {
+      served = serveMainModuleIfHandler(entry);
+    } catch (err) {
+      report(err);
+      return result;
+    }
+    if (served) closeEntryChannel(entry);
+    else PromisePrototypeThen(ReflectApply(PromiseResolve, Promise, []), pass);
+    return result;
+  };
+}
+
+// The URLs a load hook may see the entry under, matched without query or fragment.
+// Node's ESM resolver hands the hook the realpath unless symlinks are preserved, and
+// `_findPath` has usually resolved it already — so both spellings are watched rather
+// than guessing which one applies. A foreign resolve hook may add a query — the
+// cache-busting `?v=…` a hot-reload loader appends — and that is still the entry;
+// one that points the entry at another file has made it a different module, and
+// no URL of ours will ever name it.
+function entryUrls(file) {
+  const urls = new Set();
+  SetPrototypeAdd(urls, pathToFileURL(file).href);
+  try {
+    SetPrototypeAdd(urls, pathToFileURL(getBuiltin("node:fs").realpathSync(file)).href);
+  } catch { /* unreadable — the unresolved spelling still matches Node's own */ }
+  return urls;
+}
+
+// A resolve hook saw Node resolve `specifier` with no parent, which is how Node
+// imports its main entry and nothing else — a preload's `import()` of the same file
+// carries the preload as its parent. Only a load AFTER this can be the entry's own:
+// a preload that imports `./entry.mjs?warm` ahead of the program would otherwise
+// be taken for it, and the pass would serve that module's handler while Node went
+// on to evaluate the real entry as a second one. Called from the fast tier's
+// synchronous hook; the compat tier's loader worker keeps the same note itself.
+function noteEntryResolve(specifier, context) {
+  const entry = serveEntry;
+  if (entry === null || entry.mainResolved || context.parentURL !== undefined) return;
+  if (SetPrototypeHas(entry.urls, withoutQuery(String(specifier)))) entry.mainResolved = true;
+}
+
+// A load hook saw Node start loading `url`. Called from the fast tier's synchronous
+// hook for every load, and from the compat tier's loader worker over the channel
+// `loaderWorkerOptions` hands it. Free in every process but the marked application.
+function noteEntryLoad(url) {
+  const entry = serveEntry;
+  if (entry === null || !entry.mainResolved || entry.loadSeen) return;
+  if (!SetPrototypeHas(entry.urls, withoutQuery(url))) return;
+  entry.loadSeen = true;
+  entry.loadUrl = url;
+  fireEntryLoad(entry);
+}
+
+function withoutQuery(url) {
+  const cut = url.search(/[?#]/);
+  return cut < 0 ? url : url.slice(0, cut);
+}
+
+function fireEntryLoad(entry) {
+  const onLoad = entry.onLoad;
+  if (onLoad === null) return;
+  entry.onLoad = null;
+  // Out of the hook's own stack: the sync hook runs INSIDE Node's load of the entry,
+  // and an `import()` issued from there would re-enter the loader. A microtask, not
+  // an immediate: Node has the entry's job by the time the stack unwinds, so the
+  // `import()` joins it, and this is only ever reached after the first pass declined
+  // to import — an entry on the ES-module loader's path, which Node's own loader
+  // already leaves promise reactions of its own behind on.
+  PromisePrototypeThen(ReflectApply(PromiseResolve, Promise, []), onLoad);
+}
+
+// For `registerLoaderWorker`, on the tiers whose hooks run in a loader worker: the
+// port that worker announces the entry's load on, or nothing. Created only when the
+// pass will have to wait for that announcement, because the port is a handle the
+// process carries until the entry loads and an ordinary run should carry nothing.
+function loaderWorkerOptions() {
+  const entry = serveEntry;
+  if (entry === null || !entry.mayFollow) return undefined;
+  const { MessageChannel } = getBuiltin("node:worker_threads");
+  const channel = new MessageChannel();
+  // The worker keeps the main-resolve note itself and announces only a load after
+  // it (preload-async-hooks.mjs), so its word stands in for `noteEntryResolve` here.
+  channel.port1.on("message", (url) => {
+    entry.mainResolved = true;
+    noteEntryLoad(url);
+  });
+  // Never referenced, so an announcement that never comes cannot hold the process
+  // open — see the triggers above `installServeEntry`.
+  channel.port1.unref();
+  entry.channel = channel;
+  return {
+    data: { entryLoad: { port: channel.port2, urls: [...entry.urls] } },
+    transferList: [channel.port2],
+  };
+}
+
+function closeEntryChannel(entry) {
+  const channel = entry.channel;
+  if (channel === null) return;
+  entry.channel = null;
+  channel.port1.close();
+}
+
+// Is this process the application the launcher marked, or a wrapper it put in
+// front of that application? An env-owner loader or a configured `prefix` runs
+// BEFORE Node in the spawn chain, and a Node-based one (`varlock` is a
+// `#!/usr/bin/env node` script) inherits nub's NODE_OPTIONS and so runs this very
+// preload; a bare flag was consumed there and never reached the application.
+//
+// The marker carries the launcher's argv instead — Node flags, the entry, then the
+// application's arguments — and the application is the process whose own argv IS
+// that list from the entry on: `argv[1]` resolves to one token, and everything after
+// it is `argv.slice(2)` verbatim, since Node stops parsing at the entry and passes
+// the rest through untouched. Which token is the entry is not something Rust can
+// name (`nub --require x server.mjs` puts `x` first), but the tail length pins it
+// to exactly one position, so no other token is ever a candidate. That is what
+// keeps an argument from impersonating the entry: `nub server.mjs
+// node_modules/.bin/varlock` would otherwise let the wrapper — whose `argv[1]` IS
+// that bin — claim the marker and starve the application of it. A wrapper is
+// always handed the command it runs, so its argv tail is longer than the marker's
+// and the equality can never hold there.
+//
+// Node has already `path.resolve`d `argv[1]` by the time a preload runs, so the same
+// call is an exact test — no second resolver, and no path spelling Rust and Node
+// could disagree on. The raw comparison covers `-` (stdin), which Node does not
+// expand. No `argv[1]` at all — `-e`, the REPL — is nothing to serve and nothing to
+// forward, so it counts as this process and the caller deletes the marker.
+//
+// A match hands back the launch's Node flags, the tokens ahead of the entry, for
+// `nodeRunsArgvAsProgram`; no match is null.
+function markedLaunchFlags(marker) {
+  const main = process.argv[1];
+  if (typeof main !== "string") return [];
+  const tokens = markerTokens(marker);
+  if (tokens === null) return null;
+  const rest = process.argv.slice(2);
+  const at = tokens.length - rest.length - 1;
+  if (at < 0) return null;
+  const entry = tokens[at];
+  if (entry === "" || (entry !== main && pathResolve(entry) !== main)) return null;
+  return rest.every((arg, i) => arg === tokens[at + 1 + i]) ? tokens.slice(0, at) : null;
+}
+
+// The launcher's argv out of the marker, or null for a value nub did not write. A
+// JSON array rather than a joined string because an argument may hold any byte but
+// NUL: ASCII unit separator was the join once, and one inside an argument split it
+// in two and moved the entry off its position. A value that does not parse is left
+// alone and claims nothing.
+function markerTokens(marker) {
+  let tokens;
+  try {
+    tokens = JSONParse(marker);
+  } catch {
+    return null;
+  }
+  return ArrayIsArray(tokens) && tokens.every((token) => typeof token === "string")
+    ? tokens
+    : null;
+}
+
+// Could a preload still run after nub's own? True whenever an `--import`/`--loader`
+// token names anything but nub's own preload — a user entry on its own token, or the
+// preload chainer when the spawn path gave it one instead of loading it from inside
+// nub's preload. Deliberately conservative, and deliberately not
+// `foreignAsyncLoaderFlagPresent`, whose question is a different one: it treats the
+// chainer as nub's own (correct for tier selection, wrong here, since the chainer is
+// precisely what must not be front-run) and reads nub's compat-tier `--import` as
+// foreign.
+function anotherPreloadMayFollow() {
+  const ourDir = dirname(__filename);
+  let tokens = "";
+  try {
+    if (ArrayIsArray(process.execArgv)) tokens += process.execArgv.join(" ");
+  } catch { /* execArgv unavailable — the NODE_OPTIONS channel still answers */ }
+  const opts = process.env.NODE_OPTIONS;
+  if (typeof opts === "string") tokens += ` ${opts}`;
+  const re = /(?:^|\s)--(?:experimental[-_])?(?:import|loader)(?:=|\s)("[^"]*"|\S*)/g;
+  for (const match of tokens.matchAll(re)) {
+    const value = (match[1] || "").replace(/^"|"$/g, "");
+    if (value === "") continue;
+    let path = value;
+    if (path.startsWith("file:")) {
+      try { path = fileURLToPath(path); } catch { return true; }
+    }
+    if (dirname(path) !== ourDir) return true;
+  }
+  return false;
+}
+
+// Serve the entry if its default export is a handler. Resolves TRUE when it declined
+// only because it may not import yet, which is the caller's signal to arm the late
+// triggers. `entry.taken` is shared by every trigger: whichever gets a usable
+// namespace takes it SYNCHRONOUSLY, before any await, so no two can bind a listener.
+//
+// A CommonJS entry is already on `process.mainModule`, fully evaluated, so its
+// exports need no module-loader round trip. Anything else — an ES module entry, or a
+// CommonJS one the ESM loader owns on the `--import` compat tier — is reached through
+// `import()`, which returns the job Node already created for that URL. So the entry
+// evaluates exactly once whichever of us gets there first, and the promise settles
+// only after the entry's own top-level await does. The URL imported is the one a
+// load hook saw the entry under, when one did: a foreign resolve hook that rewrote
+// the entry for Node's own import — a cache-busting query keyed on the entry having
+// no parent, say — would not rewrite nub's, and importing the file's plain URL then
+// evaluates the entry a second time as a different module.
+//
+// Getting there first would cost the entry its `isEntryPoint` flag, and with it
+// `import.meta.main`; on the fast tier the
+// `--require` preload is synchronous, so Node's own import runs in the same macrotask
+// that scheduled the pass, and the compat tier is Node ≤ 22.14, which has no
+// `import.meta.main` to lose. Measured `true` on the fast tier and `undefined` on
+// 20.19 and 22.14, which is what plain Node reports on each.
+async function serveEntryIfHandler(entry, mayImport) {
+  if (entry.taken) return false;
+  if (serveMainModuleIfHandler(entry)) return false;
+  if (!mayImport) return true;
+  entry.taken = true;
+  let ns;
+  try {
+    ns = await import(entry.loadUrl ?? pathToFileURL(entry.file).href);
+  } catch {
+    // The entry threw. Node has already reported that as an uncaught error, and this
+    // is the same failure observed a second time, so it is dropped rather than
+    // doubling the report.
+    return false;
+  }
+  serveIfHandler(ns.default);
+  return false;
+}
+
+// The synchronous half: a CommonJS entry Node has already run is inspected off
+// `process.mainModule`, with nothing imported and nothing deferred. True once the
+// entry has been taken this way.
+function serveMainModuleIfHandler(entry) {
+  const main = process.mainModule;
+  if (!(main && main.loaded && main.filename === entry.file)) return false;
+  entry.taken = true;
+  serveIfHandler(main.exports);
+  return true;
+}
+
+function serveIfHandler(exported) {
+  const handler = fetchHandler(exported);
+  if (!handler) return;
+  // Required only now, so an ordinary file run never loads node:http at all.
+  require("./fetch-serve.cjs").serve(handler);
+}
+
+// Node runs `argv[1]` as the program in its script mode only. Three other modes still
+// load the preloads with a file in `argv[1]`: the test runner, which runs it in a
+// child of its own (`--test`); a syntax check, which only parses it (`--check`); and
+// `-e`/`-p` code, after which it is a plain argument. The pass's `import()` joins the
+// evaluation Node already started, and in these modes there is none to join, so the
+// import WAS the evaluation: every `nub --test` file ran twice, a checked file
+// executed, and an argument ran as a script. Node refuses all of these flags in
+// NODE_OPTIONS, so they arrive on argv alone, read here twice over: this process's
+// own `execArgv`, and the LAUNCH's flags as the marker recorded them. The second is
+// for a test runner's children. On the compat tier the runner never consumes the
+// marker (measured on 22.13), so every child inherits it and the one whose file sits
+// at the entry's position matches it — and that child, running its file as the
+// program, carries no `--test` of its own, so a test file that default-exports a
+// handler was served there and the run never ended. Either way the marker is
+// consumed before this is asked, so nothing the claimant spawns inherits it.
+function nodeRunsArgvAsProgram(launchFlags) {
+  const own = ArrayIsArray(process.execArgv) ? process.execArgv : [];
+  return modeRunsArgvAsProgram(own) && modeRunsArgvAsProgram(launchFlags);
+}
+
+// One flag list read the way Node's option parser reads it, not by which tokens are
+// present. Node names an option without its `=value` and reads `_` as `-`, so
+// `--no_test=1` is `--no-test`. `--check`, `--test` and `--interactive` are booleans:
+// no value turns one off (`--check=false` is a syntax check), the `--no-` spelling
+// does, and the last spelling wins, so `--test --no-test file` runs the file. An eval
+// string cannot be negated: Node refuses `--no-eval`, and `--no-print` still evaluates.
+// `-i` outranks it unless `--no-interactive` follows, so `-e 0 -i file` runs the file
+// as the program. Measured on 18.19 through 26.5.
+const EVAL_FLAGS = new Set(["--eval", "-e", "--print", "--no-print", "-p", "-pe"]);
+
+function modeRunsArgvAsProgram(flags) {
+  let evaluates = false;
+  let interactive = false;
+  let checks = false;
+  let tests = false;
+  for (const token of flags) {
+    const flag = optionName(token);
+    if (SetPrototypeHas(EVAL_FLAGS, flag)) evaluates = true;
+    else if (flag === "-i" || flag === "--interactive") interactive = true;
+    else if (flag === "--no-interactive") interactive = false;
+    else if (flag === "-c" || flag === "--check") checks = true;
+    else if (flag === "--no-check") checks = false;
+    else if (flag === "--test") tests = true;
+    else if (flag === "--no-test") tests = false;
+  }
+  return !(evaluates && !interactive) && !checks && !tests;
+}
+
+// A token as Node's parser names the option: a `--` option loses its `=value` and
+// reads `_` as `-`. A single-dash option takes no `=`, so it stays as written.
+function optionName(token) {
+  if (!token.startsWith("--")) return token;
+  const equals = token.indexOf("=");
+  return (equals === -1 ? token : token.slice(0, equals)).replace(/_/g, "-");
+}
+
+// The entry as Node itself resolved it: `resolveMainPath` is `Module._findPath` over
+// the absolute `argv[1]` with `isMain` true, so deferring to the same call inherits
+// every main-specific behavior — extension and index probing, a directory's
+// package `main`, and `--preserve-symlinks-main` — instead of reimplementing a
+// second resolver that could name a different file than the one Node loaded.
+function mainEntryPath() {
+  const main = process.argv[1];
+  // Absent for the REPL and for `--eval`/`--print` with no arguments (with arguments
+  // it is the first of them, which `nodeRunsArgvAsProgram` has already declined);
+  // `-` is stdin, which has no module identity to inspect.
+  if (typeof main !== "string" || main === "" || main === "-") return null;
+  try {
+    const found = module_._findPath(pathResolve(main), null, true);
+    return typeof found === "string" && found !== "" ? found : null;
+  } catch {
+    return null;
+  }
+}
+
+// The handler object, or null when the default export is not one. A `.ts` or `.js`
+// entry that resolves as CommonJS carries `export default` as
+// `{ __esModule: true, default: … }` after transpilation, and Node's interop hands
+// that whole object over as the namespace `default` — so unwrap exactly one level of
+// it. A CommonJS entry written as `module.exports = { fetch }` needs no unwrapping
+// and is accepted as it stands.
+function fetchHandler(value) {
+  let handler = value;
+  if (isPlainish(handler) && handler.__esModule === true && isPlainish(handler.default)) {
+    handler = handler.default;
+  }
+  return isPlainish(handler) && typeof handler.fetch === "function" ? handler : null;
+}
+
+function isPlainish(value) {
+  return typeof value === "object" && value !== null;
+}
+
+// ── User preloads (`nub.jsonc` `preload`) ───────────────────────────
+// nub loads the user's preload entries HERE rather than emitting one NODE_OPTIONS
+// token per entry. Two reasons, and the first is a correctness bug in the wild:
+//
+//  1. Consumers that re-parse NODE_OPTIONS destroy repeated same-name flags. Next.js
+//     parses it into a `Record` keyed by option name and reformats it for every
+//     forked worker, so `--require=a --require=b` becomes `--require=b`, silently
+//     dropping whichever came first — which is nub's OWN preload. Filed upstream as
+//     vercel/next.js#96582. Emitting at most one `--require` and one `--import`
+//     survives that round-trip intact.
+//  2. Loading them here means nub stops GUESSING each entry's module format from its
+//     file extension; Node's own resolver decides at load time.
+//
+// Resolution base is the CWD, not nub's runtime dir. That is what Node does for a
+// `--require`/`--import` specifier (measured: a bare specifier resolves through the
+// node_modules walk-up from the CWD, and fails outside the project), whereas nub's
+// runtime dir would resolve a bare entry against nub's OWN dependencies. Relative
+// entries already arrive absolute from the Rust side; bare ones do not.
+// The chainer path, present only when the spawn path decided nub's OWN preload
+// should load it (no second NODE_OPTIONS token exists in that case). Absent when
+// the chainer got its own `--import` — loading it in both places would run the
+// user's entries twice.
+function userPreloadChain() {
+  try {
+    const chain = JSONParse(process.env.__NUB_RUNTIME_CONFIG || "{}").preloadChain;
+    return typeof chain === "string" && chain.length > 0 ? chain : null;
+  } catch {
+    return null;
+  }
+}
+
+// Fast tier, `.cjs`-only entries: load the chainer SYNCHRONOUSLY, so `--require`'s
+// synchronous-entry semantics (R1) survive. The chainer's own `require()` calls
+// resolve from ITS directory, which is inside the user's project.
+function requireUserPreloadChain() {
+  const chain = userPreloadChain();
+  if (chain) module.require(chain);
+}
+
+// Compat tier: nub's own preload is an `--import`, so it can await. The chainer is
+// ESM here, and awaiting it lets a user entry with top-level await settle before the
+// program starts — which `require()` could not do (ERR_REQUIRE_ASYNC_MODULE).
+async function importUserPreloadChain() {
+  const chain = userPreloadChain();
+  if (!chain) return;
+  const { pathToFileURL } = require("node:url");
+  await import(pathToFileURL(chain).href);
+}
+
 module.exports = {
+  installVersionMarker,
+  installThreadpoolPolicy,
   installWatchReporting,
+  installAsyncTierCjsSource,
   registerLoaderWorker,
   makeHooks,
+  shouldAutoAsyncTierAtPreload,
+  // Consumed by the standalone loader entry (loader-entry.mjs), whose foreign-
+  // loader scan must be value-aware (its own delivery IS an `--import`) and so
+  // cannot reuse shouldAutoAsyncTierAtPreload directly.
+  nodeHookComposeBroken,
   installCjsRequireHooks,
   preloadPolyfillPackages,
+  installTemporalGlobal,
   installTemporalLazyGlobal,
+  // The compiled preamble's lazy Temporal getter (compile-lazy-temporal.cjs)
+  // installs the value on first access without reading the global back.
+  installTemporalValue,
   restoreCompileCacheEnv,
+  installCompiledChildProcess,
   reenableUserCompileCache,
+  claimServeEntry,
+  loaderWorkerOptions,
+  installServeEntry,
+  // For compiled artifacts, whose program root hands the entry over itself.
+  serveIfHandler,
+  requireUserPreloadChain,
+  importUserPreloadChain,
 };

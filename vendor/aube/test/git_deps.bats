@@ -40,6 +40,29 @@ EOF
 	(cd "$work" && git rev-parse HEAD)
 }
 
+# Build a bare git repo with source files but no package.json. pnpm
+# accepts these asset-only git deps and records version 0.0.0 with no
+# transitive dependencies.
+_make_git_repo_without_package_json() {
+	local bare="$1"
+	local work
+	work="$(temp_make)"
+	(
+		cd "$work" || exit 1
+		git init -q
+		git config commit.gpgsign false
+		mkdir -p json
+		cat >json/checkoutservice-v71.json <<EOF
+{"openapi":"3.1.0","info":{"title":"CheckoutService","version":"71"}}
+EOF
+		git add -A
+		git commit -q -m "init"
+	)
+	git init -q --bare "$bare"
+	(cd "$work" && git push -q "$bare" HEAD:refs/heads/main)
+	(cd "$work" && git rev-parse HEAD)
+}
+
 # Build a bare git repo whose package.json has a `prepare` script that
 # generates a `dist/` directory at build time. Used to verify git deps
 # get their `prepare` hook run before the snapshot is taken, matching
@@ -154,6 +177,31 @@ EOF
 	assert_output --partial "commit: $sha"
 	assert_output --partial "type: git"
 	assert_output --partial "repo: file://$TEST_TEMP_DIR/git-src.git"
+}
+
+@test "aube install handles git dep without package.json" {
+	sha="$(_make_git_repo_without_package_json "$TEST_TEMP_DIR/git-assets.git")"
+
+	mkdir -p app
+	cd app
+	cat >package.json <<EOF
+{"name":"app","version":"0.0.0","dependencies":{"gitassets":"git+file://$TEST_TEMP_DIR/git-assets.git#$sha"}}
+EOF
+
+	run aube install
+	assert_success
+
+	assert_file_exists node_modules/gitassets/json/checkoutservice-v71.json
+	run test -e node_modules/gitassets/package.json
+	assert_failure
+	run cat aube-lock.yaml
+	assert_output --partial "commit: $sha"
+	assert_output --partial "gitassets@file://"
+
+	rm -rf node_modules
+	run aube install
+	assert_success
+	assert_file_exists node_modules/gitassets/json/checkoutservice-v71.json
 }
 
 # A `packageExtensions` entry that injects a dependency into a *git*
@@ -368,7 +416,7 @@ EOF
 	mkdir -p app
 	cd app
 	cat >package.json <<EOF
-{"name":"app","version":"0.0.0","dependencies":{"gitprep":"git+file://$TEST_TEMP_DIR/git-prep.git"}}
+{"name":"app","version":"0.0.0","dependencies":{"gitprep":"git+file://$TEST_TEMP_DIR/git-prep.git"},"pnpm":{"allowBuilds":{"gitprep@git+file://$TEST_TEMP_DIR/git-prep.git":true}}}
 EOF
 
 	run aube install
@@ -409,7 +457,7 @@ EOF
 	mkdir -p app
 	cd app
 	cat >package.json <<EOF
-{"name":"app","version":"0.0.0","dependencies":{"gitprepregistry":"git+file://$TEST_TEMP_DIR/git-prep-registry.git"}}
+{"name":"app","version":"0.0.0","dependencies":{"gitprepregistry":"git+file://$TEST_TEMP_DIR/git-prep-registry.git"},"pnpm":{"allowBuilds":{"gitprepregistry@git+file://$TEST_TEMP_DIR/git-prep-registry.git":true}}}
 EOF
 
 	run aube --registry="$AUBE_TEST_REGISTRY" install
@@ -431,7 +479,8 @@ EOF
   },
   "pnpm": {
     "allowBuilds": {
-      "aube-test-builds-marker": true
+      "aube-test-builds-marker": true,
+      "gitprepallowbuilds@git+file://$TEST_TEMP_DIR/git-prep-allow-builds.git": true
     }
   }
 }
@@ -453,7 +502,7 @@ EOF
 	(
 		cd app1
 		cat >package.json <<EOF
-{"name":"app1","version":"0.0.0","dependencies":{"gitprepcontam":"git+file://$TEST_TEMP_DIR/git-prep-contam.git"}}
+{"name":"app1","version":"0.0.0","dependencies":{"gitprepcontam":"git+file://$TEST_TEMP_DIR/git-prep-contam.git"},"pnpm":{"allowBuilds":{"gitprepcontam@git+file://$TEST_TEMP_DIR/git-prep-contam.git":true}}}
 EOF
 		run aube install
 		assert_success

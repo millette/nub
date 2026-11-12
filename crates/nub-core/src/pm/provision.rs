@@ -14,7 +14,8 @@
 //! runs against an unpinned runtime.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
@@ -29,6 +30,30 @@ use crate::version_management::download;
 pub struct ProvisionedPm {
     pub bin: PathBuf,
     pub version: String,
+}
+
+/// Join a registry-resolved version onto the PM store dir, asserting the result
+/// stays UNDER the store. The STRUCTURAL half of the F0c containment, paired with
+/// [`registry::validate_version`]'s char-blocklist: an ABSOLUTE or DRIVE-prefixed
+/// version (`C:foo` on Windows) makes `Path::join` DISCARD the base and escape the
+/// store, so the bin nub then writes + EXECUTES would land outside `<store>/pm/<pm>/`.
+/// This is the exact escape class a char-blocklist is most apt to miss a
+/// metacharacter for (the Windows `:` slipped through once). `validate_version`
+/// already rejects those at resolution, so in practice this never fires — it is
+/// belt-and-suspenders. The two layers are complementary: this catches the
+/// base-discarding join (absolute/drive), while the separator/`..` class stays with
+/// `validate_version` (`PathBuf::starts_with` is a lexical component-prefix and does
+/// NOT normalize `..`, so it is not a traversal guard on its own — but it is
+/// component-wise, so a sibling-prefix dir like `…/pm-evil` does not spuriously pass).
+fn store_version_dir(pm_store: &Path, version: &str) -> Result<PathBuf> {
+    let dir = pm_store.join(version);
+    if !dir.starts_with(pm_store) {
+        bail!(
+            "refusing to use {version:?} as a store path component — it escapes {}",
+            pm_store.display()
+        );
+    }
+    Ok(dir)
 }
 
 /// Download + verify + extract the pinned package manager into nub's store,
@@ -113,15 +138,46 @@ pub fn provision_pm_announced(
     // (It was read from the cache-store root before — a dir no project commits
     // anything into — so project mirrors/auth were silently ignored.)
     let cfg = registry::registry_config(project_root);
+
+    // 2b. Dist-tag TTL cache: a tag spec (`latest`) is not exact, so it skipped
+    // the cache check above and used to pay a registry round-trip on EVERY
+    // invocation — the shim's dynamic default made that a per-`npx`-call cost
+    // (#491). A tag resolution recorded within [`TAG_TTL`] whose version is
+    // still installed short-circuits to the zero-network path; freshness lags
+    // the registry by at most the TTL, the same trade corepack makes.
+    let is_tag = is_dist_tag(spec);
+    if is_tag
+        && let Some((version, age)) = read_tag_resolution(&pm_store, &cfg.base, spec)
+        && age <= TAG_TTL
+        && let Some(bin) = cached_bin(&pm_store, &version)
+    {
+        if let Some(cb) = on_resolved {
+            cb(&version);
+        }
+        return Ok(ProvisionedPm { bin, version }); // cache hit — silent
+    }
+
     let dist = match registry::resolve_version_authed(&cfg, &pm.to_string(), spec) {
-        Ok(dist) => dist,
-        // 3. Registry unreachable: a range can still resolve against the cache.
-        // Exact pins were handled above (and an exact spec parses as a *caret*
-        // VersionReq, so it must not reach the range match); dist-tags have no
-        // offline meaning. Announced — a stale-vs-fresh divergence from the
-        // online behavior should never be silent.
+        Ok(dist) => {
+            if is_tag {
+                record_tag_resolution(&pm_store, &cfg.base, spec, &dist.version);
+            }
+            dist
+        }
+        // 3. Registry unreachable: a range can still resolve against the cache,
+        // and a dist-tag against its last RECORDED resolution (any age — stale
+        // beats down). Exact pins were handled above (and an exact spec parses
+        // as a *caret* VersionReq, so it must not reach the range match).
+        // Announced — a stale-vs-fresh divergence from the online behavior
+        // should never be silent.
         Err(err) if semver::Version::parse(spec).is_err() => {
-            match best_cached_match(&pm_store, spec) {
+            let fallback = if is_tag {
+                read_tag_resolution(&pm_store, &cfg.base, spec)
+                    .and_then(|(version, _)| cached_bin(&pm_store, &version).map(|b| (version, b)))
+            } else {
+                best_cached_match(&pm_store, spec)
+            };
+            match fallback {
                 Some((version, bin)) => {
                     if let Some(cb) = on_resolved {
                         cb(&version);
@@ -143,7 +199,7 @@ pub fn provision_pm_announced(
         cb(&dist.version);
     }
 
-    let final_dir = pm_store.join(&dist.version);
+    let final_dir = store_version_dir(&pm_store, &dist.version)?;
     let bin = final_dir.join("package").join(&dist.bin_subpath);
     if bin.is_file() {
         return Ok(ProvisionedPm {
@@ -158,7 +214,11 @@ pub fn provision_pm_announced(
         &pm_store,
         &final_dir,
         pin_hash,
-        cfg.auth.as_ref(),
+        // Host-match the registry auth to the tarball before attaching it: a
+        // packument's `dist.tarball` can name a foreign host, and the bearer
+        // token must never leave the registry's own origin (N1b). The packument
+        // fetch above already used the full `cfg.auth`.
+        registry::auth_for_tarball(&cfg, &dist.tarball),
         resolved_from,
         on_resolved.is_some(),
     )?;
@@ -202,7 +262,7 @@ pub fn provision_pm_from_tarball(
     store_root: &Path,
 ) -> Result<ProvisionedPm> {
     let pm_store = store_root.join("pm").join(pm.to_string());
-    let final_dir = pm_store.join(&dist.version);
+    let final_dir = store_version_dir(&pm_store, &dist.version)?;
     let bin = final_dir.join("package").join(&dist.bin_subpath);
 
     // Cache hit on the exact resolved version → done, zero work (the warm re-pin
@@ -221,14 +281,98 @@ pub fn provision_pm_from_tarball(
     })
 }
 
+/// How long a recorded dist-tag resolution (`latest` → `12.0.1`) is trusted
+/// without re-consulting the registry. The trade is freshness-lag vs. a network
+/// round-trip on every unpinned shim invocation; 24h matches the cadence other
+/// tools accept for the same default (corepack's known-good pin, npm's own
+/// update-notifier). Deliberately NOT configurable until real demand exists —
+/// every knob is a doc + support surface (AGENTS.md knob discipline).
+const TAG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether `spec` is a dist-tag (`latest`, `next`) — i.e. neither an exact
+/// version nor a semver range. Mirrors [`resolve_dist`]'s precedence safely:
+/// npm rejects publishing a tag that parses as a version or range, so the three
+/// classes are disjoint.
+fn is_dist_tag(spec: &str) -> bool {
+    semver::Version::parse(spec).is_err()
+        && semver::VersionReq::parse(&registry::normalize_range(spec)).is_err()
+}
+
+/// The tag-resolution record: `<pm_store>/.resolved-tags.json`, a flat
+/// `{"<registry-base>#<tag>": {"version": "...", "at": <unix-secs>}}` map. Lives
+/// INSIDE the per-PM store dir so [`best_cached_match`]'s version-dir scan
+/// parse-fails it out, and a registry switch (mirror vs public) misses the other
+/// registry's entries by key.
+fn tag_cache_file(pm_store: &Path) -> PathBuf {
+    pm_store.join(".resolved-tags.json")
+}
+
+fn tag_cache_key(registry_base: &str, tag: &str) -> String {
+    format!("{}#{tag}", registry_base.trim_end_matches('/'))
+}
+
+/// The recorded resolution of `tag` on `registry_base`, as `(version, age)`.
+/// Returns `None` for a missing/corrupt record file (never an error — the cache
+/// is advisory), and rejects a non-semver `version` value: the string becomes a
+/// store path component via [`cached_bin`], and while nub only ever records
+/// validated versions, a hand-edited file must not become a path-escape vector.
+fn read_tag_resolution(
+    pm_store: &Path,
+    registry_base: &str,
+    tag: &str,
+) -> Option<(String, Duration)> {
+    let raw = std::fs::read_to_string(tag_cache_file(pm_store)).ok()?;
+    let map: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let entry = map.get(tag_cache_key(registry_base, tag))?;
+    let version = entry.get("version")?.as_str()?;
+    semver::Version::parse(version).ok()?;
+    let at = entry.get("at")?.as_u64()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    // A future-dated record (clock skew at write, a hand-edited file) must not
+    // read as maximally fresh until wall-clock catches up — treat it as stale.
+    // The offline fallback still honors it; only freshness is denied.
+    let age = if at > now {
+        Duration::MAX
+    } else {
+        Duration::from_secs(now - at)
+    };
+    Some((version.to_string(), age))
+}
+
+/// Record `tag` → `version` (just resolved online) with the current time,
+/// preserving other registries'/tags' entries. Best-effort: a failure to record
+/// only costs the next invocation a re-resolve, so errors are swallowed. The
+/// write is temp-file + rename so a concurrent reader never sees a torn file
+/// (last writer wins, both wrote a fresh resolution).
+fn record_tag_resolution(pm_store: &Path, registry_base: &str, tag: &str, version: &str) {
+    let file = tag_cache_file(pm_store);
+    let mut map = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return;
+    };
+    map.insert(
+        tag_cache_key(registry_base, tag),
+        serde_json::json!({ "version": version, "at": now.as_secs() }),
+    );
+    let _ = std::fs::create_dir_all(pm_store);
+    let tmp = pm_store.join(format!(".resolved-tags-{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, serde_json::Value::Object(map).to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &file);
+    }
+}
+
 /// The runnable bin of an already-installed `<pm_store>/<version>/`, or `None`
 /// when the version isn't cached (or its install is unreadable/incomplete —
-/// callers then take the network path, whose installer treats an existing
-/// `package/` dir as someone else's completed install).
+/// callers then take the network path, whose installer repairs only that
+/// incomplete version entry from verified staging).
 fn cached_bin(pm_store: &Path, version: &str) -> Option<PathBuf> {
     let pkg_dir = pm_store.join(version).join("package");
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(pkg_dir.join("package.json")).ok()?).ok()?;
+    let raw = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(crate::strip_utf8_bom(&raw)).ok()?;
     let bin = pkg_dir.join(registry::bin_subpath(&manifest)?);
     bin.is_file().then_some(bin)
 }
@@ -400,22 +544,131 @@ fn extract_and_place(
     let top = extract_tgz(tarball, &staging)?;
     normalize_top_dir(&staging, &top)?;
 
-    // Atomic place. If a concurrent run already installed it, keep theirs.
-    if !final_dir.join("package").is_dir() {
-        std::fs::create_dir_all(pm_store).ok();
-        if let Err(e) = std::fs::rename(&staging, final_dir) {
-            if !final_dir.join("package").is_dir() {
-                return Err(e).with_context(|| {
-                    format!(
-                        "installing {pm} {} into {}",
-                        dist.version,
-                        final_dir.display()
-                    )
-                });
-            }
+    let staging_bin = staging.join("package").join(&dist.bin_subpath);
+    let final_bin = final_dir.join("package").join(&dist.bin_subpath);
+    if !staging_bin.is_file() {
+        bail!(
+            "cannot install {pm} {}: the verified package is missing the expected launcher {}",
+            dist.version,
+            final_bin.display()
+        );
+    }
+
+    if final_bin.is_file() {
+        return Ok(());
+    }
+    if final_dir.exists() {
+        return recover_incomplete_version(pm, dist, pm_store, final_dir, &staging);
+    }
+
+    #[cfg(test)]
+    run_before_initial_rename_test_hook(final_dir);
+
+    match std::fs::rename(&staging, final_dir) {
+        Ok(()) => require_launcher(pm, dist, &final_bin),
+        Err(_) if final_bin.is_file() => Ok(()),
+        Err(_) if final_dir.exists() => {
+            recover_incomplete_version(pm, dist, pm_store, final_dir, &staging)
         }
+        Err(e) => Err(e).with_context(|| placement_context(pm, dist, final_dir)),
+    }
+}
+
+fn recover_incomplete_version(
+    pm: super::Pm,
+    dist: &VersionDist,
+    pm_store: &Path,
+    final_dir: &Path,
+    staging: &Path,
+) -> Result<()> {
+    let final_bin = final_dir.join("package").join(&dist.bin_subpath);
+    if final_bin.is_file() {
+        return Ok(());
+    }
+
+    let quarantine = match move_to_unique_quarantine(pm_store, final_dir, &dist.version) {
+        Ok(path) => path,
+        Err(_) if final_bin.is_file() => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let _quarantine_guard = WorkGuard(quarantine.clone());
+    match std::fs::rename(staging, final_dir) {
+        Ok(()) => require_launcher(pm, dist, &final_bin),
+        Err(_) if final_bin.is_file() => Ok(()),
+        Err(e) => Err(e).with_context(|| placement_context(pm, dist, final_dir)),
+    }
+}
+
+fn move_to_unique_quarantine(pm_store: &Path, final_dir: &Path, version: &str) -> Result<PathBuf> {
+    rename_to_unique_sibling(final_dir, || next_quarantine_path(pm_store, version)).with_context(
+        || {
+            format!(
+                "cannot quarantine incomplete package-manager cache entry {}",
+                final_dir.display()
+            )
+        },
+    )
+}
+
+fn require_launcher(pm: super::Pm, dist: &VersionDist, launcher: &Path) -> Result<()> {
+    if !launcher.is_file() {
+        bail!(
+            "installing {pm} {} did not produce the expected launcher {}",
+            dist.version,
+            launcher.display()
+        );
     }
     Ok(())
+}
+
+fn placement_context(pm: super::Pm, dist: &VersionDist, final_dir: &Path) -> String {
+    format!(
+        "installing {pm} {} into {}",
+        dist.version,
+        final_dir.display()
+    )
+}
+
+fn rename_to_unique_sibling(
+    source: &Path,
+    mut next: impl FnMut() -> PathBuf,
+) -> std::io::Result<PathBuf> {
+    loop {
+        let candidate = next();
+        match std::fs::rename(source, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(_)
+                if std::fs::symlink_metadata(source).is_ok()
+                    && std::fs::symlink_metadata(&candidate).is_ok() =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn next_quarantine_path(pm_store: &Path, version: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    pm_store.join(format!(
+        ".tmp-replaced-{version}-{}-{sequence}",
+        std::process::id()
+    ))
+}
+
+#[cfg(test)]
+type BeforeInitialRenameHook = Box<dyn Fn(&Path) + Send>;
+
+#[cfg(test)]
+static BEFORE_INITIAL_RENAME_HOOK: std::sync::Mutex<Option<BeforeInitialRenameHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_before_initial_rename_test_hook(final_dir: &Path) {
+    if let Some(hook) = BEFORE_INITIAL_RENAME_HOOK.lock().unwrap().as_ref() {
+        hook(final_dir);
+    }
 }
 
 /// The silent (no announce, no `Installed` line) extract+place for the
@@ -505,6 +758,23 @@ impl Drop for WorkGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F0c structural backstop: a legit version stays under the store; an absolute
+    /// component (the cross-platform stand-in for the Windows `C:foo` drive-relative
+    /// escape, where `Path::join` discards the base) is refused. `validate_version`
+    /// blocks both before they reach here — this proves the second line of defense.
+    #[test]
+    fn store_version_dir_contains_legit_and_rejects_a_base_discarding_join() {
+        let store = Path::new("/var/cache/nub/pm/pnpm");
+        assert_eq!(
+            store_version_dir(store, "11.9.0").unwrap(),
+            store.join("11.9.0")
+        );
+        assert!(
+            store_version_dir(store, "/etc/evil").is_err(),
+            "an absolute version makes join discard the base — must be refused"
+        );
+    }
     use crate::pm::Pm;
 
     #[test]
@@ -706,26 +976,234 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store);
     }
 
+    /// A loopback registry answering EVERY request with 200 + a pnpm@9.9.9
+    /// version manifest whose dist.tarball points back at the mock (where a GET
+    /// yields this same JSON — never a valid tarball, so any install attempt
+    /// against it fails on integrity). This makes the tag-cache tests
+    /// DISCRIMINATING: a run that consults the registry observably resolves
+    /// 9.9.9 (and then fails to install it), which a cache short-circuit never
+    /// does. The accept loop rides a detached thread for the remaining test
+    /// process — a few KB, no cleanup needed.
+    fn mock_registry_serving_pnpm_9_9_9() -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = format!(
+            r#"{{ "name": "pnpm", "version": "9.9.9", "bin": {{ "pnpm": "bin/pnpm.cjs" }},
+                 "dist": {{ "tarball": "http://127.0.0.1:{port}/pnpm-9.9.9.tgz", "integrity": "sha512-AAAA" }} }}"#
+        );
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { break };
+                let mut buf = [0u8; 4096];
+                let _ = conn.read(&mut buf); // drain the request head
+                let _ = conn.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn fresh_tag_resolution_short_circuits_the_registry() {
+        if ambient_registry_override() {
+            return; // env registry outranks the test .npmrc — see helper
+        }
+        // A recorded, TTL-fresh `latest` → 9.5.0 with the version installed must
+        // return WITHOUT consulting the registry. The registry is a live mock
+        // that resolves `latest` to a DIFFERENT version (9.9.9, uninstallable),
+        // so a run that consults it cannot produce Ok(9.5.0) — the assertion
+        // distinguishes the short-circuit from the offline-fallback path, which
+        // a dead registry alone could not.
+        let store = offline_store_with("tag-fresh", "9.5.0");
+        let mock = mock_registry_serving_pnpm_9_9_9();
+        std::fs::write(store.join(".npmrc"), format!("registry={mock}\n")).unwrap();
+        let pm_store = store.join("pm").join("pnpm");
+        record_tag_resolution(&pm_store, &mock, "latest", "9.5.0");
+
+        let pin = PmPin {
+            pm: Pm::Pnpm,
+            version: Some("latest".to_string()),
+        };
+        let seen = std::cell::RefCell::new(Vec::<String>::new());
+        let prov = provision_pm_announced(
+            &pin,
+            &store,
+            &store,
+            None,
+            Some(&|v: &str| {
+                seen.borrow_mut().push(v.to_string());
+            }),
+        )
+        .expect("fresh tag record + cached install must not consult the registry");
+        assert_eq!(prov.version, "9.5.0");
+        assert_eq!(
+            *seen.borrow(),
+            vec!["9.5.0".to_string()],
+            "the shim-header hook still fires on the tag-cache hit"
+        );
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn stale_tag_resolution_is_not_trusted_for_freshness() {
+        if ambient_registry_override() {
+            return; // env registry outranks the test .npmrc — see helper
+        }
+        // The TTL boundary: an EXPIRED record must NOT short-circuit — the
+        // resolve must run. Against the live mock, `latest` resolves to 9.9.9
+        // whose "tarball" is JSON, so the run fails at install; a wrongly-firing
+        // short-circuit would instead return Ok(9.5.0). Future-dated records
+        // (at > now) are equally untrusted.
+        let store = offline_store_with("tag-expired", "9.5.0");
+        let mock = mock_registry_serving_pnpm_9_9_9();
+        std::fs::write(store.join(".npmrc"), format!("registry={mock}\n")).unwrap();
+        let pm_store = store.join("pm").join("pnpm");
+        for at in [1u64, u64::MAX] {
+            std::fs::write(
+                tag_cache_file(&pm_store),
+                format!(
+                    "{{\"{}\": {{\"version\": \"9.5.0\", \"at\": {at}}}}}",
+                    tag_cache_key(&mock, "latest")
+                ),
+            )
+            .unwrap();
+            let pin = PmPin {
+                pm: Pm::Pnpm,
+                version: Some("latest".to_string()),
+            };
+            let result = provision_pm(&pin, &store, &store, None);
+            assert!(
+                result.is_err(),
+                "an untrusted record (at={at}) must re-resolve, reaching the mock's \
+                 uninstallable 9.9.9 — got {result:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn stale_tag_resolution_survives_a_registry_outage() {
+        if ambient_registry_override() {
+            return; // env registry outranks the dead-registry .npmrc — see helper
+        }
+        // An EXPIRED record is not trusted for freshness (the resolve runs), but
+        // when the registry is unreachable it is the offline answer — stale
+        // beats down. Written by hand with at=1 (record_tag_resolution always
+        // stamps now).
+        let store = offline_store_with("tag-stale", "9.5.0");
+        let pm_store = store.join("pm").join("pnpm");
+        std::fs::write(
+            tag_cache_file(&pm_store),
+            format!(
+                "{{\"{}\": {{\"version\": \"9.5.0\", \"at\": 1}}}}",
+                tag_cache_key("http://127.0.0.1:1/", "latest")
+            ),
+        )
+        .unwrap();
+
+        let pin = PmPin {
+            pm: Pm::Pnpm,
+            version: Some("latest".to_string()),
+        };
+        let prov = provision_pm(&pin, &store, &store, None)
+            .expect("stale tag record is the offline fallback");
+        assert_eq!(prov.version, "9.5.0");
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn tag_record_round_trips_and_rejects_junk() {
+        let store = std::env::temp_dir().join(format!("nub-pm-tagrec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let pm_store = store.join("pm").join("npm");
+
+        // Round-trip, preserving a sibling registry's entry.
+        record_tag_resolution(&pm_store, "https://registry.npmjs.org/", "latest", "12.0.1");
+        record_tag_resolution(&pm_store, "https://mirror.example.com", "latest", "11.9.9");
+        let (version, age) = read_tag_resolution(&pm_store, "https://registry.npmjs.org", "latest")
+            .expect("fresh record reads back");
+        assert_eq!(version, "12.0.1");
+        assert!(age <= TAG_TTL, "a just-written record is fresh");
+        assert_eq!(
+            read_tag_resolution(&pm_store, "https://mirror.example.com/", "latest")
+                .expect("sibling registry entry preserved")
+                .0,
+            "11.9.9"
+        );
+
+        // A non-semver version value is refused — the string becomes a store
+        // path component, so a hand-edited file must not smuggle one in.
+        std::fs::write(
+            tag_cache_file(&pm_store),
+            format!(
+                "{{\"{}\": {{\"version\": \"../evil\", \"at\": 999999999999}}}}",
+                tag_cache_key("https://registry.npmjs.org", "latest")
+            ),
+        )
+        .unwrap();
+        assert!(read_tag_resolution(&pm_store, "https://registry.npmjs.org", "latest").is_none());
+
+        // Corrupt JSON is advisory-cache tolerated: read yields None, no panic.
+        std::fs::write(tag_cache_file(&pm_store), "not json").unwrap();
+        assert!(read_tag_resolution(&pm_store, "https://registry.npmjs.org", "latest").is_none());
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    const FAKE_PNPM_LAUNCHER: &[u8] = b"// fake pnpm launcher\n";
+
     /// Author a `package/`-rooted pnpm-shaped `.tgz` (gzip + tar) on disk — what
     /// the registry serves and what `nub pm use` downloads once, then hands to
     /// [`provision_pm_from_tarball`]. Same shape `extract.rs` authors in its own
     /// tests; restated here (three lines) rather than crossing the module seam.
     fn write_pnpm_tgz(archive: &Path) {
+        write_pnpm_tgz_with_launcher(archive, Some(FAKE_PNPM_LAUNCHER));
+    }
+
+    fn write_pnpm_tgz_with_launcher(archive: &Path, launcher: Option<&[u8]>) {
         use flate2::{Compression, write::GzEncoder};
         let manifest = br#"{ "name": "pnpm", "bin": { "pnpm": "bin/pnpm.cjs" } }"#;
-        let bin = b"// fake pnpm launcher\n";
         let gz = GzEncoder::new(std::fs::File::create(archive).unwrap(), Compression::fast());
         let mut tar = tar::Builder::new(gz);
-        for (path, body) in [
-            ("package/package.json", manifest.as_slice()),
-            ("package/bin/pnpm.cjs", bin.as_slice()),
-        ] {
+        for (path, body) in [("package/package.json", manifest.as_slice())]
+            .into_iter()
+            .chain(launcher.map(|body| ("package/bin/pnpm.cjs", body)))
+        {
             let mut h = tar::Header::new_gnu();
             h.set_size(body.len() as u64);
             h.set_mode(0o644);
             tar.append_data(&mut h, path, body).unwrap();
         }
         tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    fn fake_pnpm_dist() -> VersionDist {
+        VersionDist {
+            version: "9.12.0".to_string(),
+            tarball: "http://127.0.0.1:1/never-fetched.tgz".to_string(),
+            integrity: registry::Integrity::Sha512("unused-caller-already-verified".to_string()),
+            bin_subpath: PathBuf::from("bin/pnpm.cjs"),
+        }
+    }
+
+    fn assert_no_placement_debris(pm_store: &Path) {
+        let leftovers = std::fs::read_dir(pm_store)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(".tmp-place-") || name.starts_with(".tmp-replaced-"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "placement work and quarantine dirs are cleaned: {leftovers:?}"
+        );
     }
 
     #[test]
@@ -741,14 +1219,8 @@ mod tests {
 
         let tgz = store.join("pnpm-9.12.0.tgz");
         write_pnpm_tgz(&tgz);
-        let dist = VersionDist {
-            version: "9.12.0".to_string(),
-            // A bogus tarball URL: if the pre-downloaded path ever tried to fetch,
-            // it would hit this and fail — it must not.
-            tarball: "http://127.0.0.1:1/never-fetched.tgz".to_string(),
-            integrity: registry::Integrity::Sha512("unused-caller-already-verified".to_string()),
-            bin_subpath: PathBuf::from("bin/pnpm.cjs"),
-        };
+        // The bogus URL in this dist fails fast if the pre-downloaded path ever fetches.
+        let dist = fake_pnpm_dist();
 
         // Cold: extracts the supplied tarball into the version-addressed store.
         let cold = provision_pm_from_tarball(Pm::Pnpm, &dist, &tgz, &store)
@@ -769,6 +1241,109 @@ mod tests {
             warm, cold,
             "the warm hit returns the identical bin + version"
         );
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn provision_from_tarball_repairs_an_incomplete_version_entry() {
+        let store = offline_store_with("from-tarball-repair", "0.0.0-unused");
+        let _ = std::fs::remove_dir_all(store.join("pm"));
+
+        let tgz = store.join("pnpm-9.12.0.tgz");
+        write_pnpm_tgz(&tgz);
+        let dist = fake_pnpm_dist();
+        let final_dir = store.join("pm/pnpm/9.12.0");
+        std::fs::create_dir_all(final_dir.join("package")).unwrap();
+        std::fs::write(final_dir.join("stale-sentinel"), "stale").unwrap();
+
+        let provisioned = provision_pm_from_tarball(Pm::Pnpm, &dist, &tgz, &store)
+            .expect("a verified replacement repairs an incomplete version entry");
+        assert_eq!(
+            std::fs::read(&provisioned.bin).unwrap(),
+            FAKE_PNPM_LAUNCHER,
+            "the replacement launcher lands at the returned path"
+        );
+        assert!(
+            !final_dir.join("stale-sentinel").exists(),
+            "recovery replaces the whole version entry rather than merging trees"
+        );
+        assert_no_placement_debris(&store.join("pm/pnpm"));
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn placement_preserves_a_valid_concurrent_winner() {
+        let store = offline_store_with("from-tarball-winner", "0.0.0-unused");
+        let _ = std::fs::remove_dir_all(store.join("pm"));
+        let pm_store = store.join("pm/pnpm");
+        let final_dir = pm_store.join("9.12.0");
+        let winner_bin = final_dir.join("package/bin/pnpm.cjs");
+        assert!(!final_dir.exists());
+
+        let tgz = store.join("pnpm-9.12.0.tgz");
+        write_pnpm_tgz_with_launcher(&tgz, Some(b"candidate\n"));
+        let hook_target = final_dir.clone();
+        *BEFORE_INITIAL_RENAME_HOOK.lock().unwrap() = Some(Box::new(move |current| {
+            if current == hook_target.as_path() {
+                let winner = current.join("package/bin/pnpm.cjs");
+                std::fs::create_dir_all(winner.parent().unwrap()).unwrap();
+                std::fs::write(winner, b"winner\n").unwrap();
+            }
+        }));
+        let provisioned = provision_pm_from_tarball(Pm::Pnpm, &fake_pnpm_dist(), &tgz, &store);
+        *BEFORE_INITIAL_RENAME_HOOK.lock().unwrap() = None;
+        let provisioned = provisioned.expect("a valid concurrent winner is adopted");
+
+        assert_eq!(provisioned.bin, winner_bin);
+        assert_eq!(std::fs::read(&winner_bin).unwrap(), b"winner\n");
+        assert_no_placement_debris(&pm_store);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn quarantine_rename_skips_a_stale_name_collision() {
+        let store = offline_store_with("quarantine-collision", "0.0.0-unused");
+        let source = store.join("9.12.0");
+        let stale_quarantine = store.join("stale-quarantine");
+        let fresh_quarantine = store.join("fresh-quarantine");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("incumbent"), "incumbent").unwrap();
+        std::fs::create_dir_all(&stale_quarantine).unwrap();
+        std::fs::write(stale_quarantine.join("sentinel"), "stale").unwrap();
+        let mut candidates = [stale_quarantine.clone(), fresh_quarantine.clone()].into_iter();
+
+        let quarantine = rename_to_unique_sibling(&source, || candidates.next().unwrap()).unwrap();
+        assert_eq!(quarantine, fresh_quarantine);
+        assert!(fresh_quarantine.join("incumbent").is_file());
+        assert!(stale_quarantine.join("sentinel").is_file());
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn a_malformed_replacement_does_not_disturb_an_incomplete_incumbent() {
+        let store = offline_store_with("from-tarball-incomplete", "0.0.0-unused");
+        let _ = std::fs::remove_dir_all(store.join("pm"));
+        let pm_store = store.join("pm/pnpm");
+        let final_dir = pm_store.join("9.12.0");
+        let tgz = store.join("pnpm-9.12.0.tgz");
+        write_pnpm_tgz_with_launcher(&tgz, None);
+        let dist = fake_pnpm_dist();
+
+        std::fs::create_dir_all(final_dir.join("package")).unwrap();
+        std::fs::write(final_dir.join("stale-sentinel"), "stale").unwrap();
+        let incumbent_err = provision_pm_from_tarball(Pm::Pnpm, &dist, &tgz, &store)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            incumbent_err.contains("verified package is missing the expected launcher"),
+            "unexpected error: {incumbent_err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(final_dir.join("stale-sentinel")).unwrap(),
+            "stale",
+            "staging validation fails before moving an incomplete incumbent"
+        );
+        assert_no_placement_debris(&pm_store);
         let _ = std::fs::remove_dir_all(&store);
     }
 

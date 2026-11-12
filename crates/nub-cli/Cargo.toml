@@ -2,7 +2,10 @@
 name = "nub-cli"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# 1.95 for core::hint::cold_path() in the vendored aube engine (a path dep of
+# nub-cli) — an explicit guard that stands independent of the workspace's
+# oxc-0.140-driven 1.95 floor. See vendor/aube/Cargo.toml.
+rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
 
@@ -10,14 +13,137 @@ repository.workspace = true
 name = "nub"
 path = "src/main.rs"
 
+[features]
+# Single self-contained binary: embed the `runtime/` tree as a compressed blob and
+# JIT-extract it on first run (forwards to nub-core, where the extract module +
+# build.rs blob generation live). OFF by default — the `--profile fast` dev loop
+# and `make install-dev` keep walking to the in-repo `runtime/`. CI release builds
+# pass `--features embed-runtime`.
+embed-runtime = ["nub-core/embed-runtime"]
+# `nub compile` (spike): the in-process Rolldown bundler + Mach-O section
+# injection/signing (libsui) + zstd-19 Node compression. OFF by default — these
+# are large, compile-time-only deps, so the everyday build and CI cheap gates
+# don't carry them. `tokio/full` gives the bundler a full async runtime. Rolldown's
+# oxc requirement is what sets the repo-wide oxc pin (see the root Cargo.toml
+# OXC_VERSION note): every oxc consumer tracks it so this feature adds Rolldown's
+# own crates, NOT a second oxc stack.
+compile = [
+    "dep:rolldown",
+    "dep:rolldown_common",
+    "dep:rolldown_error",
+    "dep:rolldown_utils",
+    "dep:libsui",
+    "dep:zstd",
+    "dep:brotli",
+    "dep:oxc_allocator",
+    "dep:oxc_ast",
+    "dep:oxc_ast_visit",
+    "dep:oxc_parser",
+    "dep:oxc_semantic",
+    "dep:oxc_span",
+    "dep:string_wizard",
+    "dep:rolldown_sourcemap",
+    "dep:glob-match",
+    "dep:pathdiff",
+    "dep:unicode-casefold",
+    "dep:unicode-normalization",
+    "tokio/full",
+]
+
 [dependencies]
 nub-core = { path = "../nub-core" }
+# The raw-text nesting bound every externally-authored JSONC read goes through
+# (src/jsonc.rs). Shared with the nub-native addon, which parses the same
+# JSON-family formats in its own workspace, so the two cannot drift.
+nub-json-guard = { path = "../nub-json-guard" }
+# The data-format parsers, shared with the N-API addon so a `.yaml` import cannot
+# mean one thing under `nub` and another once compiled.
+nub-data-formats = { path = "../nub-data-formats" }
+# `nub compile` compile-time pipeline (behind the `compile` feature). The Rolldown
+# crates are pinned EXACT — they explicitly disclaim semver (rolldown.rs/apis/
+# rust-crates), so every bump is a reviewed change gated on a round-trip test.
+rolldown = { version = "=1.2.0", optional = true }
+rolldown_common = { version = "=1.2.0", optional = true }
+# `rolldown_error` for `EventKind::UnresolvedImport` (the unresolved-import gate
+# reads the bundler's own resolve diagnostics); `rolldown_utils` for the
+# `FxIndexMap` that `BundlerOptions::define` is typed against. Both are already in
+# Rolldown's own graph — pinned in lockstep with it.
+rolldown_error = { version = "=1.2.0", optional = true }
+rolldown_utils = { version = "=1.2.0", optional = true }
+# The oxc parser subset backing the unresolved-import scan for non-literal
+# `import(expr)` sites. Already compiled for nub-phantom-core (same EXACT
+# workspace pin), so the compile feature adds no oxc build cost.
+oxc_allocator = { version = "=0.140.0", optional = true }
+oxc_ast = { version = "=0.140.0", optional = true }
+oxc_ast_visit = { version = "=0.140.0", optional = true }
+oxc_parser = { version = "=0.140.0", optional = true }
+oxc_semantic = { version = "=0.140.0", optional = true }
+oxc_span = { version = "=0.140.0", optional = true }
+# Used directly for insertion-aware source maps in Nub's Rolldown transforms.
+# This exact version is already transitive under Rolldown; declare it here only
+# to construct the map, pinned in lockstep because Rolldown's crate APIs are
+# explicitly non-semver.
+string_wizard = { version = "=1.2.0", optional = true }
+# `collapse_sourcemaps`, to keep a chunk's map true after the post-minify eager
+# compilation rewrite in `compile::bundle` (the same composition Rolldown applies
+# to a `render_chunk` hook's map, which that rewrite runs too late to use).
+rolldown_sourcemap = { version = "=1.2.0", optional = true }
+# Two consumers: the compile path reads the entry's effective tsconfig (`extends`
+# chain applied) to decide whether `compilerOptions.jsx` is "preserve", and the
+# bare-preload resolver uses it unconditionally — so it is NOT optional, or a
+# default build breaks. Pinned to the version already in Rolldown's graph: it is
+# the SAME resolver Rolldown loads tsconfigs with, so the answer cannot disagree
+# with what the bundler goes on to do.
+oxc_resolver = "=11.24.2"
+# Mach-O section injection + pure-Rust ad-hoc signing of the launcher output.
+libsui = { version = "0.16", optional = true }
+# zstd-19 compression of the embedded Node (encode side; the launcher decodes with
+# pure-Rust ruzstd).
+zstd = { version = "0.13", optional = true }
+# The inline (`no-extract`) payload's codec. Brotli rather than the zstd beside it
+# because the artifact's own JavaScript is what decompresses those bytes, and
+# `zlib.zstdDecompressSync` is absent on Node 23.5 and 23.6.
+brotli = { version = "8", optional = true }
+# `--include`/`--exclude` matching. Already in the tree at this version as a
+# nub-core dependency, so the compile feature adds no build cost — declared here
+# rather than reached through nub-core, which does not re-export it.
+glob-match = { version = "0.2", optional = true }
+# Full default/non-Turkic folding for Darwin filesystem collision keys. Simple
+# lowercase misses multi-codepoint folds such as `ß` → `ss`.
+unicode-casefold = { version = "0.2", optional = true }
+# Default macOS APFS folds canonically equivalent Unicode filename spellings,
+# so compile normalizes Darwin payload names before collision detection.
+unicode-normalization = { version = "0.1", optional = true }
+# tsconfig discovery / parse / `extends` — the SAME reader the nub-native addon uses,
+# so `compilerOptions.customConditions` becomes `--conditions=` NODE_OPTIONS tokens
+# before Node starts (src/cli.rs `runtime_node_options_with`). Sharing the crate is
+# what stops the `extends` chain being implemented twice.
+nub-tsconfig = { path = "../nub-tsconfig" }
+# Shared phantom-classification primitives (specifier extraction + guard modeling
+# + builtin/name classification) for the pre-run phantom scan (src/phantom_scan.rs).
+# Depends on the LEAN oxc parser subset, not the full `oxc` umbrella — see the
+# crate's Cargo.toml for why that keeps the shipped CLI's build graph lean.
+nub-phantom-core = { path = "../nub-phantom-core" }
+# The reachable-graph phantom SCANNER (graph walk + classify) for the dynamic
+# per-version scan → sidecar path (unconditionally on for users). Lean by
+# construction — same oxc-parser weight as nub-phantom-core, no fetch stack. The
+# `ScanResult` it defines is the sidecar payload phantom_closure deserializes.
+nub-phantom-scan = { path = "../nub-phantom-scan" }
 # Vendored aube (vendor/aube — plain in-tree files, vendored from nubjs/aube). aube-lockfile
 # is a pure library crate (no CLI/tokio surface); `aube` is the command layer
 # as a library (lib target landed in nubjs/aube@b15cdcb) — `nub install` /
 # `nub ci` route through `aube::commands::install::run` in-process instead of
 # shelling out. See vendor/aube/AGENTS.md and src/pm_engine/.
 aube-lockfile = { path = "../../vendor/aube/crates/aube-lockfile" }
+# aube-linker: nub installs a disk-materialize expansion hook (selective-subtree
+# materialization) via `aube_linker::set_disk_materialize_expand_hook`; a pure
+# library crate (no CLI/tokio surface), same lean-graph rationale as aube-lockfile.
+aube-linker = { path = "../../vendor/aube/crates/aube-linker" }
+# aube-resolver: `nub import` runs the peer-context pass (hoist_auto_installed_peers
+# + apply_peer_contexts) on a bun/npm-parsed graph before writing pnpm-lock, so the
+# imported lockfile carries peer suffixes the install path assumes pnpm-locks have
+# (#453). Pure offline graph transforms; a lean library crate already in the graph.
+aube-resolver = { path = "../../vendor/aube/crates/aube-resolver" }
 aube-manifest = { path = "../../vendor/aube/crates/aube-manifest" }
 # default-features = false drops aube's default set (`mimalloc`, `config-tui`),
 # neither of which nub uses: aube's `config-tui` (ratatui/crossterm) only feeds
@@ -26,7 +152,22 @@ aube-manifest = { path = "../../vendor/aube/crates/aube-manifest" }
 # aube's `mimalloc` feature only swaps the allocator in aube's own dead main.rs
 # — nub sets its own mimalloc global allocator in nub-cli's main.rs. Dropping
 # config-tui removes ratatui + crossterm from the binary's dependency graph.
-aube = { path = "../../vendor/aube/crates/aube", default-features = false }
+#
+# `rustls` and `publish` are NOT optional for nub even though they are default
+# features upstream: aube v1.32 (jdx/aube#1068, #1069) feature-gated the TLS
+# backend and the publish/sigstore stack so embedders can drop them, so with
+# `default-features = false` they must be re-named here. `rustls` is the crate's
+# only TLS backend (upstream: "embedders depend with default-features = false,
+# features = [\"rustls\"]"); `publish` gates `commands::publish`, which
+# pm_engine/publish_family.rs calls directly.
+aube = { path = "../../vendor/aube/crates/aube", default-features = false, features = [
+    "rustls",
+    "publish",
+    # Comment/format-preserving edits of user-authored workspace YAML (catalogs,
+    # allowBuilds, patchedDependencies). Upstream made it optional in v2.2
+    # (aubepkg/aube#1278) and keeps it default; nub always had it, so re-name it.
+    "workspace-yaml-preserve",
+] }
 # `EffectiveFilter` for the workspace-aware engine verbs (`nub publish
 # --filter/-r`); same type aube's own dispatch passes to publish/list/etc.
 aube-workspace = { path = "../../vendor/aube/crates/aube-workspace" }
@@ -48,6 +189,10 @@ aube-scripts = { path = "../../vendor/aube/crates/aube-scripts" }
 # Diagnostics / critical-path recorder: nub's engine_session calls diag::init()
 # so AUBE_DIAG_* env vars work when nub install runs the embedded aube engine.
 aube-util = { path = "../../vendor/aube/crates/aube-util" }
+# Store dir resolution: the Vite compat post-install step (pm_engine/vite_compat.rs)
+# reads the global virtual-store path via `aube_store::dirs::cache_dir()` (embedder
+# cache_namespace-aware) to write it into `.modules.yaml`. Already a transitive dep.
+aube-store = { path = "../../vendor/aube/crates/aube-store" }
 # Same major + `fancy` as vendor/aube — present.rs renders the engine's
 # miette::Report exactly as aube's own cli_main would, then rewrites it.
 miette = { version = "7", features = ["fancy"] }
@@ -56,34 +201,73 @@ base64 = "0.22"
 # Global allocator for the `nub` binary only. NOT added to crates/nub-native
 # (the cdylib loaded into Node) — that must not hijack Node's allocator.
 mimalloc = "0.1"
-clap.workspace = true
+usage-rs.workspace = true
 # Same major as vendor/aube: `nubx -q` switches the engine's progress UI to
 # text mode via clx::progress::set_output, the same knob aube's own startup
 # flips for --silent (vendor/aube/crates/aube/src/startup.rs).
-clx = "2"
+clx = "3"
+# Same major as vendor/aube: `nub init`'s prompts (src/init.rs) use the same
+# clack-style prompt crate the engine already ships, so the dep graph carries
+# one copy and the prompt aesthetic matches the engine's own pickers.
+demand = "2"
 dirs-next.workspace = true
 dotenvy = "0.15"
+# The string form of `nub.jsonc#prefix` splits like a POSIX shell word list.
+shlex = "2"
 # `preserve_order` keeps serde_json::Map in INSERTION order (IndexMap-backed) so
 # pm_engine's config rewrites (use_nub.rs, config_scope.rs, store_config_family.rs)
 # preserve the user's existing key order rather than alphabetizing the file.
+serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
+# Node module resolution for ONE narrow job: turning a BARE `nub.jsonc` `preload`
+# entry into an absolute path before Node starts (prepare_preload_chain in cli.rs).
+# That resolution is cold and pre-V8 — nothing has executed, so none of the
+# JS-runtime inputs to Node's algorithm (loader hooks, require.cache,
+# require.extensions, monkey-patched _resolveFilename) exist yet, which is what
+# makes a static resolver sound HERE and unsound for runtime resolution. nub's
+# runtime hooks still delegate every in-process resolution to Node; that
+# delegation is what keeps nub at 0 divergences across Node's own resolution
+# corpus (wiki/research/resolution-conformance.md), and this dependency must not
+# be wired into it. Independently versioned from the oxc transpiler pin above —
+# different crate, different release train.
 rustc-hash.workspace = true
 semver = "1"
+# npm-semantics range satisfaction for the pre-run dependency-freshness gate
+# (verify_deps.rs). The Cargo `semver` crate above uses Cargo semantics, which
+# don't match npm ranges (`x`-ranges, `||` unions, hyphen ranges); node-semver
+# is the same resolver aube already uses.
+node-semver = "2"
+pathdiff = { version = "0.2", optional = true }
 # pnpm-workspace.yaml read + regeneration for `nub pm use nub` / `use pnpm`
-# (pm_engine/use_nub.rs). serde_yaml is archived/unmaintained; serde_yaml_ng
-# is the maintained, API-compatible fork, aliased as `serde_yaml` so the
-# source paths are unchanged.
-serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+# (pm_engine/use_nub.rs). serde_yaml is archived/unmaintained; yaml_serde is
+# the maintained, API-compatible fork vendor/aube already builds, aliased as
+# `serde_yaml` so the source paths are unchanged.
+serde_yaml = { package = "yaml_serde", version = "0.10" }
 sha2.workspace = true
+hex = "0.4"
+# Records the embedded Node's optional BLAKE3 format-headroom field. The launcher
+# does not hash the extracted runtime on its current warm path.
+blake3 = "1"
 tracing.workspace = true
 tempfile = "3"
 toml.workspace = true
+# Comment-preserving JSONC read (serde) + read-modify-write (cst) for nub's own
+# global config file (~/.config/nub/nub.jsonc, see src/config.rs).
+jsonc-parser.workspace = true
+console.workspace = true
 # Multi-thread runtime for the embedded aube install engine (pm_engine.rs).
 # Mirrors aube's own cli_main runtime shape; tokio is dormant on every other
 # nub code path.
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing-subscriber.workspace = true
 url = "2.5"
+# Only to SIZE the rayon GLOBAL pool under a detected PID/thread constraint
+# (pm_engine::build_runtime): the embedded engine fans CAS writes / delta / fetch
+# out over rayon's implicit global pool, whose lazy init spins up
+# available_parallelism() threads (CPU-quota-bound, NOT PID-bound) and PANICS on
+# thread-create EAGAIN — the same exit-101 abort the tokio cap closes. We cap it
+# under the same headroom budget; unconstrained boxes keep rayon's default.
+rayon = "1"
 
 [target.'cfg(unix)'.dependencies]
 # fd-level capture of the engine's raw println/eprintln hint lines so the
@@ -97,6 +281,13 @@ libc.workspace = true
 # (pm_engine/mod.rs::with_fd_captured). Without it the substitution silently
 # breaks and the default registry is never surfaced on Windows.
 libc.workspace = true
+# Expand 8.3 path components before auto-discovered env files reach Node's
+# Windows watcher. Node 24's bundled libuv aborts when an event path and watched
+# directory use short and long spellings of the same directory.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 
 [lints]
 workspace = true

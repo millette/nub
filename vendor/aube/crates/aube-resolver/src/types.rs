@@ -24,26 +24,19 @@ pub trait ReadPackageHook: Send {
     ) -> Pin<Box<dyn Future<Output = Result<aube_registry::VersionMetadata, String>> + Send + 'a>>;
 }
 
-/// Supply-chain mitigation: forbid versions younger than `min_age` for
-/// every package not matched by an `exclude` rule. Mirrors pnpm's
-/// `minimumReleaseAge` / `minimumReleaseAgeExclude` /
+/// Supply-chain mitigation: forbid versions younger than `min_age`
+/// unless the package (or specific version) is exempted by `exclude`.
+/// Mirrors pnpm's `minimumReleaseAge` / `minimumReleaseAgeExclude` /
 /// `minimumReleaseAgeStrict` triplet. Constructed by the install
 /// command, threaded into [`Resolver::with_minimum_release_age`].
-///
-/// `exclude` reuses the same [`TrustExcludeRules`] grammar as
-/// `trustPolicyExclude`, so a `minimumReleaseAgeExclude` entry may be
-/// name-only (`lodash` — every version of the package skips the age
-/// gate, the original behavior), or version-pinned with a `||` union
-/// (`axios@0.18.1 || 0.21.1` — only those exact versions skip the
-/// gate), matching pnpm's documented `name@v1 || v2` support.
 #[derive(Debug, Clone)]
 pub struct MinimumReleaseAge {
     /// Minutes a version must have aged in the registry. `0` disables.
     pub minutes: u64,
-    /// Packages/versions skipped by the cutoff filter. Name-only rules
-    /// exempt the whole package; version-pinned rules exempt only the
-    /// listed exact versions.
-    pub exclude: crate::trust::TrustExcludeRules,
+    /// Packages exempt from the cutoff. Supports the same syntax pnpm's
+    /// `minimumReleaseAgeExclude` does: bare names, `*` name globs (e.g.
+    /// `@myorg/*`), and exact-version unions (`pkg@1.2.3 || 1.2.4`).
+    pub exclude: crate::trust::PackageVersionPolicy,
     /// When true, fail the install if no version satisfies the range
     /// without violating the cutoff. When false (the pnpm default), the
     /// resolver falls back to the lowest satisfying version, ignoring
@@ -53,12 +46,12 @@ pub struct MinimumReleaseAge {
 
 impl Default for MinimumReleaseAge {
     fn default() -> Self {
+        // `PackageVersionPolicy::default()` carries the *trust* exclude
+        // list; the age gate must start with no exemptions, so use the
+        // explicitly-empty constructor.
         Self {
             minutes: 0,
-            // Empty — unlike `trustPolicyExclude`, the release-age gate
-            // ships no default exclusions, so `TrustExcludeRules::default()`
-            // (which seeds the trust-policy defaults) would be wrong here.
-            exclude: crate::trust::TrustExcludeRules::empty(),
+            exclude: crate::trust::PackageVersionPolicy::empty(),
             strict: false,
         }
     }
@@ -94,6 +87,13 @@ pub struct PackageExtension {
     pub optional_dependencies: BTreeMap<String, String>,
     pub peer_dependencies: BTreeMap<String, String>,
     pub peer_dependencies_meta: BTreeMap<String, aube_registry::PeerDepMeta>,
+    /// Optional peers from an embedder's compatibility database, `name ->
+    /// range`. They repair a package's undeclared import, which the package
+    /// manager being mirrored does not know about, so they must not change how
+    /// many copies of the package get installed: unlike `peer_dependencies`
+    /// they never reach the peer-context pass.
+    /// See `peer_context::database_peer_targets`.
+    pub database_peers: BTreeMap<String, String>,
 }
 
 /// Default is `NoDowngrade` to match the user-facing default in
@@ -255,6 +255,7 @@ impl ResolvedPackage {
 /// Which version-picking strategy the resolver uses for a workspace.
 /// Mirrors pnpm's `resolution-mode` setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ResolutionMode {
     /// Classic pnpm behavior: every dep resolves to the highest version
     /// satisfying its range.
@@ -265,4 +266,8 @@ pub enum ResolutionMode {
     /// before a cutoff date derived from the max publish time of
     /// already-locked packages. Matches pnpm's `time-based` mode.
     TimeBased,
+    /// Pick the lowest version that satisfies each direct-dependency range,
+    /// while resolving transitive dependencies normally. Unlike `TimeBased`,
+    /// this mode does not apply a publish-date cutoff.
+    LowestDirect,
 }

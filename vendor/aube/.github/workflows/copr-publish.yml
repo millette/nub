@@ -10,9 +10,9 @@ on:
         required: true
         type: string
       chroots:
-        description: "COPR chroots to target (space-separated)"
+        description: "COPR chroots to target (space-separated; empty uses project defaults)"
         required: false
-        default: "fedora-rawhide-aarch64 fedora-rawhide-x86_64 fedora-44-aarch64 fedora-44-x86_64 fedora-43-aarch64 fedora-43-x86_64 fedora-42-aarch64 fedora-42-x86_64 epel-10-aarch64 epel-10-x86_64"
+        default: ""
         type: string
 
 permissions: {}
@@ -22,7 +22,7 @@ env:
 
 jobs:
   publish-copr:
-    runs-on: namespace-profile-endev-linux-amd64
+    runs-on: ubuntu-latest
     timeout-minutes: 150
     container:
       image: fedora:45@sha256:0c1f63ed8fb818fad16cf6ae091598c410a21d2e1a9adf183beb93189299bfba
@@ -80,7 +80,7 @@ jobs:
           echo "TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: Checkout repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ env.TAG }}
           fetch-depth: 0
@@ -97,9 +97,8 @@ jobs:
         run: |
           VERSION="${TAG#v}"
 
-          if [ "$EVENT_NAME" = "release" ]; then
-            CHROOTS="fedora-rawhide-aarch64 fedora-rawhide-x86_64 fedora-44-aarch64 fedora-44-x86_64 fedora-43-aarch64 fedora-43-x86_64 fedora-42-aarch64 fedora-42-x86_64 epel-10-aarch64 epel-10-x86_64"
-          else
+          CHROOTS=""
+          if [ "$EVENT_NAME" != "release" ]; then
             CHROOTS="$INPUT_CHROOTS"
           fi
 

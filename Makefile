@@ -1,15 +1,31 @@
-CARGO   ?= cargo
+# Clamp make-driven cargo to utility QoS on darwin so fleet builds never starve
+# interactive work — same contention control as scripts/rust-build.sh (which
+# covers `make verify` already). NUB_BUILD_FG=1 opts out; no-op off macOS.
+ifeq ($(NUB_BUILD_FG),1)
+  QOS =
+else
+  QOS = $(shell command -v taskpolicy >/dev/null 2>&1 && echo taskpolicy -c utility)
+endif
+CARGO   ?= $(QOS) cargo
 PROFILE ?= release
 BIN_DIR ?= /usr/local/bin
+RUST_BUILD = $(CURDIR)/scripts/rust-build.sh
 TARGET   = target/$(PROFILE)/nub
 
+# PROFILE names a cargo profile AND the target/<dir> the copy steps read from, so
+# the two must agree. `debug` is the odd one out: cargo's profile is named `dev`
+# but its output dir is `target/debug`, and it is the default, so it takes no
+# flag. Any other named profile (`fast`) needs an explicit --profile or cargo
+# would build into target/debug while the copy steps looked in target/<profile>.
 ifeq ($(PROFILE),release)
   CARGO_FLAGS = --release
-else
+else ifeq ($(PROFILE),debug)
   CARGO_FLAGS =
+else
+  CARGO_FLAGS = --profile $(PROFILE)
 endif
 
-.PHONY: build addon addon-fast install-dev uninstall-dev test test-node-matrix clean npm-build npm-publish npm-publish-dry
+.PHONY: build addon addon-fast install-dev uninstall-dev qos-global build-status build-slots-off build-slots-on target-gc test-target-gc test test-build-slots verify fix test-node-matrix bench clean npm-build npm-publish npm-publish-dry
 
 build: addon
 	$(CARGO) build $(CARGO_FLAGS)
@@ -42,12 +58,30 @@ addon:
 # The fast profile rebuilds it in a fraction of that. addon-fast builds the
 # native addon under the same profile so a single `cargo build --profile fast`
 # pass serves both.
-install-dev: addon-fast
-	$(CARGO) build --profile fast
-	ln -sf $(CURDIR)/target/fast/nub $(BIN_DIR)/nub-dev
-	ln -sf $(CURDIR)/target/fast/nub $(BIN_DIR)/nubx-dev
-	@echo "Installed: $(BIN_DIR)/nub-dev -> target/fast/nub"
-	@echo "Installed: $(BIN_DIR)/nubx-dev -> target/fast/nub"
+# Builds through scripts/rust-build.sh and symlinks to the target dir IT picked.
+# Hardcoding $(CURDIR)/target left nub-dev pointing at a stale binary: every
+# documented rebuild path (the post-merge refresh, the dev-loop) goes through the
+# wrapper, which normally writes to the SHARED dir, so nothing updated
+# ./target/fast/nub and `nub-dev` silently served whatever was built last time
+# make ran.
+#
+# The path comes from NUB_BUILD_TARGET_OUT — the dir THIS build resolved — not
+# from a second `--print-target`, which re-resolves from source content: a merge
+# landing on the shared tree during the build moves the content key, and the
+# symlink then names a bucket the build never wrote to (nub-dev dangling, seen
+# on a 27-minute rebuild that overlapped a merge). One build, one resolution.
+install-dev: addon-fast qos-global
+	@tf=$$(mktemp); \
+	  NUB_BUILD_TARGET_OUT=$$tf scripts/rust-build.sh build --profile fast || { rm -f $$tf; exit 1; }; \
+	  t=$$(cat $$tf); rm -f $$tf; \
+	  test -x $$t/fast/nub || { echo "install-dev: no binary at $$t/fast/nub" >&2; exit 1; }; \
+	  ln -sf $$t/fast/nub $(BIN_DIR)/nub-dev && \
+	  ln -sf $$t/fast/nub $(BIN_DIR)/nubx-dev && \
+	  ln -sf $$t/fast/nub $(BIN_DIR)/nubr-dev || \
+	  { echo "install-dev: cannot link into $(BIN_DIR); pass a writable BIN_DIR=<dir> on PATH" >&2; exit 1; }; \
+	  echo "Installed: $(BIN_DIR)/nub-dev -> $$t/fast/nub"; \
+	  echo "Installed: $(BIN_DIR)/nubx-dev -> $$t/fast/nub"; \
+	  echo "Installed: $(BIN_DIR)/nubr-dev -> $$t/fast/nub"
 	@echo ""
 	@nub-dev --version
 
@@ -63,18 +97,121 @@ addon-fast:
 	 echo "Warning: could not find nub-native library"
 	@echo "Built: runtime/addons/nub-native.node (fast profile)"
 
+# Machine-global rustc governor: every cargo invocation on this host — any
+# worktree, clone, or direct `cargo` call — compiles at utility QoS, waits its
+# turn for a build slot (at most two builds compile at once; the rest queue),
+# AND takes a token from a global rustc semaphore, closing the gap the
+# entry-point clamps above leave open. The QoS half protects interactive work;
+# the slot is what stops N concurrent agent builds from multiplying their
+# individually polite job caps into an N-fold oversubscription and a swap storm.
+# See scripts/rustc-qos.sh.
+qos-global:
+	@scripts/qos-global.sh
+
+# Why is this machine saturated, and why is my build not starting? Prints the
+# SUM no single session can see: load, which builds hold the compile slots and
+# who is queued behind them, token occupancy, and which builds are outside the cap.
+build-status:
+	@scripts/build-status.sh
+
+# What the self-pruning collector would reclaim right now (it runs for real,
+# hourly, from rust-build.sh; scripts/target-gc.sh has the policy).
+target-gc:
+	@scripts/target-gc.sh --dry-run
+
+test-target-gc:
+	@tests/target-gc/run.sh
+
+# Host-wide emergency switch for the build-slot layer: every wrapper checks the
+# file on entry and on each wait iteration, so `off` releases builds already
+# queued. Leaves the QoS clamp and the rustc tokens in place.
+build-slots-off:
+	@mkdir -p $${NUB_BUILD_SEM_DIR:-$$HOME/.cache/nub/build-sem} && touch $${NUB_BUILD_SEM_DIR:-$$HOME/.cache/nub/build-sem}/off && echo "build slots OFF (make build-slots-on to restore)"
+build-slots-on:
+	@rm -f $${NUB_BUILD_SEM_DIR:-$$HOME/.cache/nub/build-sem}/off && echo "build slots ON"
+
 uninstall-dev:
-	rm -f $(BIN_DIR)/nub-dev $(BIN_DIR)/nubx-dev
-	@echo "Removed nub-dev and nubx-dev from $(BIN_DIR)"
+	rm -f $(BIN_DIR)/nub-dev $(BIN_DIR)/nubx-dev $(BIN_DIR)/nubr-dev
+	@echo "Removed nub-dev, nubx-dev and nubr-dev from $(BIN_DIR)"
 
 test:
 	$(CARGO) test
+
+# The build-slot layer of the machine-global rustc governor, driven by a fake
+# cargo/rustc pair in a private state dir — ~3 min, no real build, never touches
+# the installed governor. CI runs the same script (the `build-slots` job, on
+# ubuntu and macOS), and `verify` includes it.
+test-build-slots:
+	@tests/build-slots/run.sh
+
+# Bounded host-local gate. Platform matrices, Docker jobs, and change-specific
+# end-to-end tests remain separate parts of the pre-push verification loop.
+verify:
+	@test -f node_modules/@oxc-project/runtime/package.json || { \
+		echo "make verify requires installed JS dependencies; run: nub install --frozen-lockfile --node-linker hoisted" >&2; \
+		exit 1; \
+	}
+	NUB_SHARED_TARGET="$(CURDIR)/target" "$(RUST_BUILD)" fmt --check
+	(cd crates/nub-native && NUB_SHARED_TARGET="$(CURDIR)/target" "$(RUST_BUILD)" fmt --check)
+	@# Cheap and early: every tracked lock must satisfy its manifest. The build
+	@# steps below all omit `--locked` and re-resolve silently, so without this a
+	@# stale lock first surfaces in CI ~20 minutes after the push.
+	scripts/check-lockfiles.sh
+	@# PROFILE=fast, matching both the dev loop and CI's check/clippy jobs, so the
+	@# gates reuse the artifacts iteration already built instead of driving a
+	@# second full dependency compile under `dev` (~26 GB of duplicated
+	@# target/debug + target/fast, and one cold dependency build the first time a
+	@# developer crossed from the dev loop into the gates). `fast` inherits `dev`,
+	@# so debug-assertions, overflow checks and opt-level are identical — only
+	@# debuginfo differs, and no lint reads it.
+	$(MAKE) --no-print-directory PROFILE=fast CARGO="env NUB_SHARED_TARGET='$(CURDIR)/target' '$(RUST_BUILD)'" addon
+	@test -s runtime/addons/nub-native.node
+	@# NUB_ALLOW_INCOMPLETE_RUNTIME: `--all-features` turns on `embed-runtime`, whose
+	@# build.rs requires the vendored runtime node_modules as well as the addon staged
+	@# above. A lint ships nothing, so grant it here exactly as ci.yml's clippy job does
+	@# rather than vendoring npm packages into runtime/ on every developer's tree.
+	NUB_ALLOW_INCOMPLETE_RUNTIME=1 NUB_SHARED_TARGET="$(CURDIR)/target" "$(RUST_BUILD)" clippy --all-targets --all-features --profile fast -- -D warnings
+	@tests/build-slots/run.sh
+	(cd crates/nub-native && NUB_SHARED_TARGET="$(CURDIR)/target" "$(RUST_BUILD)" clippy --all-features --profile fast -- -D warnings)
+	tests/brand-lint/check-env-reads.sh
+	tests/brand-lint/check-path-literals.sh
+	@tests/target-gc/run.sh
+	NUB_SHARED_TARGET="$(CURDIR)/target" "$(RUST_BUILD)" test
+
+# Apply Clippy's machine-applicable autofixes in the root and nub-native
+# workspaces, matching `verify`. The separate nub-launcher workspace is out of
+# scope, as it is for `verify`; its CI clippy gate remains independent. Run on
+# a dirty tree is intended; review the diff before committing.
+fix:
+	@# `--all-features` turns on `embed-runtime`, whose build.rs wants the vendored
+	@# runtime packages (waived by NUB_ALLOW_INCOMPLETE_RUNTIME, as in `verify` and
+	@# CI's clippy job) and hashes runtime/addons/nub-native.node. With no built
+	@# addon, stage CI's placeholder for the lint and remove it on exit: left behind,
+	@# a dev-profile `nub` would load it as the real addon. No `-D warnings`: `--fix`
+	@# ignores it, so what clippy cannot fix prints as warnings and `verify` fails.
+	@# No NUB_SHARED_TARGET either: `verify` pins target/ for its addon copy, but
+	@# nothing here reads target/, and the wrapper's own pick is warm in a worktree.
+	@set -e; \
+	addon="$(CURDIR)/runtime/addons/nub-native.node"; \
+	if [ ! -s "$$addon" ]; then \
+		trap 'rm -f "$$addon"' EXIT; trap 'exit 130' INT TERM; \
+		mkdir -p "$$(dirname "$$addon")"; \
+		printf 'placeholder-addon' > "$$addon"; \
+	fi; \
+	NUB_ALLOW_INCOMPLETE_RUNTIME=1 "$(RUST_BUILD)" clippy --fix --workspace --all-targets --all-features --profile fast --allow-dirty --allow-staged; \
+	(cd crates/nub-native && "$(RUST_BUILD)" clippy --fix --all-features --profile fast --allow-dirty --allow-staged)
 
 # Run the integration suite across a Node version matrix (18.19 floor → 22.15
 # fast-path floor) — the local mirror of ci.yml's `test` job. Locates or
 # downloads each Node under ~/.cache/nub-test-node. See the script header.
 test-node-matrix:
 	@bash wiki/scripts/test-node-matrix.sh
+
+# Warm-install benchmark table (nub vs bun/pnpm/npm). The script's staleness guard
+# builds a current release binary if target/release/nub is missing or stale, so
+# `make bench` is one command = build-if-needed + run. Pass args: make bench ARGS="--fixture t3 --runs 12"
+bench:
+	@bash tests/bench/install/run-4way.sh $(ARGS)
 
 clean:
 	$(CARGO) clean
@@ -84,45 +221,25 @@ clean:
 # Set version across all npm packages + Cargo.toml + preload.mjs. Usage: make version V=0.0.3
 # Portable (node-based, no macOS-only sed). preload.mjs NUB_VERSION must stay in
 # lockstep with the binary version — it is the transpile-cache key, so a stale
-# value would serve stale cached output after an upgrade.
+# value would serve stale cached output after an upgrade. The file-stamping body
+# lives in scripts/set-version.mjs; this target adds the Cargo.lock refresh a
+# committed bump wants.
 version:
 	@test -n "$(V)" || (echo "Usage: make version V=0.0.3" && exit 1)
 	@echo "Setting version to $(V) across all packages, Cargo.toml, and preload.mjs..."
-	@node -e " \
-		const fs = require('fs'); \
-		const v = '$(V)'; \
-		const pkgs = ['npm/nub/package.json', 'npm/nub-types/package.json', \
-			'npm/nub-darwin-arm64/package.json', 'npm/nub-darwin-x64/package.json', \
-			'npm/nub-linux-x64/package.json', 'npm/nub-linux-x64-musl/package.json', \
-			'npm/nub-linux-arm64/package.json', 'npm/nub-linux-arm64-musl/package.json', \
-			'npm/nub-win32-x64/package.json', 'npm/nub-win32-arm64/package.json']; \
-		for (const f of pkgs) { \
-			const p = JSON.parse(fs.readFileSync(f, 'utf8')); \
-			p.version = v; \
-			if (p.optionalDependencies) { \
-				for (const k of Object.keys(p.optionalDependencies)) p.optionalDependencies[k] = v; \
-			} \
-			fs.writeFileSync(f, JSON.stringify(p, null, 2) + '\n'); \
-		} \
-		const q = String.fromCharCode(34); \
-		let cargo = fs.readFileSync('Cargo.toml', 'utf8'); \
-		const cargoNext = cargo.replace(/^version = .*/m, 'version = ' + q + v + q); \
-		if (cargoNext === cargo) { console.error('ERROR: workspace version line not found in Cargo.toml'); process.exit(1); } \
-		fs.writeFileSync('Cargo.toml', cargoNext); \
-		let nativeCargo = fs.readFileSync('crates/nub-native/Cargo.toml', 'utf8'); \
-		const nativeCargoNext = nativeCargo.replace(/^version = .*/m, 'version = ' + q + v + q); \
-		if (nativeCargoNext === nativeCargo) { console.error('ERROR: workspace version line not found in crates/nub-native/Cargo.toml'); process.exit(1); } \
-		fs.writeFileSync('crates/nub-native/Cargo.toml', nativeCargoNext); \
-		let version = fs.readFileSync('runtime/version.mjs', 'utf8'); \
-		const versionNext = version.replace(/export const NUB_VERSION = .*/, 'export const NUB_VERSION = ' + q + v + q + ';'); \
-		if (versionNext === version) { console.error('ERROR: NUB_VERSION not found in runtime/version.mjs'); process.exit(1); } \
-		fs.writeFileSync('runtime/version.mjs', versionNext); \
-		"
+	@node scripts/set-version.mjs "$(V)"
 	@cargo update -p nub-cli -p nub-cache-key -p nub-core --precise $(V)
 	@# nub-native is its own workspace (split for panic=abort vs unwind); its
 	@# version + Cargo.lock entry live under crates/nub-native, updated separately.
 	@cd crates/nub-native && cargo update -p nub-native --precise $(V)
-	@echo "✓ All packages, Cargo.toml, both Cargo.lock files, and runtime/version.mjs set to $(V)"
+	@# nub-launcher is also its own workspace and records nub-core's inlined
+	@# version, so every version bump must refresh its lock before --locked builds.
+	@cd crates/nub-launcher && cargo update -p nub-core --precise $(V)
+	@# nub-phantom is the fourth workspace: it depends on nub-phantom-core and
+	@# nub-phantom-scan by path, and ci.yml checks it --locked, so its lock must
+	@# record the stamped versions too (v0.9.1 shipped without this line and went red).
+	@cd crates/nub-phantom && cargo update -p nub-phantom-core -p nub-phantom-scan --precise $(V)
+	@echo "✓ All packages, Cargo.toml, all four Cargo.lock files, and runtime/version.mjs set to $(V)"
 
 # Verify version consistency across npm packages, Cargo.toml, and version.mjs,
 # AND that @oxc-project/runtime (the emit-helper runtime) is exact-pinned and
@@ -133,9 +250,17 @@ version:
 # Non-zero exit on any mismatch — the pre-release gate (release.yml runs it before
 # building/publishing). Guards the transpile-cache invariant (A12): NUB_VERSION is
 # the sole cache key, valid only because oxc cannot float without a version bump.
+# The schema snapshot is checked only when latest.json is PRESENT. The site
+# withdraws the whole published schema whenever the nub.jsonc config reference is
+# hidden pending ship (3539b65db1), and an absent schema means there is nothing
+# published to be out of step with — the same rule the parser/schema key-set test
+# in crates/nub-cli/src/project_config.rs applies. A latest.json that EXISTS but is
+# corrupt, or whose pinned snapshot is missing or divergent, still fails: deliberate
+# withdrawal removes the file, accidental damage leaves it there.
 version-check:
 	@node -e " \
 		const fs = require('fs'); \
+		const { isDeepStrictEqual } = require('node:util'); \
 		const root = JSON.parse(fs.readFileSync('npm/nub/package.json', 'utf8')); \
 		const v = root.version; \
 		const errors = []; \
@@ -151,10 +276,30 @@ version-check:
 			const types = JSON.parse(fs.readFileSync('npm/nub-types/package.json', 'utf8')); \
 			if (types.version !== v) errors.push('npm/nub-types/package.json has ' + types.version + ', expected ' + v); \
 		} catch { errors.push('missing or unreadable npm/nub-types/package.json'); } \
+		try { \
+			const runner = JSON.parse(fs.readFileSync('npm/runner/package.json', 'utf8')); \
+			if (runner.version !== v) errors.push('npm/runner/package.json has ' + runner.version + ', expected ' + v); \
+			for (const [dep, ver] of Object.entries(runner.optionalDependencies || {})) { \
+				if (ver !== v) errors.push(dep + ' optionalDependency pinned at ' + ver + ', expected ' + v); \
+				const pkg = 'npm/' + dep.replace('@nubjs/', '') + '/package.json'; \
+				try { \
+					const p = JSON.parse(fs.readFileSync(pkg, 'utf8')); \
+					if (p.version !== v) errors.push(pkg + ' has ' + p.version + ', expected ' + v); \
+				} catch { errors.push('missing or unreadable ' + pkg); } \
+			} \
+			const runnerOxc = (runner.dependencies || {})['@oxc-project/runtime']; \
+			if (!runnerOxc) errors.push('npm/runner/package.json: @oxc-project/runtime missing from dependencies'); \
+		} catch { errors.push('missing or unreadable npm/runner/package.json'); } \
 		const cargo = fs.readFileSync('Cargo.toml', 'utf8'); \
 		const cm = cargo.match(/^version = \x22([^\x22]*)\x22/m); \
 		if (!cm) errors.push('Cargo.toml: workspace version line not found'); \
 		else if (cm[1] !== v) errors.push('Cargo.toml has ' + cm[1] + ', expected ' + v); \
+		for (const m of ['crates/nub-core/Cargo.toml', 'crates/nub-native/Cargo.toml']) { \
+			const t = fs.readFileSync(m, 'utf8'); \
+			const mm = t.match(/^version = \x22([^\x22]*)\x22/m); \
+			if (!mm) errors.push(m + ': inlined version line not found — it must NOT inherit from the workspace (see the manifest comment)'); \
+			else if (mm[1] !== v) errors.push(m + ' has ' + mm[1] + ', expected ' + v + ' — an inlined version is what spawn.rs hands the preload as process.versions.nub, so a stale one makes the runtime misreport itself'); \
+		} \
 		const version = fs.readFileSync('runtime/version.mjs', 'utf8'); \
 		const pm = version.match(/export const NUB_VERSION = \x22([^\x22]*)\x22/); \
 		if (!pm) errors.push('runtime/version.mjs: NUB_VERSION not found'); \
@@ -167,8 +312,22 @@ version-check:
 		const om = cargo.match(/^oxc = \\{ version = \x22=([^\x22]*)\x22/m); \
 		if (!om) errors.push('Cargo.toml: oxc workspace dependency (=X.Y.Z pin) not found'); \
 		else if (rt && rt !== om[1]) errors.push('package.json @oxc-project/runtime (' + rt + ') must match the oxc crate compiled into nub-native (Cargo.toml oxc =' + om[1] + ') — the emit helpers and the transformer are one oxc release'); \
+		const pinned = 'v' + v.split('.').slice(0, 2).join('.') + '.json'; \
+		const latestPath = 'site/public/schema/latest.json'; \
+		if (!fs.existsSync(latestPath)) { \
+			console.log('· no published schema (' + latestPath + ' absent) — snapshot check skipped'); \
+		} else try { \
+			const latest = JSON.parse(fs.readFileSync(latestPath, 'utf8')); \
+			const snapshotPath = 'site/public/schema/' + pinned; \
+			const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8')); \
+			const expectedId = 'https://nubjs.com/schema/' + pinned; \
+			if (snapshot.\$$id !== expectedId) errors.push(snapshotPath + ' has \$$id ' + JSON.stringify(snapshot.\$$id) + ', expected ' + JSON.stringify(expectedId)); \
+			delete latest.\$$id; \
+			delete snapshot.\$$id; \
+			if (!isDeepStrictEqual(snapshot, latest)) errors.push(snapshotPath + ' does not equal latest.json modulo \$$id'); \
+		} catch { errors.push('missing or unreadable schema snapshot for ' + pinned); } \
 		if (errors.length) { console.error('Version mismatch:\\n  ' + errors.join('\\n  ')); process.exit(1); } \
-		else { console.log('✓ All npm packages, Cargo.toml, runtime/version.mjs at v' + v + '; @oxc-project/runtime matches nub-native oxc pin (' + (om ? om[1] : '?') + ')'); }"
+		else { console.log('✓ All npm packages, Cargo.toml, and runtime/version.mjs at v' + v + '; @oxc-project/runtime matches nub-native oxc pin (' + (om ? om[1] : '?') + ')'); }"
 
 npm-build: build
 	./npm/build-local.sh

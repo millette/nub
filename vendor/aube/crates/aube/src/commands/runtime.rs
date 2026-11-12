@@ -6,27 +6,26 @@
 //! the resolved version lands in the lockfile. `list` shows what the
 //! current project resolves to and which versions are installed.
 
-use clap::Args;
 use miette::{Context, IntoDiagnostic, miette};
 
 use super::install;
 
-#[derive(Debug, Args)]
+#[derive(Debug, usage_rs::Args)]
 pub struct RuntimeArgs {
-    #[command(subcommand)]
+    #[usage(subcommand)]
     pub command: RuntimeCommand,
 }
 
-#[derive(Debug, clap::Subcommand)]
+#[derive(Debug, usage_rs::Subcommands)]
 pub enum RuntimeCommand {
     /// Show the resolved runtime and installed versions
-    #[command(visible_alias = "ls")]
+    #[usage(alias = "ls")]
     List(RuntimeListArgs),
     /// Pin a runtime in package.json devEngines.runtime and install it
     Set(RuntimeSetArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, usage_rs::Args)]
 pub struct RuntimeSetArgs {
     /// Runtime name (only `node` is supported)
     pub name: String,
@@ -35,22 +34,22 @@ pub struct RuntimeSetArgs {
     // Explicit id: clap reserves the `version` id for the global
     // `--version` flag, and a positional with the same id panics at
     // dispatch with a bool/String downcast mismatch.
-    #[arg(id = "runtime-version", value_name = "VERSION")]
+    #[usage(arg, name = "VERSION")]
     pub version: String,
     /// Install for the user instead of the project (delegates to
     /// `mise use -g node@<version>` when mise manages installs)
-    #[arg(short = 'g', long)]
+    #[usage(short = 'g', long)]
     pub global: bool,
     /// `onFail` policy written to devEngines.runtime
-    #[arg(long, value_name = "POLICY", default_value = "download")]
+    #[usage(long, value_name = "POLICY", default = "download")]
     pub on_fail: String,
     /// Pin the exact resolved version instead of a caret range
-    #[arg(long)]
+    #[usage(long)]
     pub save_exact: bool,
 }
 
-#[derive(Debug, Args)]
-pub struct RuntimeListArgs {}
+#[derive(Debug, usage_rs::Args)]
+pub struct RuntimeListArgs;
 
 pub async fn run(args: RuntimeArgs) -> miette::Result<()> {
     match args.command {
@@ -128,10 +127,20 @@ async fn run_set(args: RuntimeSetArgs) -> miette::Result<()> {
         install::InstallOptions::with_mode(super::chained_frozen_mode(install::FrozenMode::Prefer));
     install::run(opts).await?;
 
-    let ctx = crate::runtime::current();
-    if let Some(ctx) = ctx
-        && let Some(version) = &ctx.version
-    {
+    // Install runtime state is invocation-scoped so concurrent projects cannot
+    // replace one another. Re-read the manifest rather than using the process
+    // cache, which may still contain the pre-edit package.json, then resolve the
+    // now-installed, lockfile-pinned runtime for the follow-up status message.
+    let manifest = aube_manifest::PackageJson::from_path(&manifest_path)
+        .map_err(miette::Report::new)
+        .wrap_err("failed to read updated package.json")?;
+    let parse_options = super::with_settings_ctx(&project_dir, |ctx| aube_lockfile::ParseOptions {
+        strict_store_integrity: aube_settings::resolved::strict_store_integrity(ctx)
+            || aube_settings::resolved::paranoid(ctx),
+    });
+    let pin = crate::runtime::lockfile_node_pin(&project_dir, &manifest, parse_options);
+    let ctx = crate::runtime::ensure(&project_dir, Some(&manifest), settings, pin.as_ref()).await?;
+    if let Some(version) = &ctx.version {
         println!("node {version} ready ({})", ctx.provenance.label());
     }
     Ok(())
@@ -139,8 +148,8 @@ async fn run_set(args: RuntimeSetArgs) -> miette::Result<()> {
 
 /// `-g`: hand the install to mise when it manages runtimes (one Node
 /// store on disk, and mise's activation puts it on PATH globally).
-/// Under `runtimeInstaller=aube` there are no shims by design, so the
-/// install lands in aube's runtime dir and the user wires PATH.
+/// Under `runtimeInstaller=aube` the install lands in aube's runtime
+/// dir; shell activation is the opt-in path for command shims.
 async fn run_set_global(
     settings: &crate::runtime::RuntimeSettings,
     resolved: &str,
@@ -175,8 +184,7 @@ async fn run_set_global(
     }
 
     // aube-managed global install: fetch into the runtime dir and tell
-    // the user how to reach it — aube deliberately ships no shims or
-    // shell activation.
+    // the user how to reach it directly or through opt-in activation.
     let version: node_semver::Version = resolved.parse().into_diagnostic()?;
     let cfg = aube_runtime::RuntimeConfig {
         installer: aube_runtime::InstallerMode::Aube,
@@ -223,11 +231,11 @@ async fn run_set_global(
     }
     if let Some(bin_dir) = &resolution.bin_dir {
         println!(
-            "{} has no shims — projects running through {} pick it up automatically;\n\
-             to use it outside {}, add it to PATH: export PATH=\"{}:$PATH\"",
+            "projects running through {} pick it up automatically;\n\
+             to use shims, run `{} <shell>` for your shell;\n\
+             to use this install directly, add it to PATH: export PATH=\"{}:$PATH\"",
             aube_util::prog(),
-            aube_util::prog(),
-            aube_util::prog(),
+            aube_util::cmd("activate"),
             bin_dir.display()
         );
     }
@@ -313,7 +321,7 @@ async fn run_list() -> miette::Result<()> {
             None => println!("node: none found on PATH and no project pin"),
         },
     }
-    if let Some(bin) = &ctx.node_bin {
+    if let Some(bin) = &ctx.node_program {
         println!("  bin: {}", bin.display());
     }
 

@@ -1,5 +1,5 @@
 //! An embedder whose `manifest_namespace` is `""` ("manifest root") writes
-//! map settings (`allowBuilds`, `patchedDependencies`, …) as **top-level**
+//! map settings (`allowScripts`, `patchedDependencies`, …) as **top-level**
 //! `package.json` keys — never nested under a namespace object, and never
 //! under a foreign brand's key (`pnpm`).
 //!
@@ -26,12 +26,17 @@ static ROOT_TOOL: Embedder = Embedder {
     self_names: &["roottool"],
     compatible_names: &["pnpm"],
     lockfile_basename: "roottool-lock.yaml",
+    lockfile_legacy_basenames: &[],
     workspace_yaml: None,
     manifest_namespace: "",
     env_prefix: None,
     config_env_prefix: None,
+    diag_env_prefix: None,
     cache_namespace: "roottool",
     data_namespace: "roottool",
+    virtual_store_subdir: "virtual-store",
+    managed_config_system_dir: Some("roottool"),
+    config_namespace: Some("roottool"),
     canonical_lockfile_always_wins: true,
     runtime_switching: true,
     self_engines_check: true,
@@ -39,12 +44,61 @@ static ROOT_TOOL: Embedder = Embedder {
     warm_store_verify: true,
     no_churn_lockfile_write: false,
     read_branded_settings_env: true,
+    gvs_incompatible_warning: true,
+    gvs_over_default_hoist: false,
     primer_ttl: None,
+    cpu_budget: None,
+    tty_progress: false,
+    rich_update_picker: false,
+    strict_unsupported_source: false,
+    trust_policy_ignore_after_default: None,
+    extra_settings_fingerprint: None,
+    unsupported_settings: &[],
 };
 
 fn read_manifest(dir: &std::path::Path) -> serde_json::Value {
     let raw = std::fs::read_to_string(dir.join("package.json")).unwrap();
     serde_json::from_str(&raw).unwrap()
+}
+
+/// Own binary, own process — but that isolates these tests from other binaries,
+/// not from cargo's parallel runner inside this one, and the surface they drive
+/// is a process-global. Each test here wants a DIFFERENT combination of
+/// `read_branded_pnpm_config` / `read_manifest_root_config`, and one of them
+/// deliberately walks all three, so concurrent tests read a sibling's surface:
+/// a pnpm-surface write lands at the manifest root instead. Acquiring this
+/// serializes them and restores the surface on drop, which also keeps a panic
+/// mid-body from leaking a surface into whatever runs next.
+struct SurfaceGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    branded_pnpm: bool,
+    manifest_root: bool,
+}
+
+impl SurfaceGuard {
+    fn acquire() -> Self {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let lock = match LOCK.get_or_init(|| std::sync::Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let ctx = aube_util::engine_context();
+        Self {
+            _lock: lock,
+            branded_pnpm: ctx.read_branded_pnpm_config,
+            manifest_root: ctx.read_manifest_root_config,
+        }
+    }
+}
+
+impl Drop for SurfaceGuard {
+    fn drop(&mut self) {
+        let (branded_pnpm, manifest_root) = (self.branded_pnpm, self.manifest_root);
+        aube_util::update_engine_context(|ctx| {
+            ctx.read_branded_pnpm_config = branded_pnpm;
+            ctx.read_manifest_root_config = manifest_root;
+        });
+    }
 }
 
 /// A map setting written under a `manifest_namespace=""` embedder lands at the
@@ -53,19 +107,20 @@ fn read_manifest(dir: &std::path::Path) -> serde_json::Value {
 /// already declared in the manifest.
 #[test]
 fn root_embedder_writes_map_settings_at_manifest_root() {
+    let _surface = SurfaceGuard::acquire();
     aube_util::set_embedder(&ROOT_TOOL);
 
     let tmp = tempfile::tempdir().unwrap();
     // Pre-existing `pnpm` object present (the case that must NOT divert the
-    // write into `pnpm`), plus a prior root-level `allowBuilds` entry that
+    // write into `pnpm`), plus a prior root-level `allowScripts` entry that
     // must survive the merge.
     std::fs::write(
         tmp.path().join("package.json"),
-        "{\n  \"name\": \"x\",\n  \"pnpm\": {},\n  \"allowBuilds\": { \"old\": true }\n}\n",
+        "{\n  \"name\": \"x\",\n  \"pnpm\": {},\n  \"allowScripts\": { \"old\": true }\n}\n",
     )
     .unwrap();
 
-    edit_setting_map(tmp.path(), "allowBuilds", |m| {
+    edit_setting_map(tmp.path(), "allowScripts", |m| {
         m.insert("esbuild".to_string(), serde_json::Value::Bool(true));
     })
     .unwrap();
@@ -75,13 +130,13 @@ fn root_embedder_writes_map_settings_at_manifest_root() {
 
     // Lands at the manifest ROOT as a top-level map key.
     assert_eq!(
-        obj["allowBuilds"]["esbuild"],
+        obj["allowScripts"]["esbuild"],
         serde_json::Value::Bool(true),
-        "new entry must land at top-level allowBuilds, got: {obj:#?}"
+        "new entry must land at top-level allowScripts, got: {obj:#?}"
     );
     // The pre-existing root-level entry round-trips via the merge.
     assert_eq!(
-        obj["allowBuilds"]["old"],
+        obj["allowScripts"]["old"],
         serde_json::Value::Bool(true),
         "existing root-level entry must survive the write"
     );
@@ -92,20 +147,23 @@ fn root_embedder_writes_map_settings_at_manifest_root() {
     );
     // Never nested under the foreign `pnpm` brand.
     assert!(
-        obj.get("pnpm").and_then(|p| p.get("allowBuilds")).is_none(),
+        obj.get("pnpm")
+            .and_then(|p| p.get("allowScripts"))
+            .is_none(),
         "must never nest the setting under the pnpm namespace, got: {obj:#?}"
     );
 }
 
 #[test]
-fn root_embedder_reads_neutral_top_level_allow_builds_on_every_surface() {
+fn root_embedder_reads_neutral_top_level_allow_scripts_on_every_surface() {
+    let _surface = SurfaceGuard::acquire();
     aube_util::set_embedder(&ROOT_TOOL);
 
     let manifest = PackageJson::parse(
         std::path::Path::new("package.json"),
         r#"{
             "name": "x",
-            "allowBuilds": {
+            "allowScripts": {
                 "esbuild": true,
                 "sharp": false
             },
@@ -120,7 +178,7 @@ fn root_embedder_reads_neutral_top_level_allow_builds_on_every_surface() {
     .unwrap();
 
     // A non-pnpm incumbent under a manifest-root embedder: the pnpm namespace
-    // is gated off, but the top-level `allowBuilds` is the embedder's own
+    // is gated off, but the top-level `allowScripts` is the embedder's own
     // un-branded key and is read on EVERY surface — so `approve-builds` heals
     // here (the npm/bun/yarn incumbent case). The pnpm-branded `left-pad` entry
     // is NOT read on this surface.
@@ -159,7 +217,7 @@ fn root_embedder_reads_neutral_top_level_allow_builds_on_every_surface() {
         Some(AllowBuildRaw::Bool(true))
     ));
 
-    // NubIdentity-style mode gates pnpm off and reads root `allowBuilds` as the
+    // NubIdentity-style mode gates pnpm off and reads root `allowScripts` as the
     // native config surface produced by `pm use nub`.
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = false;
@@ -186,6 +244,7 @@ fn root_embedder_reads_neutral_top_level_allow_builds_on_every_surface() {
 /// read side to prove the write is visible.
 #[test]
 fn set_allow_builds_writes_pnpm_only_built_deps_on_pnpm_surface_no_yaml() {
+    let _surface = SurfaceGuard::acquire();
     aube_util::set_embedder(&ROOT_TOOL);
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = true;
@@ -214,8 +273,8 @@ fn set_allow_builds_writes_pnpm_only_built_deps_on_pnpm_surface_no_yaml() {
     // Nested under `pnpm.onlyBuiltDependencies`, not the unread top-level key.
     let manifest = read_manifest(tmp.path());
     assert!(
-        manifest.get("allowBuilds").is_none(),
-        "must not write an unread top-level allowBuilds key, got: {manifest:#?}"
+        manifest.get("allowScripts").is_none(),
+        "must not write an unread top-level allowScripts key, got: {manifest:#?}"
     );
     assert_eq!(
         manifest["pnpm"]["onlyBuiltDependencies"],
@@ -241,6 +300,7 @@ fn set_allow_builds_writes_pnpm_only_built_deps_on_pnpm_surface_no_yaml() {
 /// rather than splitting it into `package.json`.
 #[test]
 fn set_allow_builds_appends_existing_yaml_on_pnpm_surface() {
+    let _surface = SurfaceGuard::acquire();
     aube_util::set_embedder(&ROOT_TOOL);
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = true;
@@ -279,6 +339,7 @@ fn set_allow_builds_appends_existing_yaml_on_pnpm_surface() {
 /// `false`), again without creating a workspace yaml.
 #[test]
 fn set_allow_builds_writes_pnpm_allow_builds_map_for_denial_no_yaml() {
+    let _surface = SurfaceGuard::acquire();
     aube_util::set_embedder(&ROOT_TOOL);
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = true;
@@ -317,11 +378,14 @@ fn set_allow_builds_writes_pnpm_allow_builds_map_for_denial_no_yaml() {
 
 /// `approve-builds` HEALS on the NonPnpmCompat (npm/bun/yarn incumbent)
 /// surface: with both gates off, `set_allow_builds` writes the top-level
-/// `package.json#allowBuilds` key, and the read side now consults that neutral,
+/// `package.json#allowScripts` key, and the read side now consults that neutral,
 /// un-branded key on every surface — so the approval takes effect and the next
 /// install runs the script. (Previously a documented no-op; the gap is closed.)
+/// Under an npm incumbent it is also npm 12's own field, so one approval serves
+/// both tools.
 #[test]
 fn set_allow_builds_heals_on_non_pnpm_compat_surface() {
+    let _surface = SurfaceGuard::acquire();
     aube_util::set_embedder(&ROOT_TOOL);
     // npm/bun/yarn incumbent: the pnpm namespace is gated off and this is not
     // nub identity, but the neutral top-level key is still read.
@@ -347,7 +411,7 @@ fn set_allow_builds_heals_on_non_pnpm_compat_surface() {
     // The approval is written at the top level…
     let manifest = read_manifest(tmp.path());
     assert_eq!(
-        manifest["allowBuilds"]["core-js"],
+        manifest["allowScripts"]["core-js"],
         serde_json::Value::Bool(true)
     );
     // …and the read side on this surface now honors it: the approval takes
@@ -374,6 +438,7 @@ fn set_allow_builds_heals_on_non_pnpm_compat_surface() {
 /// nub-identity surface).
 #[test]
 fn set_allow_builds_writes_root_key_under_nub_identity() {
+    let _surface = SurfaceGuard::acquire();
     aube_util::set_embedder(&ROOT_TOOL);
     aube_util::update_engine_context(|ctx| {
         ctx.read_branded_pnpm_config = false;
@@ -396,8 +461,8 @@ fn set_allow_builds_writes_root_key_under_nub_identity() {
     );
     let manifest = read_manifest(tmp.path());
     assert_eq!(
-        manifest["allowBuilds"]["core-js"],
+        manifest["allowScripts"]["core-js"],
         serde_json::Value::Bool(true),
-        "approval must land in the top-level allowBuilds the nub-identity reader consults"
+        "approval must land in the top-level allowScripts the nub-identity reader consults"
     );
 }

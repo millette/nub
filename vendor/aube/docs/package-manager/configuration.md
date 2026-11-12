@@ -9,7 +9,7 @@ CLI flags. Existing `pnpm-workspace.yaml` files are migration inputs.
 | Area | Default | Why it matters |
 | --- | --- | --- |
 | Linker | `nodeLinker=isolated` | Keeps transitive dependencies scoped to the packages that declared them. |
-| Package imports | `packageImportMethod=auto` | Hardlinks files from the store, falling back to copy on cross-filesystem boundaries. Opt into reflink with `clone` or `clone-or-copy`. |
+| Package imports | `packageImportMethod=auto` | Links files from the store with the faster same-filesystem primitive per platform — reflink (clonefile) on macOS, hardlink on Linux and elsewhere — falling back to copy on cross-filesystem boundaries. Set `clone` or `clone-or-copy` to attempt reflink first, still falling back to copy when reflink is unavailable. |
 | New releases | `minimumReleaseAge=1440` | Avoids installing versions published in the last 24 hours by default. |
 | Exotic transitive deps | `blockExoticSubdeps=true` | Blocks transitive git and tarball dependencies unless you opt out. |
 | Dependency scripts | approval required | Build scripts in dependencies stay skipped until approved. |
@@ -18,8 +18,9 @@ CLI flags. Existing `pnpm-workspace.yaml` files are migration inputs.
 
 ## User aube config
 
-`aube config set` writes user-scope settings to `~/.config/aube/config.toml` by
-default. If `XDG_CONFIG_HOME` is set, the path is `$XDG_CONFIG_HOME/aube/config.toml`.
+`aube config set --global` writes user-scope settings to
+`~/.config/aube/config.toml`. If `XDG_CONFIG_HOME` is set, the path is
+`$XDG_CONFIG_HOME/aube/config.toml`.
 
 ```toml
 minimumReleaseAge = 2880
@@ -32,11 +33,35 @@ aube reads configuration from `.npmrc` regardless of which tool wrote it.
 Writes follow a routing rule: settings marked `npmShared = true` in
 [`crates/aube-settings/settings.toml`][settings-toml] (plus per-host auth/cert
 templates and scoped registries) land in `.npmrc` so npm, yarn, and pnpm see
-the same value. Aube-only and pnpm-only settings land in
+the same value. aube-only and pnpm-only settings land in
 `~/.config/aube/config.toml` instead, so unknown-to-npm keys don't trigger
 warnings from sibling tools.
 
-[settings-toml]: https://github.com/jdx/aube/blob/main/crates/aube-settings/settings.toml
+[settings-toml]: https://github.com/aubepkg/aube/blob/main/crates/aube-settings/settings.toml
+
+## Managed hardening config
+
+System administrators can enforce security settings with
+`/etc/aube/managed.toml`. Managed config is not normal precedence: aube first
+resolves CLI, env, project, workspace, and user config, then applies managed
+policy as a final hardening pass. Local config, env vars, and CLI flags can
+make managed settings stricter, but cannot weaken them.
+
+For tests and non-root deployments, `AUBE_MANAGED_CONFIG_PATH` points at an
+additional managed TOML file. It is additive with `/etc/aube/managed.toml`: when
+both files set the same managed setting, aube keeps the stricter value.
+
+The [settings reference](/settings/) is generated from the settings registry
+and marks every enforceable setting with `Managed policy`. The policy names
+describe how multiple managed files and local config combine:
+
+- `max`: the largest integer wins.
+- `trueWins`: `true` wins over `false`.
+- `falseWins`: `false` wins over `true`.
+- `ranked:a<b<c`: later ranked values are stricter.
+- `managedWins`: the managed value replaces the local value; when multiple
+  managed files set a list, aube keeps only entries present in every managed
+  file.
 
 ## .npmrc
 
@@ -53,7 +78,7 @@ registries, per-host auth, proxy/TLS, and the npm-standard scalars tagged
 when it writes to one. See the [settings reference](/settings/) — each entry
 lists its `.npmrc` key alongside the other sources.
 
-Aube map settings (`allowBuilds`, `overrides`, `packageExtensions`, …) accept
+aube map settings (`allowBuilds`, `overrides`, `packageExtensions`, …) accept
 **dotted writes** at project scope to edit one entry at a time:
 
 ```sh
@@ -121,8 +146,8 @@ aube config list --json
 
 Writes land in `.npmrc` only for the npm-shared surface (auth, registries,
 npm-standard scalars). Everything else — aube settings, pnpm-only knobs, and
-unknown keys — is stored in aube's own config. `--local` and
-`--location project` write the project-scope equivalents (`<cwd>/.npmrc` and
+unknown keys — is stored in aube's own config. `--local` writes the
+project-scope equivalents (`<cwd>/.npmrc` and
 `<cwd>/.config/aube/config.toml`).
 
 ## `package.json` — `pnpm.*` and `aube.*` namespaces

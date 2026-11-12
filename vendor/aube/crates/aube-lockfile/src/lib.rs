@@ -7,28 +7,33 @@ mod io;
 pub mod merge;
 pub mod npm;
 mod override_match;
+pub mod patch_groups;
 pub mod pnpm;
 mod source;
 pub mod yarn;
 
 pub use detect::{
     DeclarationSource, DeclaredPackageManager, ResolvedLockfileKind, declared_package_manager,
-    resolve_project_lockfile_kind,
+    declared_version_for, resolve_project_lockfile_kind,
 };
 pub use drift::DriftStatus;
 pub use io::{
-    Error, LockfileKind, active_lockfile_has_conflict_markers, aube_lock_filename,
+    Error, LockfileKind, ParseOptions, active_lockfile_has_conflict_markers, aube_lock_filename,
     build_canonical_map, detect_existing_lockfile_kind, parse_for_import, parse_json,
-    parse_lockfile, parse_lockfile_with_kind, pnpm_lock_filename, read_lockfile, write_lockfile,
-    write_lockfile_as, write_lockfile_preserving_existing,
+    parse_lockfile, parse_lockfile_with_kind, parse_lockfile_with_kind_and_options,
+    pnpm_lock_filename, read_lockfile, rewrite_lockfile_as, write_lockfile, write_lockfile_as,
+    write_lockfile_preserving_existing,
 };
 pub(crate) use io::{atomic_write_lockfile, current_git_branch};
 pub use merge::{MergeReport, merge_branch_lockfiles};
 pub(crate) use source::normalize_git_fragment;
 pub use source::{
     GitSource, HostedGit, HostedGitHost, LocalSource, RemoteTarballSource, git_commits_match,
-    parse_git_spec, parse_hosted_git, resolve_dep_edge, shared_local_dep_path,
+    parse_git_spec, parse_hosted_git, parse_hosted_git_tarball, resolve_dep_edge,
+    shared_local_dep_path,
 };
+
+pub(crate) const EXTRA_PRESERVE_TARBALL_URL: &str = "__aube_preserve_tarball_url";
 
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -120,10 +125,10 @@ pub struct LockfileGraph {
     /// release.
     pub bun_config_version: Option<u32>,
     /// Top-level `patchedDependencies:` block mirrored by bun 1.1+ and
-    /// pnpm 9+. Key: selector (`lodash@4.17.21`), value: relative patch
-    /// file path (`patches/lodash@4.17.21.patch`). Round-tripped
-    /// verbatim so a parse/write cycle doesn't silently drop user
-    /// patches from the lockfile.
+    /// pnpm 9+. Key: selector (`lodash@4.17.21`); value is the relative
+    /// patch path for bun/fresh resolution or pnpm's patch-content hash
+    /// when parsed from a pnpm lockfile. The pnpm writer resolves paths
+    /// to hashes before serializing.
     pub patched_dependencies: BTreeMap<String, String>,
     /// Sidecar of [`Self::patched_dependencies`]: the sha256 hex of
     /// each patch file's contents, keyed by the same selector. pnpm 10
@@ -294,12 +299,12 @@ pub struct DirectDep {
     pub dep_type: DepType,
     /// The specifier as written in package.json at the time the lockfile was
     /// generated (e.g., `"^4.17.0"`). Used by drift detection to compare against
-    /// the current manifest. Only populated by formats that record it
-    /// (pnpm-lock.yaml v9). `None` for npm/yarn/bun lockfiles.
+    /// the current manifest. Populated by formats that record it
+    /// (pnpm importers and npm root/workspace package entries).
     pub specifier: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DepType {
     Production,
     Dev,
@@ -316,6 +321,139 @@ pub fn dep_type_label(dt: DepType) -> &'static str {
         DepType::Production => "dependencies",
         DepType::Dev => "devDependencies",
         DepType::Optional => "optionalDependencies",
+    }
+}
+
+/// Render a project-root-relative directory as a `link:` target
+/// relative to the consuming importer, the way pnpm writes importer
+/// `version:` values (`packages/app` → `packages/core` renders as
+/// `../core`; the root importer keeps `packages/core` as-is). Pure
+/// lexical computation over `/`-separated components — both inputs are
+/// normalized root-relative paths, so no filesystem access is needed.
+///
+/// Shared by the pnpm writer and the resolver's `workspace:` alias
+/// rewrite, which has to synthesize the same importer-relative target
+/// the writer would later render.
+pub fn link_from_importer(importer_path: &str, target_posix: &str) -> String {
+    if importer_path == "." {
+        return target_posix.to_string();
+    }
+    let from: Vec<&str> = importer_path
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let to: Vec<&str> = target_posix
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let common = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut parts: Vec<&str> = vec![".."; from.len() - common];
+    parts.extend(&to[common..]);
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+/// A lockfile entry whose dependency source the reader can't resolve,
+/// recorded by a format reader's classifier under the `strict_unsupported_source`
+/// embedder profile instead of silently dropping it (yarn-berry) or
+/// reclassifying it to a registry `name@version` that 404s at fetch
+/// (yarn-classic / bun). Resolved to a fatal or a warn at the edge sites
+/// (where dep-type is known) by [`resolve_dep_spec`].
+#[derive(Debug, Clone)]
+pub(crate) struct UnsupportedSpec {
+    /// The dependency name (for the optional-skip warning).
+    pub name: String,
+    /// A human-readable entry identifier (for the fatal message), e.g. the
+    /// resolution/spec string `foo@user/repo#abc`.
+    pub key: String,
+    /// The unsupported protocol token (`git`, `jsr`, `exec`, …).
+    pub protocol: String,
+}
+
+/// The `<token>:` protocol prefix of a version tail, if it carries one.
+///
+/// A registry pin is an exact semver version, which can never contain a
+/// `:`, so a protocol-shaped tail marks a NON-registry source —
+/// `github:owner/repo#sha`, `git+ssh://…`, `file:./vendor`,
+/// `https://…/pkg.tgz`, `workspace:*`. Every non-registry branch of the
+/// bun reader's `classify_bun_ident` records that whole tail verbatim as
+/// [`LockedPackage::version`], so the same predicate answers two
+/// questions: whether a lockfile ident is resolvable as a registry pin,
+/// and whether a `patchedDependencies` selector is a source identity
+/// rather than a malformed semver range.
+///
+/// Deliberately narrow — the token must start with a letter and hold
+/// only `[A-Za-z0-9+.-]` — so a typo like `^^1:2` is not read as a
+/// protocol and keeps erroring where it should.
+pub(crate) fn version_protocol(raw_version: &str) -> Option<&str> {
+    let token = &raw_version[..raw_version.find(':')?];
+    let mut chars = token.chars();
+    if !chars.next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    chars
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+        .then_some(token)
+}
+
+/// Resolve a dependency `spec` against the lockfile's `spec → dep_path`
+/// index, applying the abort-eagerly policy for specs a classifier
+/// recorded as an [`UnsupportedSpec`]. Returns the resolved dep_path,
+/// `None` when the spec is genuinely absent OR an OPTIONAL unsupported
+/// source (warned + skipped, matching the incumbent's tolerance of a
+/// missing optional), or `Err(UnsupportedSource)` for a NON-optional
+/// unsupported source — the eager, pre-mutation plan-time refusal. The
+/// `unsupported` map is empty unless the active embedder set
+/// `strict_unsupported_source`, so for standalone aube this is a plain
+/// index lookup with the historical drop/reclassify behavior preserved
+/// upstream of it.
+pub(crate) fn resolve_dep_spec(
+    spec: &str,
+    optional: bool,
+    spec_to_dep_path: &BTreeMap<String, String>,
+    unsupported: &BTreeMap<String, UnsupportedSpec>,
+    path: &std::path::Path,
+) -> Result<Option<String>, Error> {
+    if let Some(dep_path) = spec_to_dep_path.get(spec) {
+        return Ok(Some(dep_path.clone()));
+    }
+    let Some(u) = unsupported.get(spec) else {
+        return Ok(None);
+    };
+    unsupported_edge(u, optional, path)?;
+    Ok(None)
+}
+
+/// Apply the abort-eagerly policy to an edge that resolved to an
+/// [`UnsupportedSpec`], once the edge's optionality is known: warn + skip
+/// for an OPTIONAL edge (`Ok`, matching the incumbent's tolerance of a
+/// missing optional), `Err(UnsupportedSource)` for a non-optional one —
+/// the eager, pre-mutation plan-time refusal. Shared by the yarn readers'
+/// spec-keyed resolution ([`resolve_dep_spec`]) and the bun reader's
+/// by-name nested-key walk, so the warning code and message stay
+/// identical across formats.
+pub(crate) fn unsupported_edge(
+    u: &UnsupportedSpec,
+    optional: bool,
+    path: &std::path::Path,
+) -> Result<(), Error> {
+    if optional {
+        tracing::warn!(
+            code = aube_codes::warnings::WARN_AUBE_LOCKFILE_UNSUPPORTED_SOURCE,
+            "optional dependency `{}` uses the unsupported `{}` source — skipping it (the install continues)",
+            u.name,
+            u.protocol,
+        );
+        Ok(())
+    } else {
+        Err(Error::unsupported_source(path, &u.key, &u.protocol))
     }
 }
 
@@ -387,6 +525,20 @@ pub struct LockedPackage {
     /// preserves third-party pnpm lockfiles that mark registry-shaped
     /// tarballs as hosted git.
     pub registry_git_hosted: bool,
+    /// Write-time signal: always emit `resolution.tarball` for this package
+    /// because its resolved registry host is NOT what `.npmrc`/config would
+    /// derive (a pnpm `namedRegistries` alias routed it to a different host).
+    /// The default writer omits `tarball` for registry packages whose URL has
+    /// the derivable `/-/<name>-<ver>.tgz` shape and reconstructs it from the
+    /// configured registry at install time — but that reconstruction uses the
+    /// DEFAULT registry and would 404 for a named-registry package, so a frozen
+    /// install must read the persisted URL. Set by the resolver's finalize pass
+    /// (which has the registry config to compare hosts); `false` for standalone
+    /// aube and every config-derivable registry/scoped-registry package, so the
+    /// lockfile output is unchanged there. Not itself a lockfile field — it is
+    /// re-derived on every resolve, and a package that lands with it set simply
+    /// writes the `tarball` it already carries.
+    pub force_tarball_url: bool,
     /// For npm-alias deps (`"h3-v2": "npm:h3@2.0.1-rc.20"`): the real
     /// package name on the registry (`"h3"`). `None` means the entry
     /// is not aliased and `name` already holds the registry name.
@@ -440,11 +592,17 @@ pub struct LockedPackage {
     /// fall back to the resolved pin otherwise (e.g. when the source
     /// lockfile was pnpm, whose `snapshots:` only carries pins).
     ///
-    /// Empty means "unknown" — writers should fall back to pins.
-    /// Covers production *and* optional dependencies in one map since
-    /// a package can't declare the same name twice across those
-    /// sections.
+    /// A name missing here falls back to its pin. Covers production *and*
+    /// optional dependencies in one map since a package can't declare the
+    /// same name twice across those sections. Whether an empty map means
+    /// "declares nothing" or "unknown" is [`Self::declared_dependencies_known`].
     pub declared_dependencies: BTreeMap<String, String>,
+    /// Whether [`Self::declared_dependencies`] was filled from a source
+    /// that records declared ranges (a packument, or an npm / yarn / bun
+    /// lockfile). The pnpm and nub.lock readers leave it `false`. Writers
+    /// that drop a peer-only edge need it to tell a package that declares
+    /// no dependencies from one whose declarations were never recorded.
+    pub declared_dependencies_known: bool,
     /// Package's `license` field, collapsed to the simple string
     /// form. Round-tripped so npm's lockfile keeps its per-entry
     /// `"license": "MIT"` line; pnpm / yarn / bun don't record
@@ -515,6 +673,31 @@ impl LockedPackage {
         format!("{}@{}", self.name, self.version)
     }
 
+    /// Resolve a patch entry for this package from a `name@version`-keyed
+    /// map, returning the matched key alongside the value.
+    ///
+    /// Tries the alias-qualified [`Self::spec_key`] first, then falls
+    /// back to the registry identity (`registry_name()@version`).
+    /// `patchedDependencies` are declared against the *real* package
+    /// name, so an npm-aliased entry (`"odd-alias": "npm:is-odd@3.0.1"`)
+    /// carries `name = "odd-alias"` while the patch is keyed
+    /// `is-odd@3.0.1`; the fallback is what lets the patch reach the
+    /// aliased install. Mirrors pnpm, which resolves patches on the
+    /// resolved manifest name and keeps no separate alias node.
+    pub fn lookup_patch<'a, V>(&self, map: &'a BTreeMap<String, V>) -> Option<(String, &'a V)> {
+        let spec_key = self.spec_key();
+        if let Some(value) = map.get(&spec_key) {
+            return Some((spec_key, value));
+        }
+        let registry_key = format!("{}@{}", self.registry_name(), self.version);
+        if registry_key != spec_key
+            && let Some(value) = map.get(&registry_key)
+        {
+            return Some((registry_key, value));
+        }
+        None
+    }
+
     /// Exact approval key for non-registry package sources.
     ///
     /// Name-wide build approvals are only trustworthy for packages
@@ -524,7 +707,28 @@ impl LockedPackage {
     pub fn source_approval_key(&self) -> Option<String> {
         self.local_source
             .as_ref()
-            .map(|source| format!("{}@{}", self.registry_name(), source.specifier()))
+            .map(|source| format!("{}@{}", self.registry_name(), source.pnpm_specifier()))
+    }
+
+    /// Every exact-source approval key: [`Self::source_approval_key`] first,
+    /// then for a Git clone pnpm's `name@git+…#sha` spelling. Empty for a
+    /// registry package.
+    pub fn source_approval_keys(&self) -> Vec<String> {
+        self.local_source
+            .as_ref()
+            .map(|source| source.source_approval_keys(self.registry_name()))
+            .unwrap_or_default()
+    }
+
+    /// Repository-wide approval key for a Git-backed package source.
+    ///
+    /// Unlike [`Self::source_approval_key`], this deliberately omits the
+    /// resolved commit. It is only used for an explicit `allowBuilds`
+    /// `git+<repository>` rule, never for package-name approval.
+    pub fn git_repository_approval_key(&self) -> Option<String> {
+        self.local_source
+            .as_ref()?
+            .git_repository_approval_key(self.registry_name())
     }
 
     /// Declared peer ranges with pnpm's meta-only peers folded in as `*`.
@@ -568,11 +772,13 @@ mod locked_package_tests {
             bundled_dependencies: Vec::new(),
             tarball_url: None,
             registry_git_hosted: false,
+            force_tarball_url: false,
             alias_of: None,
             yarn_checksum: None,
             engines: BTreeMap::new(),
             bin: BTreeMap::new(),
             declared_dependencies: BTreeMap::new(),
+            declared_dependencies_known: false,
             license: None,
             funding_url: None,
             optional: false,
@@ -594,6 +800,61 @@ mod locked_package_tests {
     }
 
     #[test]
+    fn lookup_patch_matches_plain_spec_key() {
+        let pkg = pkg();
+        let map = BTreeMap::from([("pkg@1.0.0".to_string(), "patch".to_string())]);
+        assert_eq!(
+            pkg.lookup_patch(&map),
+            Some(("pkg@1.0.0".to_string(), &"patch".to_string()))
+        );
+    }
+
+    #[test]
+    fn lookup_patch_falls_back_to_registry_name_for_alias() {
+        // `"odd-alias": "npm:is-odd@3.0.1"` records name = alias,
+        // alias_of = registry name. The patch is declared against the
+        // registry identity, so the aliased entry must resolve it via
+        // the fallback (this is the discussion #1082 bug).
+        let mut pkg = pkg();
+        pkg.name = "odd-alias".to_string();
+        pkg.version = "3.0.1".to_string();
+        pkg.alias_of = Some("is-odd".to_string());
+
+        let map = BTreeMap::from([("is-odd@3.0.1".to_string(), "patch".to_string())]);
+        assert_eq!(
+            pkg.lookup_patch(&map),
+            Some(("is-odd@3.0.1".to_string(), &"patch".to_string()))
+        );
+    }
+
+    #[test]
+    fn lookup_patch_prefers_alias_qualified_key_over_registry_key() {
+        // A patch declared against the alias identity wins over one
+        // declared against the registry identity — spec_key is tried
+        // first.
+        let mut pkg = pkg();
+        pkg.name = "odd-alias".to_string();
+        pkg.version = "3.0.1".to_string();
+        pkg.alias_of = Some("is-odd".to_string());
+
+        let map = BTreeMap::from([
+            ("odd-alias@3.0.1".to_string(), "alias-patch".to_string()),
+            ("is-odd@3.0.1".to_string(), "registry-patch".to_string()),
+        ]);
+        assert_eq!(
+            pkg.lookup_patch(&map),
+            Some(("odd-alias@3.0.1".to_string(), &"alias-patch".to_string()))
+        );
+    }
+
+    #[test]
+    fn lookup_patch_returns_none_when_unpatched() {
+        let pkg = pkg();
+        let map = BTreeMap::from([("other@2.0.0".to_string(), "patch".to_string())]);
+        assert_eq!(pkg.lookup_patch(&map), None);
+    }
+
+    #[test]
     fn source_approval_key_uses_source_spec_for_local_sources() {
         let mut pkg = pkg();
         pkg.dep_path = "pkg@file+abc(peer@1.0.0)".to_string();
@@ -603,6 +864,17 @@ mod locked_package_tests {
             pkg.source_approval_key(),
             Some("pkg@file:vendor/pkg".to_string())
         );
+    }
+
+    #[test]
+    fn source_approval_key_normalizes_a_local_path() {
+        let mut pkg = pkg();
+        pkg.local_source = Some(LocalSource::Directory(PathBuf::from("./vendor/pkg")));
+        assert_eq!(
+            pkg.source_approval_key(),
+            Some("pkg@file:vendor/pkg".to_string())
+        );
+        assert_eq!(pkg.source_approval_keys(), ["pkg@file:vendor/pkg"]);
     }
 
     #[test]
@@ -618,6 +890,80 @@ mod locked_package_tests {
         assert_eq!(
             pkg.source_approval_key(),
             Some("pkg@https://example.com/pkg.tgz".to_string())
+        );
+    }
+
+    #[test]
+    fn git_repository_approval_key_omits_resolved_commit() {
+        let mut pkg = pkg();
+        pkg.local_source = Some(LocalSource::Git(GitSource {
+            url: "https://github.com/acme/pkg.git".to_string(),
+            committish: Some("main".to_string()),
+            resolved: "0123456789012345678901234567890123456789".to_string(),
+            integrity: None,
+            subpath: None,
+        }));
+
+        assert_eq!(
+            pkg.git_repository_approval_key(),
+            Some("pkg@git+https://github.com/acme/pkg.git".to_string())
+        );
+    }
+
+    #[test]
+    fn hosted_git_archive_keys_as_its_repository() {
+        let mut pkg = pkg();
+        pkg.local_source = Some(LocalSource::RemoteTarball(RemoteTarballSource {
+            url: "https://codeload.github.com/acme/pkg/tar.gz/0123456789012345678901234567890123456789"
+                .to_string(),
+            integrity: String::new(),
+            git_hosted: true,
+        }));
+        assert_eq!(
+            pkg.git_repository_approval_key(),
+            Some("pkg@git+https://github.com/acme/pkg.git".to_string())
+        );
+
+        pkg.local_source = Some(LocalSource::RemoteTarball(RemoteTarballSource {
+            url: "https://example.com/pkg-1.0.0.tgz".to_string(),
+            integrity: String::new(),
+            git_hosted: false,
+        }));
+        assert_eq!(pkg.git_repository_approval_key(), None);
+    }
+
+    #[test]
+    fn git_clone_is_approvable_under_pnpms_spelling_too() {
+        let source = LocalSource::Git(GitSource {
+            url: "https://github.com/acme/pkg.git".to_string(),
+            committish: None,
+            resolved: "0123456789012345678901234567890123456789".to_string(),
+            integrity: None,
+            subpath: None,
+        });
+        assert_eq!(
+            source.source_approval_keys("pkg"),
+            [
+                "pkg@https://github.com/acme/pkg.git#0123456789012345678901234567890123456789",
+                "pkg@git+https://github.com/acme/pkg.git#0123456789012345678901234567890123456789",
+            ]
+        );
+    }
+
+    #[test]
+    fn git_repository_approval_key_normalizes_an_existing_git_prefix() {
+        let mut pkg = pkg();
+        pkg.local_source = Some(LocalSource::Git(GitSource {
+            url: "git+ssh://git@github.com/acme/pkg.git".to_string(),
+            committish: None,
+            resolved: "0123456789012345678901234567890123456789".to_string(),
+            integrity: None,
+            subpath: None,
+        }));
+
+        assert_eq!(
+            pkg.git_repository_approval_key(),
+            Some("pkg@git+ssh://git@github.com/acme/pkg.git".to_string())
         );
     }
 }
@@ -667,13 +1013,179 @@ impl LockfileGraph {
                 continue;
             };
             for (child_name, child_version) in &pkg.dependencies {
-                let child_key = format!("{child_name}@{child_version}");
+                // Resolve across reader conventions (yarn full dep_path,
+                // npm/pnpm tail, git/tarball URL); `None` = edge outside the
+                // graph, skip. A raw `name@tail` reconstruction doubled the
+                // name for yarn's full-dep_path values and under-walked the
+                // closure — see `resolve_dep_edge`.
+                let Some(child_key) =
+                    resolve_dep_edge(child_name, child_version, |k| self.packages.contains_key(k))
+                else {
+                    continue;
+                };
                 if reachable.insert(child_key.clone()) {
                     queue.push_back(child_key);
                 }
             }
         }
         reachable
+    }
+
+    /// Reverse ("ancestor") closure: the seed dep_paths UNION every package
+    /// that transitively IMPORTS a seed. The mirror image of
+    /// [`transitive_closure`], which walks child edges (what a package depends
+    /// on); this walks importer edges (what depends on a package).
+    ///
+    /// Bounded to the affected subtree BY CONSTRUCTION: a package that does not
+    /// transitively import a seed is never reached, so unrelated top-level
+    /// subtrees are excluded no matter how large the tree — a project with one
+    /// phantom-breaker plus 10k unrelated deps yields a closure of just the
+    /// breaker's importer subtree. The only way this approaches the whole tree
+    /// is a *foundational* seed (everything imports it); phantom breakers are
+    /// empirically never foundational, so a large closure is a signal, not a norm.
+    ///
+    /// Why the closure and not the package alone: disk-materializing only a
+    /// transitively-consumed package leaves every store-resident importer
+    /// resolving the un-materialized shared-store copy — a silent singleton
+    /// split (two realpaths, two module instances). Materializing the whole
+    /// importer closure makes every consumer load the one project-local copy.
+    ///
+    /// The project root is the natural top boundary: root importers are the
+    /// project itself, not a materializable package, so the walk stops at the
+    /// `packages` it can reach. Missing seeds are treated as leaves (skipped),
+    /// matching `transitive_closure`.
+    ///
+    /// Registry-only edge caveat (same as `transitive_closure`): the child key is
+    /// rebuilt as the plain `{name}@{tail}`, NOT the `name@git+<hash>` /
+    /// `name@url+<hash>` form a git/tarball dep carries, so an importer reached
+    /// ONLY through a git/tarball intermediary is not walked. This does not weaken
+    /// the disk-materialize soundness in practice: disk-materialize is
+    /// registry-only, so such an intermediary could not materialize anyway — the
+    /// split it would cause is a boundary of registry-only materialization, not a
+    /// missed closure member.
+    pub fn importer_closure<'a>(
+        &self,
+        seeds: impl IntoIterator<Item = &'a str>,
+    ) -> std::collections::HashSet<String> {
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        // Invert every forward edge once into child_dep_path → [importer
+        // dep_paths]. Keyed by the reconstructed child key (`{name}@{tail}`,
+        // identical to `transitive_closure`'s reconstruction) so it lines up
+        // with `packages` keys and the seed dep_paths. Importer values borrow
+        // the `packages` keys (live for `&self`), so only the child keys allocate.
+        let mut importers_of: HashMap<String, Vec<&str>> = HashMap::new();
+        for (parent_dep_path, pkg) in &self.packages {
+            for (child_name, child_tail) in &pkg.dependencies {
+                // Resolve across reader conventions so a yarn full-dep_path
+                // edge maps to the real child key (a raw `name@tail` doubled
+                // it); `None` = edge outside the graph, skip.
+                if let Some(child_key) =
+                    resolve_dep_edge(child_name, child_tail, |k| self.packages.contains_key(k))
+                {
+                    importers_of
+                        .entry(child_key)
+                        .or_default()
+                        .push(parent_dep_path.as_str());
+                }
+            }
+        }
+
+        let mut closure: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        for seed in seeds {
+            if closure.insert(seed.to_string()) {
+                queue.push_back(seed.to_string());
+            }
+        }
+        while let Some(dep_path) = queue.pop_front() {
+            let Some(importers) = importers_of.get(&dep_path) else {
+                continue;
+            };
+            for importer in importers {
+                if closure.insert((*importer).to_string()) {
+                    queue.push_back((*importer).to_string());
+                }
+            }
+        }
+        closure
+    }
+
+    /// BFS distance from the importers' direct dependencies to every reachable
+    /// package, keyed by dep_path. A direct dep is depth 0; a package absent
+    /// from the result is unreachable.
+    ///
+    /// Seeded from EVERY importer, not just the root. `root_deps` reads only
+    /// `importers["."]`, so in a workspace a member's direct dependency would be
+    /// unreachable here and sort as if infinitely deep — the opposite of what
+    /// hidden-hoist name selection wants, since that dependency is exactly the
+    /// copy the member's own code resolves.
+    ///
+    /// First-write-wins over a FIFO queue, so a cycle terminates (each dep_path
+    /// is enqueued at most once) and the recorded depth is the shortest one.
+    ///
+    /// Walks `optional_dependencies` as well as `dependencies`. This struct
+    /// documents active optional edges as mirrored into `dependencies`, and
+    /// `yarn/berry.rs` does not uphold that — it assigns the two maps from
+    /// separate sources with no merge.
+    ///
+    /// DEFENSIVE, not a live fix. Every route to the linker runs
+    /// `platform::filter_graph` first, and its GC walk follows `dependencies`
+    /// from the same seeds through the same edge predicate, then retains only
+    /// what it reached. So on a berry graph an optional-only-reachable package
+    /// is deleted from `packages` upstream rather than arriving here without a
+    /// depth — the chain cannot add a key on any real install. It keeps this
+    /// function honest for a caller that runs before that GC.
+    pub fn dependency_depths(&self) -> std::collections::HashMap<&str, usize> {
+        use std::collections::hash_map::Entry;
+        use std::collections::{HashMap, VecDeque};
+
+        let mut depths: HashMap<&str, usize> = HashMap::new();
+        let mut queue: VecDeque<&str> = VecDeque::new();
+        for deps in self.importers.values() {
+            for direct in deps {
+                let Some((key, _)) = self.packages.get_key_value(&direct.dep_path) else {
+                    continue;
+                };
+                if let Entry::Vacant(slot) = depths.entry(key.as_str()) {
+                    slot.insert(0);
+                    queue.push_back(key.as_str());
+                }
+            }
+        }
+        while let Some(dep_path) = queue.pop_front() {
+            let depth = depths[dep_path];
+            let Some(pkg) = self.packages.get(dep_path) else {
+                continue;
+            };
+            for (child_name, child_tail) in pkg
+                .dependencies
+                .iter()
+                .chain(pkg.optional_dependencies.iter())
+            {
+                // Same edge reconstruction `importer_closure` uses, so a yarn
+                // full-dep_path edge maps to the real child key.
+                let Some(child_key) =
+                    resolve_dep_edge(child_name, child_tail, |k| self.packages.contains_key(k))
+                else {
+                    continue;
+                };
+                let Some((key, _)) = self.packages.get_key_value(&child_key) else {
+                    continue;
+                };
+                // Vacant-only, never a bare `insert`: `insert` OVERWRITES and
+                // returns the old value, so `if insert(..).is_none()` guards the
+                // queue push while still letting a later, deeper visit clobber
+                // the recorded depth — last-write-wins, the inverse of what this
+                // returns. A cycle makes it observable: a seed re-reached around
+                // the loop lands at the cycle length instead of 0.
+                if let Entry::Vacant(slot) = depths.entry(key.as_str()) {
+                    slot.insert(depth + 1);
+                    queue.push_back(key.as_str());
+                }
+            }
+        }
+        depths
     }
 
     /// Clone only the `packages` entries whose keys are in `reachable`.
@@ -826,6 +1338,73 @@ impl LockfileGraph {
         })
     }
 
+    /// Pass the path of every path-based local package (`file:`, `link:`,
+    /// `portal:`, `exec:`) through `rebase`, re-keying it and every importer
+    /// and package edge that points at it.
+    ///
+    /// The resolver and linker keep those paths relative to the workspace
+    /// root, while a per-project lockfile (`sharedWorkspaceLockfile=false`)
+    /// records them relative to its own project, as pnpm does. This moves a
+    /// graph between the two frames.
+    pub fn rebase_local_paths(&mut self, rebase: impl Fn(&std::path::Path) -> std::path::PathBuf) {
+        let mut renames: BTreeMap<String, String> = BTreeMap::new();
+        for (key, pkg) in &mut self.packages {
+            let Some(local) = pkg.local_source.as_mut() else {
+                continue;
+            };
+            let old_base = local.dep_path(&pkg.name);
+            let path = match local {
+                LocalSource::Directory(p)
+                | LocalSource::Tarball(p)
+                | LocalSource::Link(p)
+                | LocalSource::Portal(p)
+                | LocalSource::Exec(p) => p,
+                LocalSource::Git(_) | LocalSource::RemoteTarball(_) => continue,
+            };
+            *path = rebase(path);
+            // A peer-context suffix after the base stays as it was. The pnpm
+            // reader keeps a transitive-only local under its raw key
+            // (`foo@file:../lib.tgz`), which names a different package in
+            // each frame, so it takes the hashed key too.
+            let rest = key.strip_prefix(&old_base).unwrap_or_else(|| {
+                let tail = key.strip_prefix(&format!("{}@", pkg.name)).unwrap_or(key);
+                tail.find('(').map_or("", |i| &tail[i..])
+            });
+            renames.insert(key.clone(), format!("{}{rest}", local.dep_path(&pkg.name)));
+        }
+        renames.retain(|old, new| old != new);
+        if renames.is_empty() {
+            return;
+        }
+        self.packages = std::mem::take(&mut self.packages)
+            .into_iter()
+            .map(|(key, mut pkg)| {
+                let key = match renames.get(&key) {
+                    Some(new) => {
+                        pkg.dep_path.clone_from(new);
+                        new.clone()
+                    }
+                    None => key,
+                };
+                for edges in [&mut pkg.dependencies, &mut pkg.optional_dependencies] {
+                    for (name, tail) in edges.iter_mut() {
+                        if let Some(new) = renames.get(&format!("{name}@{tail}"))
+                            && let Some(new_tail) = new.strip_prefix(&format!("{name}@"))
+                        {
+                            *tail = new_tail.to_string();
+                        }
+                    }
+                }
+                (key, pkg)
+            })
+            .collect();
+        for dep in self.importers.values_mut().flatten() {
+            if let Some(new) = renames.get(&dep.dep_path) {
+                dep.dep_path.clone_from(new);
+            }
+        }
+    }
+
     /// Overlay per-package metadata fields from `prior` onto `self`
     /// for every `(name, version)` that survives in both graphs.
     /// Carries forward only fields the abbreviated packument (npm
@@ -910,5 +1489,270 @@ impl LockfileGraph {
         if self.workspace_extra_fields.is_empty() {
             self.workspace_extra_fields = prior.workspace_extra_fields.clone();
         }
+    }
+}
+
+#[cfg(test)]
+mod graph_traversal_tests {
+    use super::*;
+
+    /// Build a graph from `(dep_path, [(child_name, child_tail)])` edges. The
+    /// package name is parsed off the dep_path (the part before the last `@`,
+    /// handling `@scope/name`), matching how real dep_paths encode identity.
+    fn graph(edges: &[(&str, &[(&str, &str)])]) -> LockfileGraph {
+        let mut g = LockfileGraph::default();
+        for (dep_path, deps) in edges {
+            let name = dep_path_name(dep_path);
+            let mut pkg = LockedPackage {
+                name: name.to_string(),
+                dep_path: dep_path.to_string(),
+                ..Default::default()
+            };
+            for (child_name, child_tail) in *deps {
+                pkg.dependencies
+                    .insert(child_name.to_string(), child_tail.to_string());
+            }
+            g.packages.insert(dep_path.to_string(), pkg);
+        }
+        g
+    }
+
+    /// Package name from a dep_path: everything before the version's `@`
+    /// (the LAST `@` for a scoped `@scope/name@1.0.0`).
+    fn dep_path_name(dep_path: &str) -> &str {
+        let core = dep_path.split(['(']).next().unwrap_or(dep_path);
+        match core.rfind('@') {
+            Some(0) | None => core,
+            Some(i) => &core[..i],
+        }
+    }
+
+    fn closure_of(g: &LockfileGraph, seeds: &[&str]) -> std::collections::BTreeSet<String> {
+        g.importer_closure(seeds.iter().copied())
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn linear_chain_walks_up_to_every_ancestor() {
+        // a → b → c ; seed c ⇒ {a, b, c}. The root importer (project) is not a
+        // package, so the walk stops at `a`.
+        let g = graph(&[
+            ("a@1.0.0", &[("b", "1.0.0")]),
+            ("b@1.0.0", &[("c", "1.0.0")]),
+            ("c@1.0.0", &[]),
+        ]);
+        assert_eq!(
+            closure_of(&g, &["c@1.0.0"]),
+            ["a@1.0.0", "b@1.0.0", "c@1.0.0"].map(String::from).into()
+        );
+    }
+
+    #[test]
+    fn diamond_collects_all_importer_paths() {
+        // a → b, a → c, b → d, c → d ; seed d ⇒ {a, b, c, d} (both paths).
+        let g = graph(&[
+            ("a@1.0.0", &[("b", "1.0.0"), ("c", "1.0.0")]),
+            ("b@1.0.0", &[("d", "1.0.0")]),
+            ("c@1.0.0", &[("d", "1.0.0")]),
+            ("d@1.0.0", &[]),
+        ]);
+        assert_eq!(
+            closure_of(&g, &["d@1.0.0"]),
+            ["a@1.0.0", "b@1.0.0", "c@1.0.0", "d@1.0.0"]
+                .map(String::from)
+                .into()
+        );
+    }
+
+    #[test]
+    fn unrelated_subtree_is_excluded_the_bounded_invariant() {
+        // The load-bearing property: a seed's closure is its importer subtree
+        // ONLY. An unrelated tree (q → r) sharing no path to the seed stays out,
+        // no matter how large — so a big project's unrelated deps keep symlink
+        // speed.
+        let g = graph(&[
+            ("root-a@1.0.0", &[("x", "1.0.0")]),
+            ("x@1.0.0", &[]),               // the phantom breaker (seed)
+            ("q@1.0.0", &[("r", "1.0.0")]), // unrelated top-level subtree
+            ("r@1.0.0", &[]),
+        ]);
+        let closure = closure_of(&g, &["x@1.0.0"]);
+        assert_eq!(
+            closure,
+            ["root-a@1.0.0", "x@1.0.0"].map(String::from).into()
+        );
+        assert!(!closure.contains("q@1.0.0"));
+        assert!(!closure.contains("r@1.0.0"));
+    }
+
+    #[test]
+    fn cycles_terminate() {
+        // a ↔ b mutual dep; seed b ⇒ {a, b}, no infinite loop.
+        let g = graph(&[
+            ("a@1.0.0", &[("b", "1.0.0")]),
+            ("b@1.0.0", &[("a", "1.0.0")]),
+        ]);
+        assert_eq!(
+            closure_of(&g, &["b@1.0.0"]),
+            ["a@1.0.0", "b@1.0.0"].map(String::from).into()
+        );
+    }
+
+    #[test]
+    fn leaf_and_missing_seeds_yield_just_the_seed() {
+        let g = graph(&[("a@1.0.0", &[("b", "1.0.0")]), ("b@1.0.0", &[])]);
+        // `a` has no importer ⇒ closure is just itself.
+        assert_eq!(
+            closure_of(&g, &["a@1.0.0"]),
+            ["a@1.0.0"].map(String::from).into()
+        );
+        // A seed absent from `packages` is treated as a leaf (matches
+        // `transitive_closure`): present in the closure, no importers.
+        assert_eq!(
+            closure_of(&g, &["ghost@9.9.9"]),
+            ["ghost@9.9.9"].map(String::from).into()
+        );
+    }
+
+    #[test]
+    fn scoped_peer_suffixed_dep_paths_reconstruct_correctly() {
+        // The child edge value is the dep_path TAIL, so `@scope/pkg`'s importer
+        // edge reconstructs as `@scope/pkg@<tail>` — including a peer suffix.
+        let g = graph(&[
+            ("firebase@10.0.0", &[("@firebase/database", "1.0.0")]),
+            ("@firebase/database@1.0.0", &[]),
+        ]);
+        assert_eq!(
+            closure_of(&g, &["@firebase/database@1.0.0"]),
+            ["@firebase/database@1.0.0", "firebase@10.0.0"]
+                .map(String::from)
+                .into()
+        );
+    }
+
+    /// Attach direct dependencies to `importer_id`, so a graph can carry a
+    /// workspace member's own entry point and not just the root's.
+    fn with_importer(mut g: LockfileGraph, importer_id: &str, deps: &[&str]) -> LockfileGraph {
+        g.importers.insert(
+            importer_id.to_string(),
+            deps.iter()
+                .map(|dep_path| DirectDep {
+                    name: dep_path_name(dep_path).to_string(),
+                    dep_path: (*dep_path).to_string(),
+                    dep_type: DepType::Production,
+                    specifier: None,
+                })
+                .collect(),
+        );
+        g
+    }
+
+    #[test]
+    fn depth_is_the_shortest_path_from_a_direct_dep() {
+        // shallow@1 → ms@2.1.2 (depth 1); deep@1 → mid@1 → ms@2.0.0 (depth 2).
+        let g = with_importer(
+            graph(&[
+                ("shallow@1.0.0", &[("ms", "2.1.2")]),
+                ("deep@1.0.0", &[("mid", "1.0.0")]),
+                ("mid@1.0.0", &[("ms", "2.0.0")]),
+                ("ms@2.1.2", &[]),
+                ("ms@2.0.0", &[]),
+            ]),
+            ".",
+            &["shallow@1.0.0", "deep@1.0.0"],
+        );
+        let depths = g.dependency_depths();
+        assert_eq!(depths.get("shallow@1.0.0"), Some(&0));
+        assert_eq!(depths.get("deep@1.0.0"), Some(&0));
+        assert_eq!(depths.get("mid@1.0.0"), Some(&1));
+        assert_eq!(
+            depths.get("ms@2.1.2"),
+            Some(&1),
+            "the copy under a root direct dep is the shallow one"
+        );
+        assert_eq!(depths.get("ms@2.0.0"), Some(&2));
+    }
+
+    #[test]
+    fn a_workspace_members_direct_dep_is_depth_zero() {
+        // The regression this guards: seeding from `root_deps()` alone leaves a
+        // member's direct dependency unreachable, so hidden-hoist name selection
+        // would rank it BELOW every transitive the root can reach — the opposite
+        // of what the member's own code resolves.
+        let g = with_importer(
+            with_importer(
+                graph(&[
+                    ("express@4.18.2", &[("debug", "2.6.9")]),
+                    ("debug@2.6.9", &[]),
+                    ("debug@4.3.4", &[]),
+                ]),
+                ".",
+                &["express@4.18.2"],
+            ),
+            "packages/a",
+            &["debug@4.3.4"],
+        );
+        let depths = g.dependency_depths();
+        assert_eq!(depths.get("debug@4.3.4"), Some(&0));
+        assert_eq!(depths.get("debug@2.6.9"), Some(&1));
+    }
+
+    #[test]
+    fn a_dependency_cycle_terminates_and_keeps_the_shortest_depth() {
+        // a → b → c → a. Without first-write-wins this never settles.
+        let g = with_importer(
+            graph(&[
+                ("a@1.0.0", &[("b", "1.0.0")]),
+                ("b@1.0.0", &[("c", "1.0.0")]),
+                ("c@1.0.0", &[("a", "1.0.0")]),
+            ]),
+            ".",
+            &["a@1.0.0"],
+        );
+        let depths = g.dependency_depths();
+        assert_eq!(depths.get("a@1.0.0"), Some(&0));
+        assert_eq!(depths.get("b@1.0.0"), Some(&1));
+        assert_eq!(depths.get("c@1.0.0"), Some(&2));
+    }
+
+    #[test]
+    fn an_optional_only_edge_still_yields_a_depth() {
+        // Guards this function's contract in isolation, NOT a berry install
+        // scenario: `platform::filter_graph` would have GC'd an
+        // optional-only-reachable package before any real caller got here, so
+        // this graph shape is hand-built on purpose.
+        let mut g = with_importer(
+            graph(&[("host@1.0.0", &[]), ("native@1.0.0", &[])]),
+            ".",
+            &["host@1.0.0"],
+        );
+        g.packages
+            .get_mut("host@1.0.0")
+            .unwrap()
+            .optional_dependencies
+            .insert("native".to_string(), "1.0.0".to_string());
+
+        let depths = g.dependency_depths();
+        assert_eq!(depths.get("host@1.0.0"), Some(&0));
+        assert_eq!(
+            depths.get("native@1.0.0"),
+            Some(&1),
+            "an active optional edge is a real edge and must carry a depth"
+        );
+    }
+
+    #[test]
+    fn a_package_no_importer_reaches_is_absent() {
+        // Absent rather than present-with-a-number: the hidden-hoist sort maps
+        // absence to "infinitely deep" so it loses every name contest it enters.
+        let g = with_importer(
+            graph(&[("reachable@1.0.0", &[]), ("orphan@1.0.0", &[])]),
+            ".",
+            &["reachable@1.0.0"],
+        );
+        let depths = g.dependency_depths();
+        assert_eq!(depths.get("reachable@1.0.0"), Some(&0));
+        assert_eq!(depths.get("orphan@1.0.0"), None);
     }
 }

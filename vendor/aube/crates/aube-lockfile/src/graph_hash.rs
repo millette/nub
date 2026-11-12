@@ -26,30 +26,19 @@
 //! gives us alphabetized keys for free. BLAKE3 is the project default
 //! for non-crypto-verifying hashes (3-5x faster than SHA-256).
 
-use crate::{LockedPackage, LockfileGraph, dep_type_label, shared_local_dep_path};
+use crate::{LockedPackage, LockfileGraph, dep_type_label, resolve_dep_edge};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-/// Resolve a child dependency's recorded `(alias, tail)` to the graph
-/// key the target package is stored under.
-///
-/// Registry deps record their version verbatim, so `alias@tail` is the
-/// key. Git / remote-tarball deps record their *resolved URL* as the
-/// tail while the package is keyed under the hashed
-/// `alias@git+<hash>` / `alias@url+<hash>` form; [`shared_local_dep_path`]
-/// performs that translation. Falling back to the raw `alias@tail`
-/// keeps the common case allocation-light and behaves identically to
-/// the pre-canonicalization lookup for everything that isn't a
-/// content-pinned source.
-///
-/// Keeping this in lockstep with the linker's sibling-symlink keying
-/// (which calls the same helper) is load-bearing: if the hasher skipped
-/// a URL-shaped git child, the parent's GVS hash would omit that child's
-/// content fingerprint and build/engine taint, and two materially
-/// different trees would collide on one virtual-store path.
-fn child_dep_path(alias: &str, tail: &str) -> String {
-    shared_local_dep_path(alias, tail).unwrap_or_else(|| format!("{alias}@{tail}"))
-}
+// Child-edge resolution uses [`resolve_dep_edge`] directly, in LOCKSTEP with
+// the linker's sibling-symlink keying (which resolves the same way). This is
+// load-bearing: the hasher must reach EXACTLY the child dep_paths the linker
+// materializes, or the parent's GVS hash omits a linked child's content
+// fingerprint + build/engine taint and two materially different trees collide
+// on one virtual-store path. The three reader conventions (yarn full dep_path,
+// npm/pnpm tail, git/tarball resolved URL) are all handled by `resolve_dep_edge`
+// — the former `child_dep_path` helper resolved only the tail + git/tarball
+// forms and silently dropped every yarn full-dep_path child from the hash.
 
 use aube_util::collections::FxMap as FxHashMap;
 use aube_util::collections::FxSet as FxHashSet;
@@ -74,14 +63,24 @@ pub struct EngineName(pub String);
 /// store directories look familiar next to `process.arch` output.
 /// Libc detection is a known gap (TODO: musl vs glibc).
 pub fn engine_name_default(node_version: &str) -> EngineName {
-    let os = std::env::consts::OS;
-    let arch = node_arch(std::env::consts::ARCH);
     let major = node_version
         .trim_start_matches('v')
         .split('.')
         .next()
         .unwrap_or("");
-    EngineName(format!("{os}-{arch}-node{major}"))
+    EngineName(format!("{}-node{major}", platform_name()))
+}
+
+/// The `<os>-<arch>` prefix of [`engine_name_default`] on its own, for
+/// callers that key build artifacts but could not resolve a Node
+/// version: they degrade to the platform axis instead of naming an
+/// engine nobody observed.
+pub fn platform_name() -> String {
+    format!(
+        "{}-{}",
+        std::env::consts::OS,
+        node_arch(std::env::consts::ARCH)
+    )
 }
 
 /// Map Rust `std::env::consts::ARCH` values to Node's `process.arch`
@@ -372,13 +371,14 @@ fn calc_deps_hash(
             let id = full_pkg_id(pkg, patch_hash, content_hash(dep_path).as_deref());
             let mut deps: BTreeMap<String, String> = BTreeMap::new();
             for (alias, child_tail) in &pkg.dependencies {
-                let child_dep_path = child_dep_path(alias, child_tail);
-                // The child might not be in the graph if the lockfile
-                // has a dangling reference (e.g. after manual edits);
-                // skip rather than panic.
-                if !graph.packages.contains_key(&child_dep_path) {
+                // `None` = the child edge points outside the graph (a dangling
+                // ref after manual edits, or a pruned optional); skip rather
+                // than panic.
+                let Some(child_dep_path) =
+                    resolve_dep_edge(alias, child_tail, |k| graph.packages.contains_key(k))
+                else {
                     continue;
-                }
+                };
                 let child_hash = calc_deps_hash(
                     graph,
                     &child_dep_path,
@@ -423,8 +423,12 @@ fn transitively_requires_build(
     }
     let result = match graph.packages.get(dep_path) {
         Some(pkg) => pkg.dependencies.iter().any(|(alias, tail)| {
-            let child_dep_path = child_dep_path(alias, tail);
-            transitively_requires_build(graph, builds, &child_dep_path, cache, parents)
+            match resolve_dep_edge(alias, tail, |k| graph.packages.contains_key(k)) {
+                Some(child_dep_path) => {
+                    transitively_requires_build(graph, builds, &child_dep_path, cache, parents)
+                }
+                None => false,
+            }
         }),
         None => false,
     };
@@ -472,8 +476,9 @@ pub fn content_affected_dep_paths(graph: &LockfileGraph) -> FxHashSet<String> {
             stack.push(dep_path.clone());
         }
         for (alias, child_tail) in &pkg.dependencies {
-            let child = child_dep_path(alias, child_tail);
-            if graph.packages.contains_key(&child) {
+            if let Some(child) =
+                resolve_dep_edge(alias, child_tail, |k| graph.packages.contains_key(k))
+            {
                 parents_of.entry(child).or_default().push(dep_path.clone());
             }
         }
@@ -505,12 +510,27 @@ fn full_pkg_id(pkg: &LockedPackage, patch_hash: PatchHashFn<'_>, content: Option
     let source = pkg
         .local_source
         .as_ref()
-        .map(|source| format!(":source:{}", source.specifier()))
+        .map(|source| format!(":source:{}", source.pnpm_specifier()))
         .unwrap_or_default();
     let content = content
         .map(|hex| format!(":content:{hex}"))
         .unwrap_or_default();
-    match patch_hash(&pkg.name, &pkg.version) {
+    // Resolve the patch fingerprint with the SAME precedence as
+    // `LockedPackage::lookup_patch` — alias-qualified `name@version`
+    // first, then `registry_name()@version` — so the virtual-store hash
+    // always reflects the exact patch the apply sites write to disk. An
+    // npm-aliased entry (`name` = alias) declares its patch against the
+    // registry identity in the common case, but a patch keyed by the
+    // alias must win here too; otherwise the patched node would share a
+    // dep_path with the unpatched one. The identity string keeps
+    // `pkg.name` so the alias retains its own node.
+    let patch = patch_hash(&pkg.name, &pkg.version).or_else(|| {
+        let registry_name = pkg.registry_name();
+        (registry_name != pkg.name)
+            .then(|| patch_hash(registry_name, &pkg.version))
+            .flatten()
+    });
+    match patch {
         Some(hex) => format!(
             "{}@{}:patch:{hex}{source}{content}:{integrity}",
             pkg.name, pkg.version
@@ -543,7 +563,7 @@ struct DepsHashInput<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DirectDep, LocalSource, LockedPackage, LockfileGraph};
+    use crate::{DirectDep, LocalSource, LockedPackage, LockfileGraph, shared_local_dep_path};
     use std::path::PathBuf;
 
     fn mk_pkg(name: &str, ver: &str, integrity: Option<&str>) -> LockedPackage {
@@ -567,6 +587,18 @@ mod tests {
             packages: BTreeMap::new(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_local_path_hashes_alike_as_resolved_and_as_read_from_the_lockfile() {
+        let hash = |path: &str| {
+            let mut g = empty_graph();
+            let mut pkg = mk_pkg("dep", "1.0.0", None);
+            pkg.local_source = Some(LocalSource::Directory(PathBuf::from(path)));
+            g.packages.insert("dep@1.0.0".into(), pkg);
+            compute_graph_hashes(&g, &|_| false, None).node_hash
+        };
+        assert_eq!(hash("./dep"), hash("dep"));
     }
 
     #[test]
@@ -617,6 +649,37 @@ mod tests {
         let h2 = compute_graph_hashes(&g2, &|_| false, None);
         assert_ne!(h1.node_hash["foo@1.0.0"], h2.node_hash["foo@1.0.0"]);
         assert_ne!(h1.node_hash["bar@1.0.0"], h2.node_hash["bar@1.0.0"]);
+    }
+
+    #[test]
+    fn yarn_full_dep_path_child_edge_cascades_to_parent_hash() {
+        // The yarn readers store an edge VALUE as the full dep_path
+        // (`bar@1.0.0`), not the bare tail (`1.0.0`). The hasher must resolve
+        // it to the child's graph key IN LOCKSTEP with the linker (which
+        // materializes it), or the parent's hash omits the child's fingerprint
+        // and two materially different trees collide on one virtual-store path.
+        // The old `child_dep_path` doubled the name (`bar@bar@1.0.0`) and
+        // silently dropped every yarn child from the hash.
+        let mut g1 = empty_graph();
+        let mut foo = mk_pkg("foo", "1.0.0", Some("sha512-F"));
+        foo.dependencies.insert("bar".into(), "bar@1.0.0".into());
+        g1.packages.insert("foo@1.0.0".into(), foo);
+        g1.packages.insert(
+            "bar@1.0.0".into(),
+            mk_pkg("bar", "1.0.0", Some("sha512-B1")),
+        );
+
+        let mut g2 = g1.clone();
+        g2.packages.insert(
+            "bar@1.0.0".into(),
+            mk_pkg("bar", "1.0.0", Some("sha512-B2")),
+        );
+
+        let h1 = compute_graph_hashes(&g1, &|_| false, None);
+        let h2 = compute_graph_hashes(&g2, &|_| false, None);
+        // The child change cascades into foo's hash only if the conv-1 edge
+        // was actually walked.
+        assert_ne!(h1.node_hash["foo@1.0.0"], h2.node_hash["foo@1.0.0"]);
     }
 
     #[test]
@@ -1095,6 +1158,61 @@ mod tests {
         assert_eq!(
             graph_identity_hash(&g1, &|_| false),
             graph_identity_hash(&g2, &|_| false)
+        );
+    }
+
+    #[test]
+    fn aliased_patch_hash_resolves_by_registry_identity() {
+        // `"odd-alias": "npm:is-odd@3.0.1"` with a patch declared against
+        // the registry identity `is-odd@3.0.1`. The graph hash must fold
+        // that patch in even though the node's `name` is the alias, so
+        // the patched node lands on a distinct dep_path from an unpatched
+        // one. Mirrors what `LockedPackage::lookup_patch` does at the
+        // apply sites.
+        let mut g = empty_graph();
+        let mut pkg = mk_pkg("odd-alias", "3.0.1", Some("sha512-A"));
+        pkg.alias_of = Some("is-odd".into());
+        g.packages.insert("odd-alias@3.0.1".into(), pkg);
+
+        let unpatched = compute_graph_hashes_with_patches(&g, &|_| false, None, &|_, _| None);
+        let patched = compute_graph_hashes_with_patches(&g, &|_| false, None, &|name, ver| {
+            (name == "is-odd" && ver == "3.0.1").then(|| "deadbeef".to_string())
+        });
+        assert_ne!(
+            unpatched.node_hash["odd-alias@3.0.1"], patched.node_hash["odd-alias@3.0.1"],
+            "a registry-name patch must change the aliased node's graph hash"
+        );
+    }
+
+    #[test]
+    fn aliased_patch_hash_prefers_alias_key_over_registry_key() {
+        // A patch declared against the alias identity must win over one
+        // declared against the registry identity — the same precedence
+        // `LockedPackage::lookup_patch` uses (`spec_key()` first). If the
+        // graph hash resolved registry-first, the on-disk bytes (patched
+        // via the alias key) and the dep_path would disagree.
+        let mut g = empty_graph();
+        let mut pkg = mk_pkg("odd-alias", "3.0.1", Some("sha512-A"));
+        pkg.alias_of = Some("is-odd".into());
+        g.packages.insert("odd-alias@3.0.1".into(), pkg);
+
+        let alias_keyed =
+            compute_graph_hashes_with_patches(
+                &g,
+                &|_| false,
+                None,
+                &|name, ver| match (name, ver) {
+                    ("odd-alias", "3.0.1") => Some("alias-patch".to_string()),
+                    ("is-odd", "3.0.1") => Some("registry-patch".to_string()),
+                    _ => None,
+                },
+            );
+        let alias_only = compute_graph_hashes_with_patches(&g, &|_| false, None, &|name, ver| {
+            (name == "odd-alias" && ver == "3.0.1").then(|| "alias-patch".to_string())
+        });
+        assert_eq!(
+            alias_keyed.node_hash["odd-alias@3.0.1"], alias_only.node_hash["odd-alias@3.0.1"],
+            "alias-keyed patch must take precedence over the registry-keyed one"
         );
     }
 }

@@ -1489,6 +1489,175 @@ fn test_parse_rebases_workspace_scoped_local_tarball() {
     );
 }
 
+/// bun writes a `file:` directory from the workspace root and a tarball as
+/// the declaring manifest spells it, under the member's scope or hoisted.
+#[test]
+fn test_parse_reads_each_local_path_from_the_base_bun_wrote_it_against() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "root",
+      "dependencies": { "root-tar": "file:../out/root-tar-1.0.0.tgz" }
+    },
+    "apps/a": {
+      "name": "a",
+      "dependencies": {
+        "out-dir": "file:../../../outside/out-dir",
+        "sibling": "file:../sibling",
+        "hoisted-tar": "file:../../vendor/hoisted-tar-1.0.0.tgz",
+        "own-tar": "file:./own-tar-1.0.0.tgz"
+      },
+      "peerDependencies": { "peer-tar": "file:./peer-tar-1.0.0.tgz" }
+    }
+  },
+  "packages": {
+    "a": ["a@workspace:apps/a"],
+    "a/out-dir": ["out-dir@file:../outside/out-dir", {}],
+    "a/sibling": ["sibling@file:apps/sibling", {}],
+    "a/own-tar": ["own-tar@./own-tar-1.0.0.tgz", {}],
+    "hoisted-tar": ["hoisted-tar@../../vendor/hoisted-tar-1.0.0.tgz", {}],
+    "peer-tar": ["peer-tar@./peer-tar-1.0.0.tgz", {}],
+    "root-tar": ["root-tar@../out/root-tar-1.0.0.tgz", {}]
+  }
+}"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let graph = parse(tmp.path()).unwrap();
+    let source = |name: &str| {
+        graph
+            .packages
+            .values()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("{name} missing"))
+            .local_source
+            .clone()
+    };
+    let dir = |p: &str| Some(LocalSource::Directory(PathBuf::from(p)));
+    let tar = |p: &str| Some(LocalSource::Tarball(PathBuf::from(p)));
+    assert_eq!(source("out-dir"), dir("../outside/out-dir"));
+    assert_eq!(source("sibling"), dir("apps/sibling"));
+    assert_eq!(source("own-tar"), tar("apps/a/own-tar-1.0.0.tgz"));
+    assert_eq!(source("hoisted-tar"), tar("vendor/hoisted-tar-1.0.0.tgz"));
+    assert_eq!(source("peer-tar"), tar("apps/a/peer-tar-1.0.0.tgz"));
+    assert_eq!(source("root-tar"), tar("../out/root-tar-1.0.0.tgz"));
+}
+
+/// Two manifests spelling one path can mean different archives. bun installs
+/// a concrete dependency's over a peer's and, within each, the root's, else
+/// the one from the member whose name sorts first.
+#[test]
+fn test_parse_picks_buns_archive_when_manifests_spell_one_path() {
+    let read = |root_fields: &str| {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let content = format!(
+            r#"{{
+  "lockfileVersion": 1,
+  "workspaces": {{
+    "": {{ "name": "root"{root_fields} }},
+    "apps/a": {{ "name": "z", "dependencies": {{ "foo": "file:./foo.tgz" }} }},
+    "apps/b": {{ "name": "a", "dependencies": {{ "foo": "file:./foo.tgz" }} }}
+  }},
+  "packages": {{ "foo": ["foo@./foo.tgz", {{}}] }}
+}}"#
+        );
+        std::fs::write(tmp.path(), content).unwrap();
+        let graph = parse(tmp.path()).unwrap();
+        let foo = graph.packages.values().find(|p| p.name == "foo").unwrap();
+        foo.local_source.clone().unwrap()
+    };
+    assert_eq!(
+        read(""),
+        LocalSource::Tarball(PathBuf::from("apps/b/foo.tgz"))
+    );
+    assert_eq!(
+        read(r#", "dependencies": { "foo": "file:./foo.tgz" }"#),
+        LocalSource::Tarball(PathBuf::from("./foo.tgz"))
+    );
+    assert_eq!(
+        read(r#", "peerDependencies": { "foo": "file:./foo.tgz" }"#),
+        LocalSource::Tarball(PathBuf::from("apps/b/foo.tgz"))
+    );
+}
+
+/// A freshly resolved local package needs bun's local form, or bun looks for
+/// it on the registry.
+#[test]
+fn test_write_renders_a_fresh_local_package_in_buns_form() {
+    let project = tempfile::TempDir::new().unwrap();
+    let root = project.path();
+    std::fs::create_dir_all(root.join("apps/a")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","workspaces":["apps/a"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("apps/a/package.json"),
+        r#"{"name":"a","version":"1.0.0","dependencies":{
+            "out-dir":"file:../../../outside/out-dir",
+            "tar":"file:../../vendor/tar-1.0.0.tgz"},
+            "peerDependencies":{"peer-tar":"file:./peer-tar-1.0.0.tgz"}}"#,
+    )
+    .unwrap();
+    let local = |name: &str, source: LocalSource| LockedPackage {
+        name: name.to_string(),
+        version: "1.0.0".to_string(),
+        dep_path: source.dep_path(name),
+        local_source: Some(source),
+        ..Default::default()
+    };
+    let packages = [
+        local(
+            "out-dir",
+            LocalSource::Directory(PathBuf::from("../outside/out-dir")),
+        ),
+        local(
+            "tar",
+            LocalSource::Tarball(PathBuf::from("vendor/tar-1.0.0.tgz")),
+        ),
+        local(
+            "peer-tar",
+            LocalSource::Tarball(PathBuf::from("apps/a/peer-tar-1.0.0.tgz")),
+        ),
+    ];
+    let direct = packages
+        .iter()
+        .map(|p| DirectDep {
+            name: p.name.clone(),
+            dep_path: p.dep_path.clone(),
+            dep_type: DepType::Production,
+            specifier: None,
+        })
+        .collect();
+    let graph = LockfileGraph {
+        importers: BTreeMap::from([(".".to_string(), vec![]), ("apps/a".to_string(), direct)]),
+        packages: packages
+            .into_iter()
+            .map(|p| (p.dep_path.clone(), p))
+            .collect(),
+        ..Default::default()
+    };
+    let lock_path = root.join("bun.lock");
+    let manifest = aube_manifest::PackageJson::from_path(&root.join("package.json")).unwrap();
+    write(&lock_path, &graph, &manifest).unwrap();
+
+    let written = std::fs::read_to_string(&lock_path).unwrap();
+    for entry in [
+        r#""out-dir": ["out-dir@file:../outside/out-dir", {}]"#,
+        r#""tar": ["tar@../../vendor/tar-1.0.0.tgz", {}]"#,
+        r#""peer-tar": ["peer-tar@./peer-tar-1.0.0.tgz", {}]"#,
+    ] {
+        assert!(written.contains(entry), "missing {entry} in:\n{written}");
+    }
+    let reread = parse(&lock_path).unwrap();
+    let tar = reread.packages.values().find(|p| p.name == "tar").unwrap();
+    assert_eq!(
+        tar.local_source,
+        Some(LocalSource::Tarball(PathBuf::from("vendor/tar-1.0.0.tgz")))
+    );
+}
+
 /// Top-level `overrides` / `patchedDependencies` / `trustedDependencies`
 /// and the unnamed `catalog` / named `catalogs` blocks must round-trip
 /// verbatim — bun preserves all five on re-emit, so aube dropping any
@@ -2126,5 +2295,267 @@ fn git_hosted_remote_tarball_is_emitted_as_bun_git_tuple() {
         !body.contains("\"ms@2.1.3\""),
         "the git dep must NOT collapse into a registry-shaped `ms@2.1.3` \
          entry (the bug that fails bun's cold-cache frozen install):\n{body}"
+    );
+}
+
+/// bun stamps `lockfileVersion: 2` on fresh installs as of bun 1.4
+/// (`bun.lock.rs`: `Version::CURRENT = V2`). v1→v2 added only parse-time
+/// strictness on identical on-disk content, so a v2 lockfile parses
+/// through the same path as v1 — its package versions and integrity
+/// hashes must land on the graph unchanged. The same `{ ident, "",
+/// { meta }, integrity }` tuple shape is used; only the header number
+/// differs from `test_parse_simple`.
+#[test]
+fn test_parse_accepts_lockfile_version_2() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let sri_foo = fake_sri('a');
+    let sri_bar = fake_sri('b');
+    let content = r#"{
+  "lockfileVersion": 2,
+  "workspaces": {
+    "": {
+      "name": "test",
+      "dependencies": {
+        "foo": "^1.0.0",
+        "bar": "^2.0.0",
+      },
+    },
+  },
+  "packages": {
+    "foo": ["foo@1.2.3", "", { "dependencies": { "bar": "^2.0.0" } }, "SRI_FOO"],
+    "bar": ["bar@2.5.0", "", {}, "SRI_BAR"],
+  }
+}"#
+    .replace("SRI_FOO", &sri_foo)
+    .replace("SRI_BAR", &sri_bar);
+    std::fs::write(tmp.path(), &content).unwrap();
+    let graph = parse(tmp.path()).unwrap();
+
+    assert_eq!(graph.packages.len(), 2);
+    assert_eq!(
+        graph.packages["foo@1.2.3"].integrity.as_deref(),
+        Some(sri_foo.as_str())
+    );
+    assert_eq!(
+        graph.packages["bar@2.5.0"].integrity.as_deref(),
+        Some(sri_bar.as_str())
+    );
+    assert_eq!(
+        graph.packages["foo@1.2.3"]
+            .dependencies
+            .get("bar")
+            .map(String::as_str),
+        Some("2.5.0")
+    );
+    let root = graph.importers.get(".").unwrap();
+    assert!(root.iter().any(|d| d.name == "foo"));
+    assert!(root.iter().any(|d| d.name == "bar"));
+}
+
+/// Only v1 and v2 are known bun.lock shapes; an unknown version
+/// (a future format, or a corrupt/hand-edited header) must still be
+/// rejected rather than silently mis-parsed against the v1/v2 layout.
+#[test]
+fn test_parse_rejects_unsupported_lockfile_version() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+  "lockfileVersion": 3,
+  "workspaces": { "": { "name": "test" } },
+  "packages": {}
+}"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let err = parse(tmp.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("lockfileVersion 3") && msg.contains("expected 1 or 2"),
+        "unsupported version error should name the version and the supported set, got: {msg}"
+    );
+}
+
+/// The LENIENT default (standalone aube, `strict_unsupported_source:
+/// false`): an ident tail with an unrecognized protocol falls through to
+/// a plain registry pin, exactly as before the strict policy existed —
+/// the in-crate suite runs under the default embedder, so this pins the
+/// fork-discipline guarantee that only a strict profile changes behavior.
+#[test]
+fn test_unknown_protocol_tail_stays_a_registry_pin_by_default() {
+    assert!(!aube_util::embedder().strict_unsupported_source);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+  "lockfileVersion": 1,
+  "workspaces": { "": { "dependencies": { "foo": "exotic:bar" } } },
+  "packages": { "foo": ["foo@exotic:bar", {}] }
+}"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let graph = parse(tmp.path()).expect("lenient default must not fatal");
+    let foo = graph
+        .packages
+        .values()
+        .find(|p| p.name == "foo")
+        .expect("foo reclassified as a registry package");
+    assert_eq!(foo.version, "exotic:bar");
+    assert!(foo.local_source.is_none());
+}
+
+/// bun writes no edge for a package's resolved peer, required or optional:
+/// the peer stays in `peerDependencies`/`optionalPeers`, which is where an
+/// install from the lockfile links it from. openai declares no dependencies,
+/// so its declared ranges are known and empty.
+#[test]
+fn write_records_a_resolved_peer_only_in_its_peer_declaration() {
+    let mut graph = LockfileGraph::default();
+    graph.importers.insert(
+        ".".to_string(),
+        ["openai", "ws", "zod"]
+            .into_iter()
+            .map(|name| DirectDep {
+                name: name.to_string(),
+                dep_path: format!("{name}@1.0.0"),
+                dep_type: DepType::Production,
+                specifier: Some("1.0.0".to_string()),
+            })
+            .collect(),
+    );
+    let mut openai = LockedPackage {
+        name: "openai".to_string(),
+        version: "1.0.0".to_string(),
+        dep_path: "openai@1.0.0".to_string(),
+        integrity: Some(fake_sri('o')),
+        declared_dependencies_known: true,
+        ..Default::default()
+    };
+    for peer in ["ws", "zod"] {
+        openai
+            .peer_dependencies
+            .insert(peer.to_string(), "^1.0.0".to_string());
+        openai
+            .dependencies
+            .insert(peer.to_string(), "1.0.0".to_string());
+    }
+    openai
+        .peer_dependencies_meta
+        .insert("zod".to_string(), crate::PeerDepMeta { optional: true });
+    openai
+        .optional_dependencies
+        .insert("zod".to_string(), "1.0.0".to_string());
+    graph.packages.insert(openai.dep_path.clone(), openai);
+    for (name, c) in [("ws", 'w'), ("zod", 'z')] {
+        let pkg = LockedPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: format!("{name}@1.0.0"),
+            integrity: Some(fake_sri(c)),
+            ..Default::default()
+        };
+        graph.packages.insert(pkg.dep_path.clone(), pkg);
+    }
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        dependencies: ["openai", "ws", "zod"]
+            .into_iter()
+            .map(|name| (name.to_string(), "1.0.0".to_string()))
+            .collect(),
+        ..Default::default()
+    };
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    write(out.path(), &graph, &manifest).unwrap();
+    let text = std::fs::read_to_string(out.path()).unwrap();
+    let openai_line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("\"openai\": [\"openai@"))
+        .expect("openai entry");
+    assert!(
+        openai_line.contains("\"peerDependencies\"")
+            && !openai_line.contains("\"dependencies\"")
+            && !openai_line.contains("\"optionalDependencies\""),
+        "a resolved peer belongs in the peer declaration alone: {openai_line}"
+    );
+}
+
+/// A genuine optional dependency that the package also declares as a peer
+/// must survive Bun -> nub.lock -> Bun. The pnpm format keeps no declared
+/// ranges, so the second write cannot tell it from a resolved optional
+/// peer and has to keep it optional.
+#[test]
+fn optional_dependency_that_is_also_a_peer_survives_a_pnpm_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let bun_in = dir.path().join("in.lock");
+    let content = r#"{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "dependencies": { "consumer": "1.0.0" }
+    }
+  },
+  "packages": {
+    "consumer": ["consumer@1.0.0", "", { "optionalDependencies": { "fsevents": "2.3.3" }, "peerDependencies": { "fsevents": "^2.0.0" }, "optionalPeers": ["fsevents"] }, "SRI_C"],
+    "fsevents": ["fsevents@2.3.3", "", { "os": "darwin" }, "SRI_F"]
+  }
+}"#
+    .replace("SRI_C", &fake_sri('c'))
+    .replace("SRI_F", &fake_sri('f'));
+    std::fs::write(&bun_in, content).unwrap();
+    let manifest = aube_manifest::PackageJson {
+        name: Some("root".to_string()),
+        dependencies: [("consumer".to_string(), "1.0.0".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+
+    let pnpm_path = dir.path().join("pnpm-lock.yaml");
+    crate::pnpm::write(&pnpm_path, &parse(&bun_in).unwrap(), &manifest).unwrap();
+    let bun_out = dir.path().join("out.lock");
+    write(
+        &bun_out,
+        &crate::pnpm::parse(&pnpm_path).unwrap(),
+        &manifest,
+    )
+    .unwrap();
+
+    let consumer = &parse(&bun_out).unwrap().packages["consumer@1.0.0"];
+    assert!(
+        consumer.optional_dependencies.contains_key("fsevents"),
+        "fsevents must stay an optional dependency of consumer: {:?}",
+        consumer.dependencies
+    );
+}
+
+/// bun writes no edge for a peer; the reader rebuilds a required one by
+/// the nesting walk node resolution would take from the package's
+/// position, so a provider nothing depends on survives pruning. Optional
+/// peers are left to peer resolution.
+#[test]
+fn parse_rebuilds_required_peer_edges_from_placement() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("bun.lock");
+    let content = r#"{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "dependencies": { "parent": "1.0.0" }
+    }
+  },
+  "packages": {
+    "maybe": ["maybe@1.0.0", "", {}, "SRI_M"],
+    "parent": ["parent@1.0.0", "", { "dependencies": { "consumer": "1.0.0" } }, "SRI_P"],
+    "provider": ["provider@1.0.0", "", {}, "SRI_A"],
+    "parent/consumer": ["consumer@1.0.0", "", { "peerDependencies": { "maybe": "^1.0.0", "provider": "^2.0.0" }, "optionalPeers": ["maybe"] }, "SRI_C"],
+    "parent/provider": ["provider@2.0.0", "", {}, "SRI_B"]
+  }
+}"#
+    .replace("SRI_M", &fake_sri('m'))
+    .replace("SRI_P", &fake_sri('p'))
+    .replace("SRI_A", &fake_sri('a'))
+    .replace("SRI_C", &fake_sri('c'))
+    .replace("SRI_B", &fake_sri('b'));
+    std::fs::write(&lock, content).unwrap();
+
+    let consumer = &parse(&lock).unwrap().packages["consumer@1.0.0"];
+    assert_eq!(
+        consumer.dependencies,
+        BTreeMap::from([("provider".to_string(), "2.0.0".to_string())]),
+        "a required peer binds to the nearest placed provider; an optional one is not rebuilt"
     );
 }

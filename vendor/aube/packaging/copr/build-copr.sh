@@ -3,7 +3,7 @@
 set -euo pipefail
 
 PACKAGE_NAME="${PACKAGE_NAME:-aube}"
-CHROOTS="${CHROOTS:-fedora-rawhide-aarch64 fedora-rawhide-x86_64 fedora-44-aarch64 fedora-44-x86_64 fedora-43-aarch64 fedora-43-x86_64 fedora-42-aarch64 fedora-42-x86_64 epel-10-aarch64 epel-10-x86_64}"
+CHROOTS="${CHROOTS:-}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
 MAINTAINER_NAME="${MAINTAINER_NAME:-aube Release Bot}"
 MAINTAINER_EMAIL="${MAINTAINER_EMAIL:-noreply@aube.jdx.dev}"
@@ -19,7 +19,7 @@ usage() {
 	echo "Options:"
 	echo "  -v, --version VERSION        Package version (required)"
 	echo "  -p, --profile PROFILE        Build profile (default: release)"
-	echo "  -c, --chroots CHROOTS        COPR chroots (default: fedora-rawhide-aarch64 fedora-rawhide-x86_64 fedora-44-aarch64 fedora-44-x86_64 fedora-43-aarch64 fedora-43-x86_64 fedora-42-aarch64 fedora-42-x86_64 epel-10-aarch64 epel-10-x86_64)"
+	echo "  -c, --chroots CHROOTS        COPR chroots (default: project defaults)"
 	echo "  -o, --owner OWNER            COPR owner (default: jdxcode)"
 	echo "  -j, --project PROJECT        COPR project (default: aube)"
 	echo "  -n, --name NAME              Package name (default: aube)"
@@ -107,7 +107,7 @@ echo "=== COPR Build Configuration ==="
 echo "Package Name: $PACKAGE_NAME"
 echo "Version: $VERSION (rpm: $RPM_VERSION)"
 echo "Build Profile: $BUILD_PROFILE"
-echo "Chroots: $CHROOTS"
+echo "Chroots: ${CHROOTS:-project defaults}"
 echo "COPR Owner: $COPR_OWNER"
 echo "COPR Project: $COPR_PROJECT"
 echo "Maintainer: $MAINTAINER_NAME <$MAINTAINER_EMAIL>"
@@ -193,8 +193,8 @@ Release:        1%{?dist}
 Summary:        A fast Node.js package manager
 
 License:        MIT
-URL:            https://aube.jdx.dev
-Source0:        https://github.com/jdx/aube/archive/v%{tarball_version}/%{name}-%{tarball_version}.tar.gz
+URL:            https://aube.sh
+Source0:        https://github.com/aubepkg/aube/archive/v%{tarball_version}/%{name}-%{tarball_version}.tar.gz
 Source1:        %{name}-vendor-%{tarball_version}.tar.gz
 
 BuildRequires:  rust >= 1.93
@@ -280,10 +280,12 @@ if [ "$DRY_RUN" != "true" ]; then
 	# paths that ever grow spaces or shell metacharacters don't get
 	# re-split by `eval`.
 	copr_cmd=(copr-cli build)
-	IFS=' ' read -ra chroot_array <<<"$CHROOTS"
-	for chroot in "${chroot_array[@]}"; do
-		copr_cmd+=(--chroot "$chroot")
-	done
+	if [ -n "$CHROOTS" ]; then
+		IFS=' ' read -ra chroot_array <<<"$CHROOTS"
+		for chroot in "${chroot_array[@]}"; do
+			copr_cmd+=(--chroot "$chroot")
+		done
+	fi
 	copr_cmd+=("$COPR_OWNER/$COPR_PROJECT" "$SRPM_FILE")
 
 	"${copr_cmd[@]}"

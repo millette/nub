@@ -1,4 +1,5 @@
 use crate::{DirectDep, Error, LocalSource, LockedPackage, LockfileGraph};
+use aube_util::path::normalize_lexical;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -86,7 +87,7 @@ pub fn write(
             all_roots.push(d.clone());
         }
     }
-    let tree = crate::npm::build_hoist_tree(&canonical, &all_roots);
+    let tree = crate::npm::build_hoist_tree(&canonical, &all_roots, None);
 
     // Non-root workspaces are read fresh from disk because the caller
     // doesn't thread them through — the root manifest is the only one
@@ -233,7 +234,7 @@ pub fn write(
         let mut opt_deps_obj = serde_json::Map::new();
         for (dep_name, dep_value) in &pkg.dependencies {
             let key = crate::npm::child_canonical_key(dep_name, dep_value);
-            if !canonical.contains_key(&key) {
+            if !canonical.contains_key(&key) || is_peer_only_edge(pkg, dep_name) {
                 continue;
             }
             let rendered = pkg
@@ -351,7 +352,7 @@ pub fn write(
             "libc",
         ];
         for (k, v) in &pkg.extra_meta {
-            if MODELED_META_KEYS.contains(&k.as_str()) {
+            if MODELED_META_KEYS.contains(&k.as_str()) || k == crate::EXTRA_PRESERVE_TARBALL_URL {
                 continue;
             }
             meta.insert(k.clone(), v.clone());
@@ -462,6 +463,22 @@ pub fn write(
                 elems.push(Value::String(integrity));
             }
             Value::Array(elems)
+        } else if let Some(local @ (LocalSource::Directory(_) | LocalSource::Tarball(_))) =
+            pkg.local_source.as_ref()
+        {
+            // bun's local tuple has no registry slot, and a registry-shaped
+            // entry sends bun to the registry for a package that is not there.
+            let tail = bun_local_ident_tail(pkg, local, manifest, &workspace_manifests);
+            let mut elems = vec![
+                Value::String(format!("{ident_name}@{tail}")),
+                Value::Object(meta),
+            ];
+            if matches!(local, LocalSource::Tarball(_))
+                && let Some(integrity) = pkg.integrity.clone().filter(|s| !s.is_empty())
+            {
+                elems.push(Value::String(integrity));
+            }
+            Value::Array(elems)
         } else {
             let ident = format!("{}@{}", ident_name, pkg.version);
             let integrity = pkg.integrity.clone().unwrap_or_default();
@@ -553,7 +570,8 @@ pub fn write(
                 .unwrap_or_else(|| {
                     crate::npm::dep_value_as_version(dep_name, dep_value).to_string()
                 });
-            if pkg.optional_dependencies.contains_key(dep_name) {
+            if pkg.optional_dependencies.contains_key(dep_name) && !is_peer_only_edge(pkg, dep_name)
+            {
                 opt_deps_obj.insert(dep_name.clone(), Value::String(rendered));
             } else {
                 deps_obj.insert(dep_name.clone(), Value::String(rendered));
@@ -876,4 +894,56 @@ fn inline_json(value: &serde_json::Value, _base_indent: usize) -> String {
             format!("{{ {} }}", parts.join(", "))
         }
     }
+}
+
+/// Whether a package's edge to `dep_name` exists only because it declares
+/// `dep_name` as a peer.
+///
+/// bun records such a peer in `peerDependencies` / `optionalPeers` and
+/// writes no edge for it, required or optional; an install from that
+/// lockfile (bun's or Nub's) links the peer from the declaration. Telling
+/// it apart from a dependency that is also a peer needs the package's
+/// declared ranges, which the pnpm and nub.lock readers never record, so
+/// without them the edge is kept and an optional one stays optional.
+/// The text after `name@` in a local package's ident. A bun-authored entry
+/// keeps it in `version`. A fresh resolve holds the real version there and a
+/// project-relative path in the source: bun writes a directory from the
+/// workspace root and a tarball as its declaring manifest spells it.
+fn bun_local_ident_tail(
+    pkg: &LockedPackage,
+    local: &LocalSource,
+    manifest: &aube_manifest::PackageJson,
+    workspace_manifests: &BTreeMap<String, aube_manifest::PackageJson>,
+) -> String {
+    if pkg.version.starts_with("file:")
+        || LocalSource::path_looks_like_tarball(Path::new(&pkg.version))
+    {
+        return pkg.version.clone();
+    }
+    if matches!(local, LocalSource::Directory(_)) {
+        return format!("file:{}", local.pnpm_path());
+    }
+    let target = local.path().map(normalize_lexical);
+    std::iter::once((".", manifest))
+        .chain(workspace_manifests.iter().map(|(p, m)| (p.as_str(), m)))
+        .find_map(|(importer, m)| {
+            let spec = [
+                &m.dependencies,
+                &m.dev_dependencies,
+                &m.optional_dependencies,
+                &m.peer_dependencies,
+            ]
+            .iter()
+            .find_map(|deps| deps.get(&pkg.name))?;
+            let rest = spec.strip_prefix("file:")?;
+            (Some(normalize_lexical(&Path::new(importer).join(rest))) == target)
+                .then(|| rest.to_string())
+        })
+        .unwrap_or_else(|| local.pnpm_path())
+}
+
+fn is_peer_only_edge(pkg: &LockedPackage, dep_name: &str) -> bool {
+    pkg.declared_dependencies_known
+        && pkg.peer_dependencies.contains_key(dep_name)
+        && !pkg.declared_dependencies.contains_key(dep_name)
 }

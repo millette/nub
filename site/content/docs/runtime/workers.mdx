@@ -1,84 +1,176 @@
 ---
 title: Web Workers
-description: A browser-style worker API on stock Node — the full constructor, messaging, and event surface, on every supported version.
+description: A browser-style Worker global on stock Node, covering its constructor, messaging, transferables, and events.
 ---
 
 <TypesSetup>
-The browser-shape `Worker` global is typed by Nub's own types package — `@types/node` declares only `node:worker_threads`.
+The browser-shape `Worker` global is typed by Nub's own types package — `@types/node` declares only `node:worker_threads`. Install `@nubjs/types` as a devDependency alongside `@types/node` 26.
 </TypesSetup>
 
-Browsers expose a `Worker` global; Node ships only `node:worker_threads.Worker`, a different class with a different API, and never a browser-shape global. Nub closes that gap with a polyfill preloaded on every supported Node (18.19+), so the browser constructor and messaging shape work unchanged.
+Nub adds a browser-style `Worker` global when one is missing. Node 26.9+ also offers an [experimental native Web Worker](https://nodejs.org/docs/latest-v26.x/api/globals.html#class-worker), enabled with `--experimental-web-worker`. With that flag, Nub preserves the native constructor, worker scope, and Blob URL handling instead of installing its fallback. The flag stays opt-in.
+
+The examples and options below describe Nub's fallback. Native workers follow Node's documented behavior, including its supported URL schemes and worker options. Node also reads a native worker's entry file itself, so Nub does not transpile that file. A `.ts` entry relies on Node's type stripping, which needs a module worker and a recent Node, and syntax such as `enum` fails. Modules the entry imports still go through Nub.
 
 ```ts
-const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
+const url = import.meta.resolve("./worker.ts");
+const worker = new Worker(url, { type: "module" });
 
+worker.onmessage = (ev) => {
+  console.log(ev.data); // → 42
+  worker.terminate();
+};
 worker.postMessage({ n: 41 });
-worker.onmessage = (ev) => console.log(ev.data); // → 42
-worker.onerror = (ev) => console.error(ev.message);
 ```
 
-```ts
-// worker.ts
+```ts title="worker.ts"
 self.onmessage = (ev) => {
   self.postMessage(ev.data.n + 1);
 };
 ```
 
-The worker entry is TypeScript here for free — Nub transpiles it like any other entry. The constructor takes a string or `URL`; pass `new URL("./worker.ts", import.meta.url)` for a path resolved relative to the current module, exactly as in the browser.
+The worker entry can be TypeScript. A listening worker keeps the process alive, so call `worker.terminate()` once you have the reply, or `self.close()` from inside the worker.
 
-## Mechanism
+<Callout>
+Read the [full docs](https://developer.mozilla.org/en-US/docs/Web/API/Worker) for `Worker` on developer.mozilla.org.
+</Callout>
 
-The polyfill is a preload (`runtime/worker-polyfill.mjs`), not a flag injection — Node has no flag that exposes a browser `Worker`. It defines `globalThis.Worker` (feature-detected with `typeof`, so it installs only when no native global is already present) as an `EventTarget` subclass wrapping a `node:worker_threads.Worker`.
+## Creating a worker
 
-Inside the worker, Nub installs the dedicated-worker scope on top of `node:worker_threads.parentPort`:
-
-```text
-self
-name
-postMessage
-close
-addEventListener, removeEventListener
-onmessage, onmessageerror
-importScripts (classic workers)
-```
-
-Node's worker global is not an `EventTarget` and exposes none of these, so the polyfill provides the whole surface.
-
-## API surface
-
-The main-thread `Worker` carries the browser subset:
-
-- **`new Worker(scriptURL, options?)`** — `scriptURL` is a string, a `URL`, a `data:` URL, or a `blob:` URL (from `URL.createObjectURL`); `options` accepts `type` (`"module"` | `"classic"`), `name`, and `credentials`.
-- **`worker.name`** — the name passed as `options.name`.
-- **`postMessage(message, transfer?)`** — `transfer` is a list of `ArrayBuffer` / `MessagePort` to transfer; transferred objects are detached on the sending side.
-- **`terminate()`** — stops the worker; returns `undefined`.
-- **`onmessage` / `onmessageerror` / `onerror`** — event-handler properties, plus the inherited `addEventListener` / `removeEventListener` / `dispatchEvent`.
-
-Inbound `"message"` events arrive as real `MessageEvent`s (`ev.data`). A failed deserialization fires `"messageerror"` as a `MessageEvent` with `data` of `null`. A thrown error in the worker surfaces on the main thread as an `ErrorEvent` carrying `message`, `error`, and the source location (`filename`, `lineno`, `colno`).
-
-## Inline workers
-
-A worker source can be inlined with a `data:` or `blob:` URL — the same mechanisms the browser uses, neither of which `node:worker_threads` exposes through a browser-shape constructor:
+The constructor takes a file path or `URL` (including `file://`), a `data:` URL, or a `blob:` URL. For a file, use `import.meta.resolve`, which resolves against the current module:
 
 ```ts
-const url = URL.createObjectURL(
-  new Blob(["self.onmessage = (e) => self.postMessage(e.data * 2);"], {
-    type: "text/javascript",
-  }),
-);
-const worker = new Worker(url);
-worker.postMessage(21);
-worker.onmessage = (e) => console.log(e.data); // → 42
+new Worker(import.meta.resolve("./worker.ts"));
 ```
 
-## Module and classic workers
+When a bundler is in the pipeline, use the `new URL(...)` form instead. Vite, webpack, and esbuild trace it into its own chunk; they do not trace `import.meta.resolve`.
 
-`type: "module"` (the default) runs the worker as an ES module — `import` and `import.meta.url` work, and `importScripts` throws. `type: "classic"` runs it as a classic worker, where `importScripts(...urls)` synchronously loads and evaluates scripts in the worker's global scope. Node still decides the entry's module-vs-CommonJS parsing by file extension and the nearest `package.json` `"type"`.
+```ts
+new Worker(new URL("./worker.ts", import.meta.url));
+```
 
-## Divergences
+A bare relative string resolves against `process.cwd()`, not the calling module, as with `node:worker_threads`. It breaks when the file runs from another directory.
 
-A worker that listens for messages keeps itself alive; one that never listens exits naturally, matching `node:worker_threads` and the browser. Events other than `message` / `messageerror` dispatched inside the worker land on a private `EventTarget`, so `event.target` is that target rather than the global scope — a minor divergence from the browser, where the global scope is itself the dispatch target.
+```ts
+new Worker("./worker.ts"); // cwd-relative
+```
+
+A `data:` URL runs directly, and a `blob:` URL from `URL.createObjectURL` works too, up to 4 MB.
+
+```ts
+const src = "self.postMessage('ready')";
+new Worker("data:text/javascript," + encodeURIComponent(src));
+const blob = new Blob([src], { type: "text/javascript" });
+new Worker(URL.createObjectURL(blob));
+```
+
+The second argument is a `WorkerOptions` object:
+
+| Option | Values | Effect |
+| --- | --- | --- |
+| `type` | `"module"` (default), `"classic"` | Which `importScripts` form the worker scope exposes: classic gets the synchronous loader, module the throwing form |
+| `name` | string | Readable as `self.name` inside the worker |
+| `eval` | `true` | Runs the first argument as source code instead of resolving it as a URL (see [Node compatibility](#node-worker_threads-compatibility)) |
+| `execArgv` | string array | Node flags for the worker, merged onto the flags carrying Nub's preload |
+| `env` | object | Environment for the worker thread |
+
+## Messaging
+
+The two threads exchange messages with `postMessage` and `onmessage`, or `addEventListener("message")`. Messages arrive as `MessageEvent`s, with the payload on `ev.data`.
+
+```ts
+worker.postMessage({ n: 41 });
+worker.onmessage = (ev) => console.log(ev.data);
+worker.addEventListener("message", (ev) => console.log(ev.data));
+```
+
+An error thrown in the worker reaches the main thread as an `ErrorEvent` with `message`, `error`, and the source location.
+
+```ts
+worker.onerror = (ev) => console.error(ev.message, ev.filename, ev.lineno);
+```
+
+Payloads are cloned with Node's structured serializer. Pass a transfer list as the second argument to move an `ArrayBuffer` or `MessagePort` instead of copying it; the sending side's copy is detached.
+
+```ts
+const buf = new ArrayBuffer(8);
+worker.postMessage(buf, [buf]); // buf.byteLength is now 0 on this side
+```
+
+| Category | Members |
+| --- | --- |
+| Cloned | plain objects and arrays, `Map` / `Set` / `Date`, typed arrays |
+| Transferred | `ArrayBuffer`, `MessagePort`, `FileHandle` — Node's transferable set |
+| Shared | `SharedArrayBuffer` (shared by reference, not copied) |
+| Unavailable | `ImageBitmap`, `OffscreenCanvas`, stream transfer — no DOM substrate on Node |
+
+## Inside the worker
+
+The worker's global `self` (the same object as `globalThis`) carries the WHATWG dedicated-worker scope. The messaging types `MessageEvent`, `MessageChannel`, and `MessagePort` are Node's own globals.
+
+```ts title="worker.ts"
+self.name; // the { name } constructor option
+self.onmessage = (ev) => self.postMessage(ev.data);
+self.addEventListener("message", (ev) => {});
+self.close(); // stop this worker from the inside
+```
+
+A module worker is the default, and uses `import`. A classic worker (`{ type: "classic" }`) gets the synchronous `importScripts()` loader, which runs local files and `data:` URLs in order; remote URLs are not supported.
+
+```ts title="worker.cjs"
+importScripts("./setup.cjs"); // runs synchronously, in order
+self.onmessage = (ev) => self.postMessage(ev.data);
+```
+
+The `type` option only chooses the loader. Node still decides whether the entry is ESM or CommonJS from its extension and the nearest `package.json` `"type"`.
+
+## Node `worker_threads` compatibility
+
+The same handle also mirrors `node:worker_threads.Worker` for Node-style code: its `EventEmitter` methods, the `online` and `exit` events, a `Promise`-returning `terminate()`, and `{ eval: true }` for an inline source string.
+
+```ts
+const worker = new Worker(
+  `const { parentPort } = require("node:worker_threads");
+   parentPort.on("message", (n) => parentPort.postMessage(n * 2));`,
+  { eval: true },
+);
+
+worker.on("online", () => console.log("started"));
+worker.on("error", (err) => console.error(err.stack)); // a bare Error
+worker.on("exit", (code) => console.log("exited", code));
+
+worker.on("message", async (value) => {
+  console.log(value); // 42 — the raw value, not a MessageEvent
+  const code = await worker.terminate(); // Promise<number>
+});
+
+worker.postMessage(21);
+```
+
+Listeners registered with `on` get Node's shapes: the raw posted value and a bare `Error`. Listeners set through `onmessage`, `onerror`, or `addEventListener` get `MessageEvent` and `ErrorEvent` on the same handle.
+
+<Callout>
+Read the [full docs](https://nodejs.org/api/worker_threads.html#class-worker) for `worker_threads` on nodejs.org.
+</Callout>
 
 ## TypeScript
 
-The `Worker` global, `WorkerOptions`, and the worker-side handlers are typed by `@nubjs/types` (a types-only devDependency). The declaration steps aside when `lib: ["dom"]` is in your `tsconfig.json` — the DOM's own `Worker` type wins there — so the two never collide.
+The main-thread `Worker` global and `WorkerOptions` are typed by `@nubjs/types`. With `lib: ["dom"]` in your `tsconfig.json`, the DOM's own `Worker` type is used instead.
+
+A worker file's global scope is the worker scope, which neither `@types/node` nor `@nubjs/types` declares. Set `lib: ["webworker"]` for the full types, or add a one-line declaration for the common handlers:
+
+```ts title="worker.ts"
+declare var self: Worker;
+
+self.onmessage = (ev: MessageEvent) => {
+  self.postMessage(ev.data + 1);
+};
+```
+
+## Limitations
+
+- **No `SharedWorker`.** It needs a browser document and origin model. Use a single worker with message passing.
+- **Workers are real threads.** Each is an OS thread with its own V8 isolate and module graph, heavier than a browser worker. Pool them for hot paths instead of spawning one per task.
+
+## How it works
+
+The `Worker` global is a preload, since Node has no flag that exposes one. It wraps a `node:worker_threads.Worker` in an `EventTarget` subclass, installs only when no native `Worker` global exists, and loads on the first `new Worker(...)`. A vendored slice of the [web-platform-tests](https://github.com/web-platform-tests/wpt) runs against it on both tiers. Messaging and structured clone pass, apart from browser DOM types such as `ImageBitmap` and `OffscreenCanvas`.

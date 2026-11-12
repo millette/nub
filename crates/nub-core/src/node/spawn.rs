@@ -3,17 +3,175 @@
 //! all of Nub's runtime augmentation into a single child-process spawn.
 
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs as unix_fs;
+use std::os::unix::fs::{
+    self as unix_fs, DirBuilderExt, MetadataExt as UnixMetadataExt, PermissionsExt,
+};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt as WindowsMetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
+#[cfg(unix)]
+use same_file::Handle as FileHandle;
 
 use super::discovery::ResolvedNode;
 use super::flags;
+use super::version::NodeVersion;
+
+/// Whether this process is attached to a console.
+///
+/// Only a compiled artifact built with `--hide-console` asks. Such a launcher
+/// carries the GUI subsystem, so Windows allocates it no console of its own — but
+/// a GUI process started FROM a console inherits that one, which is the difference
+/// between double-clicking the binary and running it from `cmd.exe`, and the
+/// difference decides whether suppressing the child's console loses the user's
+/// output or saves them a flashing window.
+///
+/// `GetConsoleWindow` is the question asked directly. Testing the standard handles
+/// instead answers a narrower one — `app.exe > out.txt` redirects stdout to a file
+/// while stderr stays on the console — and would suppress a console that is
+/// genuinely there.
+#[cfg(windows)]
+pub fn process_has_console() -> bool {
+    // SAFETY: no arguments, no out-params; returns the console's window handle or
+    // null, and is safe to call at any time from any thread.
+    !unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null()
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct FileHandle {
+    file: fs::File,
+    identity: WindowsFileIdentity,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Eq, PartialEq)]
+struct WindowsFileIdentity {
+    volume_serial: u64,
+    file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+fn windows_file_identity(
+    volume_serial: u64,
+    file_id: [u8; 16],
+) -> std::io::Result<WindowsFileIdentity> {
+    if file_id == [0; 16] || file_id == [u8::MAX; 16] {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "filesystem did not provide a stable 128-bit file identity",
+        ));
+    }
+    Ok(WindowsFileIdentity {
+        volume_serial,
+        file_id,
+    })
+}
+
+#[cfg(windows)]
+impl FileHandle {
+    fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let mut info = FILE_ID_INFO::default();
+        // SAFETY: `file` owns a valid handle; `info` is writable for exactly the
+        // size reported, and both remain live for the call and returned record.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                std::ptr::addr_of_mut!(info).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            file,
+            identity: windows_file_identity(info.VolumeSerialNumber, info.FileId.Identifier)?,
+        })
+    }
+
+    fn as_file(&self) -> &fs::File {
+        &self.file
+    }
+}
+
+#[cfg(windows)]
+impl PartialEq for FileHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+#[cfg(windows)]
+impl Eq for FileHandle {}
+
+/// Spawn a child, retrying briefly on a TRANSIENT `EAGAIN`/`ENOMEM` from the
+/// kernel's `fork`/`clone` under peak thread/PID pressure. On a resource-
+/// constrained box (the `nub ci` exit-101 family) the OS can momentarily refuse
+/// a `fork` while siblings are mid-spawn; a short bounded backoff lets the
+/// transient spike pass instead of surfacing a spurious spawn failure. Non-
+/// transient errors (ENOENT, EACCES, …) propagate immediately — we never mask a
+/// real failure, and the retry count is small so a persistent shortage still
+/// fails fast rather than hanging.
+pub fn spawn_with_eagain_retry(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    use std::io::ErrorKind;
+    const MAX_RETRIES: u32 = 5;
+    let mut attempt = 0u32;
+    loop {
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) => {
+                let transient = matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::OutOfMemory)
+                    || e.raw_os_error() == Some(libc_eagain())
+                    || e.raw_os_error() == Some(libc_enomem());
+                if !transient || attempt >= MAX_RETRIES {
+                    return Err(e);
+                }
+                // Exponential-ish backoff: 5ms, 10ms, 20ms, 40ms, 80ms — total
+                // ~155ms worst case, long enough for a spawn spike to drain,
+                // short enough to fail fast on a real shortage.
+                let backoff_ms = 5u64 << attempt;
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                attempt += 1;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn libc_eagain() -> i32 {
+    libc::EAGAIN
+}
+#[cfg(unix)]
+fn libc_enomem() -> i32 {
+    libc::ENOMEM
+}
+#[cfg(not(unix))]
+fn libc_eagain() -> i32 {
+    -1
+}
+#[cfg(not(unix))]
+fn libc_enomem() -> i32 {
+    -1
+}
 
 /// Terminating-signal forwarding to the current child, registered once per
 /// process. Nub catches SIGINT (Ctrl-C), SIGTERM (docker stop / systemd / CI
@@ -40,18 +198,32 @@ use super::flags;
 /// processes stay alive — exactly as if `node` had received the signal directly.
 #[cfg(unix)]
 mod ctrl_c {
-    use std::sync::Once;
-    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, MutexGuard, Once};
 
-    // The forward TARGET, as the argument to `kill(2)`: a POSITIVE pid signals one
-    // process (the file-run path's `node`, which IS the leaf); a NEGATIVE value
-    // signals the whole PROCESS GROUP `-value` (the script path's `sh -c` child,
-    // made a group leader via `setpgid`, so the signal reaches `sh` AND the `node`
-    // it forks — a non-interactive `sh -c` does NOT relay signals to a forked
-    // child, so single-pid delivery left the workload orphaned under dash). 0 = no
-    // child tracked.
-    static CURRENT_TARGET: AtomicI32 = AtomicI32::new(0);
+    // The forward TARGETS, each an argument to `kill(2)`: a POSITIVE pid signals one
+    // process (a bare leaf); a NEGATIVE value signals the whole PROCESS GROUP
+    // `-value` (the script path's `sh -c` child, made a group leader via `setpgid`,
+    // so the signal reaches `sh` AND the `node` it forks — a non-interactive `sh -c`
+    // does NOT relay signals to a forked child, so single-pid delivery left the
+    // workload orphaned under dash). Empty = no child tracked.
+    //
+    // A SET, not one slot: a workspace run executes N members CONCURRENTLY on worker
+    // threads, and its concurrency defaults to `min(4, cpus)` — so several children
+    // are live at once even without `--parallel`. With a single slot each spawn
+    // overwrote the last, so one Ctrl-C reached exactly one child (which one was a
+    // race), every sibling was orphaned, and nub then blocked forever waiting on
+    // them (#685).
+    static TARGETS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
     static REGISTERED: Once = Once::new();
+
+    /// Lock [`TARGETS`], recovering from poisoning. A poisoned lock only means some
+    /// thread panicked while holding it; the payload is a plain `Vec<i32>` with no
+    /// invariant a panic can break, and bailing out here would leave a live child
+    /// unsignalled — the exact failure this module exists to prevent.
+    fn targets() -> MutexGuard<'static, Vec<i32>> {
+        TARGETS.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     // When the controlling terminal's FOREGROUND process group has been handed to
     // the child (the interactive TTY path — see `foreground_child` in spawn.rs),
@@ -80,10 +252,11 @@ mod ctrl_c {
         SUPPRESS_SIGINT_FORWARD.load(Ordering::SeqCst)
     }
 
-    /// Record the `kill(2)` target (see [`CURRENT_TARGET`]), registering the signal
-    /// handler on the first call. Later calls just update the target.
+    /// Add a `kill(2)` target (see [`TARGETS`]), registering the signal handler on
+    /// the first call. Every live target is signalled, so concurrent children each
+    /// add their own on spawn and remove it again on exit.
     pub(super) fn track(target: i32) {
-        CURRENT_TARGET.store(target, Ordering::SeqCst);
+        targets().push(target);
         REGISTERED.call_once(|| {
             use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
             use signal_hook::iterator::Signals;
@@ -101,39 +274,61 @@ mod ctrl_c {
             if let Ok(mut signals) =
                 Signals::new([SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGQUIT])
             {
-                std::thread::spawn(move || {
-                    for signo in signals.forever() {
-                        // While the child owns the terminal foreground, the kernel
-                        // already delivered a TTY Ctrl-C to it directly — so a
-                        // SIGINT forward here would double it (issue #26). Suppress
-                        // SIGINT only; every other signal still forwards.
-                        if signo == SIGINT && SUPPRESS_SIGINT_FORWARD.load(Ordering::SeqCst) {
-                            continue;
-                        }
-                        let target = CURRENT_TARGET.load(Ordering::SeqCst);
-                        if target != 0 {
-                            // SAFETY: kill(2) with a stored-live target + the received
-                            // signal. A positive target signals one process; a negative
-                            // one signals process group `-target`. Benign if the
-                            // child/group already exited (ESRCH); cleared to 0 on exit.
-                            unsafe {
-                                libc::kill(target, signo);
+                // `Builder::spawn` (returns `io::Result`) over `thread::spawn`
+                // (which PANICS on OS thread-create failure): under thread/PID
+                // exhaustion an EAGAIN here would otherwise crash the parent — and
+                // under `panic = "abort"` abort it. On failure we simply don't
+                // install the forwarder, identical to the `Signals::new` error path
+                // (the pre-existing no-handler behavior), never crash.
+                let _ = std::thread::Builder::new()
+                    .name("nub-signal-forward".into())
+                    .spawn(move || {
+                        for signo in signals.forever() {
+                            // While the child owns the terminal foreground, the kernel
+                            // already delivered a TTY Ctrl-C to it directly — so a
+                            // SIGINT forward here would double it (issue #26). Suppress
+                            // SIGINT only; every other signal still forwards.
+                            if signo == SIGINT && SUPPRESS_SIGINT_FORWARD.load(Ordering::SeqCst) {
+                                continue;
+                            }
+                            // Snapshot, then signal outside the lock: a worker thread
+                            // may be adding or removing a target concurrently, and
+                            // nothing here needs the whole fan-out to be atomic.
+                            let live: Vec<i32> = targets().clone();
+                            for target in live {
+                                // SAFETY: kill(2) with a stored-live target + the received
+                                // signal. A positive target signals one process; a negative
+                                // one signals process group `-target`. Benign if the
+                                // child/group already exited (ESRCH); removed on exit.
+                                unsafe {
+                                    libc::kill(target, signo);
+                                }
                             }
                         }
-                    }
-                });
+                    });
             }
         });
     }
 
-    /// Clear the current target after the child exits.
-    pub(super) fn untrack() {
-        CURRENT_TARGET.store(0, Ordering::SeqCst);
+    /// Drop ONE target once its child exits, leaving every sibling still tracked.
+    /// Removes a single occurrence, so two entries that happen to share a value
+    /// (a recycled pid) can't disarm each other early.
+    pub(super) fn untrack(target: i32) {
+        let mut live = targets();
+        if let Some(pos) = live.iter().rposition(|&t| t == target) {
+            live.remove(pos);
+        }
+    }
+
+    /// Drop every target. Test-only — each production path removes its own.
+    #[cfg(test)]
+    pub(super) fn reset() {
+        targets().clear();
     }
 
     #[cfg(test)]
-    pub(super) fn current() -> i32 {
-        CURRENT_TARGET.load(Ordering::SeqCst)
+    pub(super) fn tracked() -> Vec<i32> {
+        targets().clone()
     }
 }
 
@@ -151,10 +346,19 @@ pub fn track_child_group(pid: u32) {
     let _ = pid;
 }
 
-/// Clear the tracked child/group after it exits — pair with [`track_child_group`].
-pub fn untrack_child() {
+/// Stop forwarding to ONE child's group after it exits — pair with
+/// [`track_child_group`], passing the same pid.
+///
+/// Takes the pid rather than clearing a single global slot because a workspace run
+/// holds several children tracked at once: zeroing the slot when the FIRST one
+/// finished disarmed the forward for every still-running sibling, so a later Ctrl-C
+/// reached nothing and nub hung waiting on children it could no longer signal
+/// (#685).
+pub fn untrack_child(pid: u32) {
     #[cfg(unix)]
-    ctrl_c::untrack();
+    ctrl_c::untrack(-(pid as i32));
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// Hand the controlling terminal's FOREGROUND process group to a just-spawned
@@ -178,7 +382,7 @@ pub fn untrack_child() {
 /// own-group-without-tcsetpgrp path (correct for non-interactive children).
 #[cfg(unix)]
 #[must_use]
-pub fn foreground_child(child_pid: u32) -> Option<ForegroundGuard> {
+fn foreground_child(child_pid: u32) -> Option<ForegroundGuard> {
     // SAFETY: pure FFI reads; STDIN_FILENO is always valid in this process.
     let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     if !stdin_is_tty {
@@ -213,6 +417,14 @@ pub fn foreground_child(child_pid: u32) -> Option<ForegroundGuard> {
     // directly, so suppress nub's redundant SIGINT forward (#26 exactly-once).
     ctrl_c::set_suppress_sigint_forward(true);
 
+    // A fast child can already be SIGTTIN-stopped before tcsetpgrp runs.
+    // Foreground ownership does not resume it; continue the whole job after
+    // the handoff so shell descendants can read the terminal too.
+    // SAFETY: child_pid identifies the child's own process group.
+    unsafe {
+        libc::kill(-(child_pid as libc::pid_t), libc::SIGCONT);
+    }
+
     Some(ForegroundGuard { nub_pgrp })
 }
 
@@ -240,22 +452,276 @@ impl Drop for ForegroundGuard {
 }
 
 /// Put the spawned child in its own process group (`setpgid(0, 0)` at exec) so
-/// [`track_child_group`] can signal the whole subtree. No-op off Unix.
+/// [`track_child_group`] can signal the whole subtree. On Linux, additionally
+/// arm `PR_SET_PDEATHSIG(SIGTERM)` as the kernel-side backstop for signals the
+/// forwarder structurally cannot relay: SIGKILL on the Nub leader (Playwright's
+/// default `webServer` teardown, `docker kill`, CI cancellation, the OOM killer)
+/// is never delivered to userspace, so the forward thread never runs and the
+/// child subtree would run on orphaned (#463). This guards BOTH callers: the
+/// `nub run` script child (`sh -c` subtree) and the `nub <file>` file-run
+/// `node` leaf — the orphan exposure is identical. With the pdeathsig armed
+/// the kernel itself TERMs the child when Nub's spawning thread dies, no
+/// matter how.
+/// No-op off Unix; macOS has no pdeathsig equivalent, so it keeps the
+/// forwarding-only behavior (the group forward covers every catchable signal).
 pub fn group_on_spawn(cmd: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // SAFETY: setpgid(0, 0) only repoints the child's own process-group id
-        // between fork and exec — async-signal-safe, touches no parent state.
+        // Captured BEFORE fork: the child's TOCTOU re-check below must compare
+        // getppid() against the REAL parent, not a post-fork read that would
+        // already name the reaper if the parent died between fork and prctl.
+        #[cfg(target_os = "linux")]
+        let parent = unsafe { libc::getpid() };
+        // SAFETY: setpgid(0, 0) / prctl / getppid / raise between fork and exec
+        // are all async-signal-safe and touch no parent state.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 libc::setpgid(0, 0);
+                #[cfg(target_os = "linux")]
+                {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    // The pdeathsig only fires for deaths AFTER registration; if
+                    // the parent died in the fork→prctl window, deliver the same
+                    // signal ourselves instead of running on orphaned.
+                    if libc::getppid() != parent {
+                        libc::raise(libc::SIGTERM);
+                    }
+                }
                 Ok(())
             });
         }
     }
     #[cfg(not(unix))]
     let _ = cmd;
+}
+
+/// The disarm byte [`GroupReaper::drop`] writes on the NORMAL teardown path, so
+/// the watcher can tell "Nub reaped the workload and is shutting down cleanly"
+/// (leave any deliberate background survivors alone, matching what plain
+/// node/sh leave behind) from "Nub died" (bare EOF — tear the group down).
+#[cfg(unix)]
+const PDEATH_DISARM: u8 = b'D';
+
+/// macOS backstop for the one signal the forwarder structurally cannot relay
+/// and that Linux's pdeathsig (see [`group_on_spawn`]) covers kernel-side:
+/// SIGKILL of the Nub leader — or of Nub's whole process group — must not
+/// orphan the workload (#480). macOS has no `PR_SET_PDEATHSIG`, so Nub instead
+/// plants a tiny WATCHER process inside the CHILD's process group:
+///
+/// - The watcher holds the read end of a pipe whose only write end lives in
+///   Nub (both ends CLOEXEC; the read end is re-armed by `dup2` for the
+///   watcher alone, so the workload never sees either fd). It blocks in
+///   `read(2)`.
+/// - Nub dying by ANY means — including SIGKILL, where the kernel closes its
+///   fds — delivers EOF, and the watcher SIGTERMs the child's group (the same
+///   signal pdeathsig delivers on Linux) and exits. EOF is level-triggered, so
+///   unlike pdeathsig there is no died-before-registration TOCTOU window to
+///   re-check.
+/// - Living in the CHILD's group is what makes it SIGKILL-proof: a supervisor's
+///   group-kill aimed at Nub's group cannot touch it. Membership also PINS the
+///   pgid — a process group cannot be recycled while a member lives — so the
+///   group kill can never land on a reused pgid.
+///
+/// On the normal path the guard writes [`PDEATH_DISARM`] before closing, and
+/// the watcher exits without signaling anyone. The guard then reaps the
+/// watcher, so nub processes that spawn many sequential children (workspace
+/// `-r` runs) don't accumulate zombies. (`nub watch` is NOT covered: its
+/// spawn path predates `group_on_spawn` entirely, so it has neither pdeathsig
+/// nor this reaper — a pre-existing gap on both platforms.)
+///
+/// Returns `None` off macOS (Linux is already covered kernel-side; a second
+/// mechanism would be redundant) and on any setup failure — the backstop
+/// degrades to the status quo rather than failing the run. Known residual
+/// windows, both milliseconds wide and of the same class as pdeathsig's
+/// fork→prctl gap:
+/// - a group-kill landing between the workload spawn and the watcher's own
+///   `setpgid` still orphans (the watcher dies in Nub's group);
+/// - macOS has no `pipe2(O_CLOEXEC)`, so a CONCURRENT `Command::spawn` on
+///   another thread (workspace `--parallel`) forking between `pipe()` and the
+///   `fcntl` below can duplicate the write end into an unrelated workload,
+///   deferring the watcher's EOF until that workload also dies. The disarm
+///   path is unaffected (the byte travels regardless of extra writers).
+///
+/// Divergence note: on Nub death this TERMs the whole GROUP (matching what
+/// the forwarder does for catchable signals), while Linux's pdeathsig TERMs
+/// only the direct child — a deliberate background survivor outlives a
+/// force-killed nub on Linux but not on macOS. Group scope is what #480 asks
+/// for; the asymmetry is accepted.
+#[cfg(unix)]
+pub fn spawn_group_reaper(child_pid: u32) -> Option<GroupReaper> {
+    use std::os::unix::process::CommandExt;
+    // cfg!(test) guard: nub-core's own in-process unit tests call the spawn
+    // paths directly, where current_exe() is the libtest harness — re-invoking
+    // THAT with watcher argv would re-run any test whose name substring-matches
+    // the argv. The integration suite (pdeath_watch.rs) spawns the real `nub`
+    // binary and exercises the watcher fully.
+    if !cfg!(target_os = "macos") || cfg!(test) {
+        return None;
+    }
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe(2) into a local array; F_SETFD on the two fresh fds.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return None;
+        }
+        for fd in fds {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    let close_both = || {
+        // SAFETY: closing the two fds this function just opened.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+    };
+    // `current_exe()` is whatever NAME nub is running under — for any workload
+    // spawned through nub's own PATH shim that is `node`, not `nub`. Select the
+    // watcher with the launcher's private mode env instead of a reserved argv
+    // token, so its PID/read-fd payload stays ordinary process arguments.
+    let Ok(exe) = std::env::current_exe() else {
+        close_both();
+        return None;
+    };
+    let mut cmd = Command::new(exe);
+    cmd.env("__NUB_COMPILED_LAUNCHER_MODE", "pdeath-watch")
+        .arg(child_pid.to_string())
+        .arg("3")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let pgid = child_pid as libc::pid_t;
+    // SAFETY: setpgid / signal / dup2 / fcntl between fork and exec are
+    // async-signal-safe and touch no parent state.
+    unsafe {
+        cmd.pre_exec(move || {
+            // Join the WORKLOAD's group. It exists while its leader lives; if
+            // the workload already exited there is nothing left to protect and
+            // the watcher's membership self-check exits it immediately.
+            libc::setpgid(0, pgid);
+            // Ignore, HERE rather than after exec, everything the watcher can
+            // be hit with as a group member: the forwarder's terminating set
+            // (a docker-stop relay landing before the watcher's main ran would
+            // otherwise kill it and silently drop the backstop — SIG_IGN
+            // dispositions survive execve, unlike handlers) and the job-control
+            // stops (a TTY Ctrl-Z would otherwise STOP it, and the guard's
+            // reaping wait() would then hang on a stopped, never-dead child).
+            for sig in [
+                libc::SIGINT,
+                libc::SIGTERM,
+                libc::SIGHUP,
+                libc::SIGUSR1,
+                libc::SIGUSR2,
+                libc::SIGQUIT,
+                libc::SIGTSTP,
+                libc::SIGTTIN,
+                libc::SIGTTOU,
+            ] {
+                libc::signal(sig, libc::SIG_IGN);
+            }
+            // Re-arm ONLY the read end across the exec, at a fixed fd. dup2
+            // clears CLOEXEC on the destination — except when src == dst, where
+            // it is a no-op and the flag must be cleared explicitly.
+            if read_fd == 3 {
+                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(read_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    match spawn_with_eagain_retry(&mut cmd) {
+        Ok(watcher) => {
+            // SAFETY: Nub's copy of the read end; the watcher holds its own.
+            unsafe { libc::close(read_fd) };
+            Some(GroupReaper { write_fd, watcher })
+        }
+        Err(_) => {
+            close_both();
+            None
+        }
+    }
+}
+
+/// Keeps the parent-death watcher's pipe write end open for the workload's
+/// lifetime — hold it across `wait()`, drop it after. See [`spawn_group_reaper`].
+#[cfg(unix)]
+pub struct GroupReaper {
+    write_fd: libc::c_int,
+    watcher: std::process::Child,
+}
+
+#[cfg(unix)]
+impl Drop for GroupReaper {
+    fn drop(&mut self) {
+        // Normal teardown: disarm (so deliberate background survivors in the
+        // workload's group are left running, exactly as plain node/sh leave
+        // them), close Nub's sole write end, and reap the watcher — it exits
+        // within microseconds of the EOF, and reaping here keeps a long-lived
+        // `nub watch` loop from accumulating zombies.
+        // SAFETY: write/close on the fd this guard owns.
+        unsafe {
+            let byte = [PDEATH_DISARM];
+            // EINTR-retry: a lost disarm byte would read as bare EOF — Nub
+            // "died" — and TERM deliberate background survivors on a NORMAL
+            // exit, the exact additivity break the byte exists to prevent.
+            while libc::write(self.write_fd, byte.as_ptr().cast(), 1) < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+            {}
+            libc::close(self.write_fd);
+        }
+        let _ = self.watcher.wait();
+    }
+}
+
+/// The `pdeath-watch` private launcher mode: `<child-pgid> <read-fd>` — the
+/// watcher half of [`spawn_group_reaper`]. Returns the process exit code.
+#[cfg(unix)]
+pub fn run_pdeath_watch(args: &[String]) -> i32 {
+    let (Some(pgid), Some(fd)) = (
+        args.first().and_then(|s| s.parse::<libc::pid_t>().ok()),
+        args.get(1).and_then(|s| s.parse::<libc::c_int>().ok()),
+    ) else {
+        return 2;
+    };
+    // SAFETY: getpgrp/read/kill FFI on values this process owns.
+    unsafe {
+        // Signal dispositions were already set in the spawner's pre_exec (they
+        // survive execve): the forwarded terminating set and the job-control
+        // stops are all SIG_IGN, so the watcher acts on exactly one stimulus —
+        // the pipe — and exits on its own. (SIGKILL still takes it down with
+        // the group, as it should.)
+        //
+        // Membership self-check: pre_exec's setpgid can only have failed if the
+        // workload group was already gone — nothing to protect. Being a member
+        // is load-bearing (SIGKILL immunity + pgid pinning, see
+        // `spawn_group_reaper`), so never watch from outside the group.
+        if libc::getpgrp() != pgid {
+            return 0;
+        }
+        let mut buf = [0u8; 1];
+        loop {
+            let n = libc::read(fd, buf.as_mut_ptr().cast(), 1);
+            if n == 1 && buf[0] == PDEATH_DISARM {
+                // Nub reaped the workload and is exiting cleanly: stand down
+                // without signaling, leaving any deliberate background
+                // survivors exactly as plain node/sh would.
+                return 0;
+            }
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            // EOF (Nub died) — or an unreadable pipe, where killing beats
+            // orphaning.
+            break;
+        }
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+    0
 }
 
 /// Spawn `cmd` in its own process group and wait, forwarding terminating signals
@@ -265,8 +731,13 @@ pub fn group_on_spawn(cmd: &mut Command) {
 /// spawns, not just Nub's leader.
 pub fn status_forwarding_signals(cmd: &mut Command) -> std::io::Result<ExitStatus> {
     group_on_spawn(cmd);
-    let mut child = cmd.spawn()?;
-    track_child_group(child.id());
+    let mut child = spawn_with_eagain_retry(cmd)?;
+    let pid = child.id();
+    track_child_group(pid);
+    // SIGKILL-on-the-leader backstop (#480) — macOS-only inside; see
+    // `spawn_group_reaper`. Held across the wait, dropped (disarmed) after.
+    #[cfg(unix)]
+    let _reaper = spawn_group_reaper(child.id());
     // Interactive path (stdin is a TTY + inherited stdio): hand the terminal
     // foreground to the child so a full-screen TUI can read it / receive Ctrl-C
     // (issue #27); the guard restores nub's foreground group on drop. No-op off a
@@ -274,7 +745,7 @@ pub fn status_forwarding_signals(cmd: &mut Command) -> std::io::Result<ExitStatu
     #[cfg(unix)]
     let _fg = foreground_child(child.id());
     let status = child.wait();
-    untrack_child();
+    untrack_child(pid);
     status
 }
 
@@ -290,6 +761,31 @@ pub struct SpawnConfig<'a> {
     pub show_warnings: bool,
     /// Path to the Nub binary itself (for the PATH shim).
     pub nub_binary: &'a Path,
+    /// An external loader that owns the environment for this project, as
+    /// `(cli, schema_dir)`.
+    ///
+    /// When set, nub does not spawn Node directly — it spawns
+    /// `<loader> run --path <schema_dir> -- <node> <args…>`, so the loader
+    /// resolves, validates and injects the environment, and pipes the child's
+    /// output through its own redaction. nub contributes no environment of its
+    /// own on this path.
+    ///
+    /// `--path` is not an optimization. nub already walked up to find the schema
+    /// before deciding the loader owns this project, and the loader would
+    /// otherwise infer its entry point from cwd — which is a different directory
+    /// for a workspace member, or for a run from a subdirectory. Standing down on
+    /// the strength of a schema and then not saying where it is leaves the child
+    /// erroring about a file nub demonstrably found.
+    ///
+    /// The node command is otherwise unchanged: nub's flags and `NODE_OPTIONS`
+    /// augmentation ride through untouched, so transpilation and the preload
+    /// chain behave exactly as they do on a direct spawn.
+    pub env_owner: Option<(&'a Path, &'a Path)>,
+    /// The configured `prefix` command, program first, already resolved to a
+    /// path. Goes in front of everything else — the env-owner loader included —
+    /// so the whole launch, loader and all, runs behind it. The re-entrancy
+    /// marker for it arrives through `env_vars`.
+    pub prefix: Option<&'a [String]>,
     /// Parsed .env vars to inject into the child environment.
     pub env_vars: &'a std::collections::HashMap<String, String>,
     /// Yarn PnP `.pnp.cjs` path (from `nub_core::pnp::detect`), injected via
@@ -301,19 +797,95 @@ pub struct SpawnConfig<'a> {
     /// a node bin run via `nub exec -r` executes IN the member, seeing its own
     /// `.env` / Node pin / `.bin` chain rather than the workspace root's.
     pub cwd: &'a Path,
+    /// Resolved project/global Node options, already validated against this Node.
+    pub runtime_node_options: &'a [String],
+    /// Resolved project/global `v8Flags`. Delivered as ARGV, not `NODE_OPTIONS`:
+    /// Node refuses most V8-only flags (`--stack-size`, `--no-opt`, …) in
+    /// `NODE_OPTIONS` but accepts them on the command line, so this is the only
+    /// channel that can carry them.
+    pub runtime_v8_flags: &'a [String],
+    /// Configured preloads can ride Nub's own preload without a Node-options token.
+    pub runtime_has_preloads: bool,
 }
 
 /// The result of spawning a Node process.
 pub struct SpawnResult {
-    pub status: ExitStatus,
+    status: ExitStatus,
 }
 
-/// Spawn Node with Nub's augmentation pipeline.
+/// Build the command that launches a program nub puts in front of Node — the
+/// env-owner loader, or the configured `prefix`.
 ///
+/// On Windows an npm-installed program is a `.cmd` batch file, which
+/// `CreateProcess` cannot launch directly — it has to go through `cmd /C`, the
+/// same route `bin_launcher` and `npm_upgrade_command_invocation` already take
+/// for exactly this reason. Rust's `std::process` does auto-convert, but its own
+/// docs say that behavior "may be removed in the future and so should not be
+/// relied upon", and it returns `InvalidInput` for arguments it cannot escape.
+pub fn loader_command(program: &Path) -> Command {
+    let shim = cmd_shim_for(program);
+    if let Some((interpreter, flag)) = shim.split_first() {
+        let mut cmd = Command::new(interpreter);
+        cmd.args(flag).arg(program);
+        return cmd;
+    }
+    Command::new(program)
+}
+
+/// The `cmd /C` a Windows batch shim needs in front of it, as argv to splice
+/// wherever the shim sits in a command line — empty for anything else.
+pub fn cmd_shim_for(program: &Path) -> &'static [&'static str] {
+    let is_batch = cfg!(windows)
+        && program
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if is_batch { &["cmd", "/C"] } else { &[] }
+}
+
 /// In compat mode, spawns Node with only the user's args — no flag
 /// injection, no preloads, no PATH shim.
 pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
-    let mut cmd = Command::new(config.node.path.as_str());
+    // With an external env owner, the loader goes in FRONT of Node rather than
+    // inside it: `<loader> run --path <dir> -- <node> …`. That is its full-capability
+    // mode — it owns resolution and pipes the child's streams through its own
+    // redaction, which an in-process integration cannot do for raw
+    // `process.stdout.write` or for anything a subprocess prints.
+    //
+    // nub stays the parent and the node command is unchanged, so every flag and
+    // the whole `NODE_OPTIONS` augmentation chain reach Node exactly as on a
+    // direct spawn.
+    //
+    // A configured `prefix` sits in front of the loader in turn, and the
+    // `.cmd`-aware launch (`loader_command`) applies to whichever program is
+    // first: `<prefix…> [cmd /C] <loader> run --path <dir> -- <node> …`.
+    let mut cmd = match (config.prefix, config.env_owner) {
+        (Some(prefix), owner) => {
+            let (program, args) = prefix.split_first().expect("a prefix names a program");
+            let mut cmd = loader_command(Path::new(program));
+            cmd.args(args);
+            if let Some((loader, schema_dir)) = owner {
+                cmd.args(cmd_shim_for(loader));
+                cmd.arg(loader)
+                    .arg("run")
+                    .arg("--path")
+                    .arg(schema_dir)
+                    .arg("--");
+            }
+            cmd.arg(config.node.path.as_str());
+            cmd
+        }
+        (None, Some((loader, schema_dir))) => {
+            let mut cmd = loader_command(loader);
+            cmd.arg("run")
+                .arg("--path")
+                .arg(schema_dir)
+                .arg("--")
+                .arg(config.node.path.as_str());
+            cmd
+        }
+        (None, None) => Command::new(config.node.path.as_str()),
+    };
     // Process-identity fidelity: set argv0 to "node" so the spawned process
     // reports `process.title` and `process.argv0` as "node" — matching what
     // plain `node` reports when invoked by PATH name — instead of the full
@@ -336,8 +908,11 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // Windows — there is nothing to fix there, and nothing the spawner could do
     // to force "node". (See crates/nub-cli/tests/process_identity.rs, which
     // asserts the Unix "node" invariant and the Windows path-passthrough one.)
+    // Only meaningful on a direct spawn. Behind an env-owner loader the process
+    // nub launches IS the loader, and Node is its child — so argv0 here would
+    // rename the loader, and Node's own identity is the loader's to set.
     #[cfg(unix)]
-    {
+    if config.env_owner.is_none() && config.prefix.is_none() {
         use std::os::unix::process::CommandExt;
         cmd.arg0("node");
     }
@@ -345,6 +920,9 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // process cwd (a no-op); the workspace-bin path threads a member dir so a
     // node bin executes IN that member rather than inheriting the parent's cwd.
     cmd.current_dir(config.cwd);
+    if config.env_owner.is_none() && config.prefix.is_none() {
+        super::discovery::mark_node_launch(&mut cmd, config.node.path.as_std_path());
+    }
 
     // Permission model detection and auto-grant.
     let has_permission = config.user_args.iter().any(|a| is_permission_flag(a));
@@ -369,8 +947,6 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         cmd.arg(format!("--allow-fs-read={}", install_dir.display()));
     }
 
-    // ShimGuard must live until after child.wait() — declared at function scope.
-    let mut _shim_guard: Option<ShimGuard> = None;
     // Removes the compile-cache sentinel (R8) on drop, after the child exits.
     let mut _ccache_guard: Option<CompileCacheSentinelGuard> = None;
 
@@ -393,10 +969,29 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         .as_deref()
         .map(|p| preload_injection(p, &config.node.version));
     let reentrancy_key = injection.as_ref().map(|i| i.node_options_token());
-    let is_reentrant = is_reentrant_in(
-        env::var("NODE_OPTIONS").ok().as_deref(),
-        reentrancy_key.as_deref(),
-    );
+    // Read the inherited NODE_OPTIONS once and reuse it for both the re-entrancy
+    // check and the flag-injection block below — the env value is constant across
+    // a single spawn.
+    let node_options = env::var("NODE_OPTIONS").ok();
+    let is_reentrant = is_reentrant_in(node_options.as_deref(), reentrancy_key.as_deref());
+
+    // A compat re-entry may arrive through an augmented parent's PATH shim.
+    // Restore the environment captured before that parent installed Nub's
+    // NODE_OPTIONS/NODE_PATH/NODE/compile-cache values, and remove its exact
+    // shim component. This makes a nested `NODE_COMPAT=1 node ...` genuinely
+    // vanilla instead of merely skipping a second augmentation pass.
+    if config.compat_mode {
+        restore_compat_environment(&mut cmd);
+    }
+
+    // After the restore, so a compat launch reads the value it will start with. The
+    // assembly below then builds on what is left.
+    let watch_flags = lift_inherited_watch_flags(&mut cmd);
+    let node_options = if watch_flags.is_empty() {
+        node_options
+    } else {
+        effective_node_options(&cmd)
+    };
 
     // Augment only when we can locate our own preload. If `find_preload` fails —
     // a broken install, or (Windows, A-WIN2) the PATH-shim `node.exe` running
@@ -406,95 +1001,115 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // inherits the parent's NODE_OPTIONS (absolute preload path) + PATH shim,
     // which already carry the augmentation, so re-augmenting here would only add
     // a half-setup (flags + a nested shim, no preload). See
-    // wiki/runtime/hijack-by-default.md.
-    if !config.compat_mode && !is_reentrant && preload.is_some() {
-        // Flag injection.
-        let node_options = env::var("NODE_OPTIONS").ok();
-        let inject = flags::compute_inject_flags(
+    // internal/runtime/hijack-by-default.md.
+
+    // Flag injection — intersected with the binary's actual accepted-flag set
+    // (probed + cached) so an open-ended `Unflag` band never injects a flag a future
+    // Node has removed (which would abort startup with "bad option"). Computed HERE,
+    // outside the augment block, because it is applied outside it too.
+    let inject_flags: Vec<&'static str> = if config.compat_mode {
+        Vec::new()
+    } else {
+        let accepted = super::discovery::accepted_env_flags(
+            config.node.path.as_std_path(),
+            &config.node.version,
+        );
+        flags::compute_inject_flags(
             config.node.version.clone(),
             config.user_args,
             node_options.as_deref(),
             config.show_warnings,
-        );
-        for flag in &inject {
-            cmd.arg(flag);
-        }
+            accepted.as_ref(),
+        )
+    };
 
-        // Web Storage: nub ALWAYS injects `--experimental-webstorage` on the band
-        // where that flag is the enabling mechanism (Node 22.4 through <25, i.e.
-        // `webstorage_flag_needed`), regardless of whether the user opted into
-        // localStorage persistence (the maintainer, 2026-06-15: "a flag that we inject no
-        // matter what"). On that band `sessionStorage` needs ONLY the flag (no file)
-        // — gating it behind a `--localstorage-file` opt-in wrongly broke out-of-the-
-        // box sessionStorage. So inject the flag unconditionally in-band; this makes
-        // sessionStorage work everywhere on 22.4–24 and installs the `localStorage`
-        // getter (which still throws `ERR_INVALID_ARG_VALUE` on ACCESS until the user
-        // supplies a `--localstorage-file`). Empirically the flag alone does NOT throw
-        // at startup on 22.4–24, so always-injecting is safe.
-        //
-        // nub NEVER synthesizes `--localstorage-file` — localStorage persistence
-        // stays the user's explicit opt-in (forwarded verbatim if they pass it).
-        //
-        // Scope is exactly the `webstorage_flag_needed` band: below 22.4 the flag is
-        // an unrecognized "bad option" (would crash startup), and on 25+ Web Storage
-        // is native so the flag is unnecessary. Skip the inject when the user already
-        // supplied `--experimental-webstorage` / `--no-experimental-webstorage` (no
-        // double-add; respect an explicit disable — nub never re-enables over a user
-        // negation).
-        if should_inject_webstorage_flag(
-            &config.node.version,
-            config.user_args,
-            node_options.as_deref(),
-        ) {
-            cmd.arg("--experimental-webstorage");
+    if !config.compat_mode && !is_reentrant && preload.is_some() {
+        apply_augmentation_restore_markers(|key, value| {
+            cmd.env(key, value);
+        });
+        // Establish an expected value for every restoration-controlled variable,
+        // including those this spawn may leave inherited. Branches below
+        // overwrite the marker when they rewrite a value. Without the baseline,
+        // a later script replacement of an untouched variable would look like a
+        // parent-owned value and be overwritten at the fresh boundary.
+        for var in &RESTORABLE_VARS {
+            let inherited = env::var_os(var.name);
+            mark_augmented(&mut cmd, var.name, inherited.as_deref());
         }
-
-        // Web Storage localStorage neutralization: on the band where nub injects
-        // `--experimental-webstorage` AND the user did NOT supply their own
-        // `--localstorage-file`, the injected flag installs a `localStorage` getter
-        // that throws `ERR_INVALID_ARG_VALUE` on access (even `typeof localStorage`
-        // throws). Signal nub's startup preload to replace that throwing getter with
-        // a plain `undefined` value — matching Node 25+'s clean shape so
-        // `typeof localStorage === "undefined"` feature-detection is safe — while
-        // `sessionStorage` (which needs only the flag) keeps working out of the box.
-        // When the user passes `--localstorage-file`, this is skipped and
-        // `localStorage` works normally. The signal is an internal `__NUB_*` env var
-        // (brand-boundary-permitted plumbing); the preload deletes it after reading.
-        if should_neutralize_localstorage(
-            &config.node.version,
-            config.user_args,
-            node_options.as_deref(),
-        ) {
-            cmd.env(NEUTRALIZE_LOCALSTORAGE_ENV, "1");
-        }
+        // NOTE: the version-gated feature flags are NOT applied to argv here. They are
+        // applied below, OUTSIDE this block — see the comment at that site. Applying
+        // them here would skip them on exactly the spawn that needs them most: a
+        // re-entrant one, which is every `node` a script launches through the shim.
+        // Web Storage's flag and its paired neutralize signal are in that same set,
+        // and moved out for the same reason — see the site below.
 
         // PATH shim: prepend a temp dir with a `node` symlink → nub.
         if let Ok(shim_dir) = setup_path_shim(config.nub_binary) {
-            let mut new_path = std::ffi::OsString::from(shim_dir.as_str());
+            let mut new_path = OsString::from(shim_dir.as_str());
             if let Some(existing) = env::var_os("PATH") {
                 new_path.push(crate::PATH_LIST_SEPARATOR);
                 new_path.push(existing);
             }
-            cmd.env("PATH", new_path);
-            _shim_guard = Some(ShimGuard {
-                path: PathBuf::from(shim_dir.as_str()),
-            });
+            cmd.env("PATH", &new_path);
+            mark_augmented(&mut cmd, "PATH", Some(OsStr::new(shim_dir.as_str())));
         }
 
-        // Yarn PnP: `--require <.pnp.cjs>` BEFORE nub's own preload so PnP's
-        // `_resolveFilename` + zipfs patches install first; nub's resolve hooks
-        // then layer on top. Inside the `!compat_mode && !is_reentrant` gate, so
-        // `--node` and re-entrant child shells both skip PnP for free.
-        if let Some(pnp) = config.pnp {
-            cmd.arg("--require").arg(pnp);
+        // `process.versions.nub` source: hand the running binary's version to the
+        // preload so it can publish the self-identification marker. Coupled to the
+        // preload injection below — both live in this augment block, so `--node`
+        // and re-entrant child shells skip it for free.
+        cmd.env(VERSION_ENV, env!("CARGO_PKG_VERSION"));
+
+        // libuv threadpool sized to the cores (see THREADPOOL_SIZE_ENV). Only when the
+        // user has not set it; inherited by the augmented subtree like NODE_OPTIONS,
+        // and undone at a compat boundary through the restore markers.
+        if let Some(size) = threadpool_size_to_install() {
+            cmd.env(THREADPOOL_SIZE_ENV, &size);
+            mark_augmented(&mut cmd, THREADPOOL_SIZE_ENV, Some(OsStr::new(&size)));
         }
 
-        // Preload injection: `--require <cjs-path>` (fast tier) or `--import <url>`
-        // (compat tier). See PreloadInjection for why the channel is tier-specific.
-        if let Some(ref inj) = injection {
-            cmd.arg(inj.flag);
-            cmd.arg(&inj.value);
+        // Force the async loader-worker tier when this child hosts a foreign async
+        // loader (tsx/ts-node/--import) on a Node whose sync/async hook composition
+        // is broken — the sync fast tier would otherwise crash with
+        // ERR_METHOD_NOT_IMPLEMENTED (see force_async_tier_env / node_hook_compose_broken).
+        // An inherited `--import` is FOLDED into nub's chainer below, which removes it
+        // from NODE_OPTIONS — and with it the signal both this scan and the runtime's
+        // own intrinsic check read. A folded import can still register a loader (an
+        // `--import tsx` is exactly that), so stand in a synthetic token for it and
+        // keep the conservative "any such flag on the band takes the async tier"
+        // policy. Without this nub stays on the sync fast tier and a real tsx loader
+        // crashes on the resolveSync stub (nub#460).
+        let folded_import_marker: &[&str] = match node_options.as_deref() {
+            Some(value) if !split_inherited_preloads(value).2.is_empty() => &["--import"],
+            _ => &[],
+        };
+        if let Some((k, val)) = force_async_tier_env(
+            &config.node.version,
+            config
+                .user_args
+                .iter()
+                .map(String::as_str)
+                .chain(folded_import_marker.iter().copied()),
+        ) {
+            cmd.env(k, val);
         }
+
+        // Value-bearing preload/PnP `--require`/`--import` flags are NOT passed via
+        // argv here — ONLY via NODE_OPTIONS (assembled below). The direct child
+        // inherits that NODE_OPTIONS, so it is still fully augmented; keeping the
+        // flags off argv avoids a fork-reconstruction hazard: a child that rebuilds
+        // its Node flags by MERGING process.execArgv + NODE_OPTIONS (Next's
+        // getParsedNodeOptions→formatNodeOptions, jest-worker) would collect the
+        // SAME preload/PnP path from both channels and space-join the duplicate into
+        // one broken `--require "a b"`, dying with `Cannot find module 'a b'`. Boolean
+        // flags above stay argv-safe (idempotent when merged twice); only these
+        // value-bearing, path-carrying flags double destructively, so only they are
+        // routed single-channel. NODE_OPTIONS `--require` preserves the R1 sync-entry
+        // semantics identically to argv (R1 is the `--require`-vs-`--import` tier
+        // choice — see PreloadInjection — not the argv-vs-NODE_OPTIONS channel), and
+        // this matches the already-single-channel `compute_augmentation_env`
+        // script path. PnP's install-before-preload ordering is preserved by the
+        // NODE_OPTIONS token order (PnP token pushed before the preload token below).
 
         // Coverage-exclude nub's own runtime (R9). When the user runs the test
         // runner under `--experimental-test-coverage`, Node instruments every
@@ -502,11 +1117,15 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // them into the user's coverage report, tanking the aggregate (a 100% TS
         // fixture drops to ~55%) and adding phantom rows. Node accepts MULTIPLE
         // `--test-coverage-exclude=<glob>` flags, so we add one more keyed to the
-        // ABSOLUTE nub runtime dir (the directory holding the preload we just
-        // injected) — never a broad `**/runtime/**`, which would also exclude a
-        // user's own `runtime/` source.
+        // ABSOLUTE nub runtime dir (the directory holding the preload injected via
+        // NODE_OPTIONS below) — never a broad `**/runtime/**`, which would also
+        // exclude a user's own `runtime/` source. This flag is safe to pass on argv
+        // even though it also rides NODE_OPTIONS: it is repeatable, so a merged
+        // duplicate is two independent exclude tokens (a harmless re-exclude), not a
+        // space-joined single value like the preload/PnP `--require` above.
         if flags::test_coverage_exclude_supported(&config.node.version) {
-            if let Some(glob) = coverage_exclude_glob(
+            for glob in coverage_exclude_globs(
+                &config.node.version,
                 config.user_args,
                 node_options.as_deref(),
                 preload.as_deref(),
@@ -530,8 +1149,9 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // and right before user code, calls `module.enableCompileCache(dir)` so the
         // user's OWN modules still cache into their dir — the feature keeps working,
         // only the preload chain is excluded. The sentinel path is keyed on nub's
-        // PID; the child reads it from `process.ppid` (nub is its direct parent),
-        // the same PID-keyed temp pattern as the PATH shim.
+        // PID; the child reads it from `process.ppid` (nub is its direct parent).
+        // Unlike the randomized PATH shim, this private parent/child handoff stays
+        // PID-only intentionally.
         //
         // COVERAGE GATE (compile-cache vs V8 coverage). A WARM compile cache makes
         // V8's coverage imprecise: cached bytecode collapses/omits per-branch ranges,
@@ -560,9 +1180,15 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
             // default nub sets; their coverage numbers may be cache-affected, the
             // same tradeoff they'd have on plain node). Normal R8 strip+sentinel.
             cmd.env_remove("NODE_COMPILE_CACHE");
-            if write_compile_cache_sentinel(&dir).is_ok() {
+            let sentinel_written = write_compile_cache_sentinel(&dir).is_ok();
+            if sentinel_written {
                 _ccache_guard = Some(CompileCacheSentinelGuard);
             }
+            mark_augmented(
+                &mut cmd,
+                "NODE_COMPILE_CACHE",
+                sentinel_written.then(|| OsStr::new(&dir)),
+            );
         } else if coverage {
             // No user cache + coverage active: suppress nub's DEFAULT compile
             // cache (a warm V8 cache collapses/omits per-branch coverage ranges,
@@ -572,6 +1198,7 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
             // half (preload-common.cjs reenableUserCompileCache) for coverage
             // children nub's spawn path never sees.
             cmd.env_remove("NODE_COMPILE_CACHE");
+            mark_augmented(&mut cmd, "NODE_COMPILE_CACHE", None);
         } else if let Some(dir) = default_compile_cache_dir() {
             // Default-on compile cache (decided 2026-06-10, measured): when the
             // user hasn't set NODE_COMPILE_CACHE, point it at a nub-owned dir.
@@ -599,36 +1226,108 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
             // Escape hatches unchanged: NODE_COMPILE_CACHE yourself, or
             // NODE_DISABLE_COMPILE_CACHE=1 (honored by Node).
             cmd.env_remove("NODE_COMPILE_CACHE");
-            if let Some(dir) = dir.to_str()
-                && write_compile_cache_sentinel(dir).is_ok()
-            {
+            let dir = dir.to_str();
+            let sentinel_written = dir.is_some_and(|dir| write_compile_cache_sentinel(dir).is_ok());
+            if sentinel_written {
                 _ccache_guard = Some(CompileCacheSentinelGuard);
             }
+            mark_augmented(
+                &mut cmd,
+                "NODE_COMPILE_CACHE",
+                dir.filter(|_| sentinel_written).map(OsStr::new),
+            );
         }
 
         // Dual-channel injection: set NODE_OPTIONS so hardcoded-path `node`
-        // invocations inherit the preload + flags. We only reach here when NOT
-        // re-entrant — i.e. NODE_OPTIONS does not already carry our preload — so
-        // always (re)build it, appending any pre-existing NODE_OPTIONS. (The old
-        // `already_injected` guard checked the same full path and is subsumed by
-        // `is_reentrant` above.)
-        let existing_opts = env::var("NODE_OPTIONS").ok().filter(|s| !s.is_empty());
-        let mut node_opts_parts: Vec<String> = Vec::new();
-        for flag in &inject {
-            node_opts_parts.push(flag.to_string());
-        }
+        // invocations inherit the PRELOAD. We only reach here when NOT re-entrant —
+        // i.e. NODE_OPTIONS does not already carry our preload — so always (re)build
+        // it, appending any pre-existing NODE_OPTIONS. (The old `already_injected`
+        // guard checked the same full path and is subsumed by `is_reentrant` above.)
+        // Reuses the NODE_OPTIONS read at the top of the function rather than
+        // re-reading the (constant) env value.
+        //
+        // The rule for this channel: a token belongs here only if its floor is at or
+        // below nub's 18.19 support floor, because NODE_OPTIONS is inherited by the
+        // whole subtree and a descendant on an older Node aborts on anything it cannot
+        // parse. That is `flags::node_options_safe_inject_flags` — today just
+        // `--enable-source-maps` (Node 12.12+). The version-gated FEATURE flags are not
+        // here, nor is `--disable-warning=ExperimentalWarning` (floor 20.11), nor
+        // `--experimental-webstorage` (floor 22.4); they ride argv, and only argv.
+        //
+        // ONE DELIBERATE EXCEPTION REMAINS: `--test-coverage-exclude` (floor 22.5),
+        // pushed just below as a single token carrying nub's own runtime glob — and
+        // deliberately not Node's default test-file pattern, which rides argv instead
+        // (see that site). It breaks the rule knowingly — a descendant below 22.5
+        // aborts on it — because it is the only token here that MUST share a channel
+        // with the preload: a coverage grandchild nub never spawns inherits the preload
+        // through this string alone, so an exclude on argv would not reach it and nub's
+        // own runtime would be instrumented into the user's report. See its own comment
+        // for the full argument.
+        //
+        // KEPT ON PURPOSE (the maintainer, 2026-08-28), asked and answered when the
+        // webstorage flag was moved off this channel. The known, accepted cost is that
+        // a host on Node 22.5+ still cannot run Electron 34 or older (embedded Node
+        // 20.18.1), which dies exit 9 on this token. The alternatives were to gate the
+        // push on `coverage_active_for_cache` — already computed above, and it would
+        // spare every non-coverage run — or to move it to argv like the rest; both were
+        // declined in favour of keeping coverage reports clean unconditionally. So this
+        // is a settled trade, not an oversight: do NOT "fix" it silently.
+        // NODE_OPTIONS is inherited by the whole subtree, and nub's set is matched to
+        // the version of the Node it resolved, so
+        // any descendant on an OLDER Node aborts at startup — Node rejects an unknown
+        // flag there outright. Electron is the case that bites: `nub exec electron`
+        // runs `node_modules/.bin/electron`, which is a NODE script, so it reaches
+        // here; it then spawns the real Electron binary, whose embedded Node 24.17
+        // rejected the `--experimental-import-text` a host on Node 26.5 had put in
+        // this string, and the whole thing died with exit 9. (#246 is the same family,
+        // caught earlier only in its V8-snapshot SIGTRAP form.)
+        //
+        // The cost, accepted: a tool that spawns Node by ABSOLUTE PATH rather than by
+        // name bypasses the PATH shim, so it now inherits the preload without the
+        // feature flags. Everything launched as `node` still gets both, because the
+        // shim re-enters nub and this function puts them on argv. The preload is the
+        // part that carries transpilation and the polyfills, `--require` is accepted
+        // by every Node, and it self-disables inside Electron.
+        let existing_opts = node_options
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut node_opts_parts: Vec<String> = flags::node_options_safe_inject_flags(
+            &config.node.version,
+            config.user_args,
+            node_options.as_deref(),
+        )
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         // Yarn PnP token BEFORE nub's preload token, mirroring the argv order
         // above so hardcoded-path `node` invocations inherit PnP-first ordering.
         // Quoted so a `.pnp.cjs` under a spacey path survives the tokenizer.
+        // The threadpool sidecar goes AHEAD of PnP: it loads nothing PnP resolves,
+        // and a consumer that keeps one `--require` per name (Next.js,
+        // vercel/next.js#96582, last wins) then keeps PnP's, losing only the demotion.
+        if let Some(token) = injection.as_ref().and_then(PreloadInjection::sidecar_token) {
+            node_opts_parts.push(token);
+        }
         if let Some(pnp) = config.pnp {
             node_opts_parts.push(format!(
                 "--require={}",
-                node_options_quote(&pnp.display().to_string())
+                node_options_token(&pnp.display().to_string())
             ));
         }
         if let Some(ref inj) = injection {
             node_opts_parts.push(inj.node_options_token());
         }
+        // Project-config `nodeOptions` entries are quoted like every other value nub
+        // writes here. The CLI-side validator rejects whitespace and NUL but NOT a
+        // double quote, so an entry such as `--title=a"b` would otherwise reach
+        // Node's tokenizer with an unmatched quote and abort startup.
+        node_opts_parts.extend(
+            config
+                .runtime_node_options
+                .iter()
+                .map(|opt| node_option_token(opt)),
+        );
         // Coverage-exclude nub's own runtime (R9) — via NODE_OPTIONS, not just argv.
         // The CLI-arg form at the `cmd.arg(glob)` site above only reaches the DIRECT
         // child nub spawns. But the test-runner coverage fixtures spawn the actual
@@ -657,22 +1356,31 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
             // silently drop the exclude.
             node_opts_parts.push(format!(
                 "--test-coverage-exclude={}",
-                node_options_quote(&format!("{}/**", runtime_dir.display()))
+                node_options_token(&format!("{}/**", runtime_dir.display()))
             ));
+            // Deliberately WITHOUT Node's default test-file pattern beside it, even
+            // though this exclude is what turns that default off in a grandchild.
+            // Node applies the default only when its exclude list is EMPTY, and a file
+            // is skipped when ANY listed glob matches it (its matchers are built with
+            // `nonegate`, so `!` is literal, not a negation). A grandchild that passes
+            // its own exclude therefore cannot escape a default carried here: its
+            // own pattern is OR-ed on top of one it never sees. Measured on 26.7 with
+            // Node's `--test-coverage-exclude=!test/**` snapshot tests: the default
+            // matched every file (a Node checkout keeps its fixtures under `test/`,
+            // which the pattern's `test/**/*` alternative covers; elsewhere the
+            // source rows would survive) and the literal `!test/**` matched nothing,
+            // so the report was EMPTY. A grandchild that passes no exclude loses the
+            // default instead (test files appear in its report) — the smaller
+            // divergence, and the one shipped before the argv site learned to
+            // restate it. Only a runtime path Node skips on its own (a
+            // `/node_modules/` segment) would remove the exclude, and with it this
+            // trade.
         }
-        // Web Storage (mirrors the argv site above): always inject
-        // `--experimental-webstorage` into NODE_OPTIONS on the flag-needed band
-        // (22.4–24.x), regardless of any `--localstorage-file` opt-in, so a child
-        // `node` re-invocation inherits the flag and `sessionStorage` works out of
-        // the box. nub never synthesizes `--localstorage-file`. Same guard: only
-        // in-band, and not if the user already supplied/disabled the flag.
-        if should_inject_webstorage_flag(
-            &config.node.version,
-            config.user_args,
-            node_options.as_deref(),
-        ) {
-            node_opts_parts.push("--experimental-webstorage".to_string());
-        }
+        // Web Storage is deliberately NOT pushed here. Its 22.4 floor is above nub's
+        // 18.19 support floor, so on this inherited channel it aborted any descendant
+        // older than 22.4 — it rides argv instead, at the site below. A child `node`
+        // still gets it: that child comes back through the PATH shim into this
+        // function, which applies it to that process's own argv.
         if let Some(existing) = existing_opts {
             // An INHERITED NODE_OPTIONS (ancestor nub or user-set) is appended
             // verbatim EXCEPT we first snip any version-gated flag whose floor
@@ -680,13 +1388,19 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
             // can't parse (e.g. --experimental-webstorage on Node <22.4) aborts it
             // with exit 9 ("not allowed in NODE_OPTIONS"). See
             // flags::strip_unsupported_node_options.
+            // Preload flags were folded into nub's chainers by the caller
+            // (prepare_preload_chain), so forward only what is left — otherwise they
+            // ride as a second token of a name nub already emits.
+            let (existing, _, _) = split_inherited_preloads(&existing);
             let stripped = flags::strip_unsupported_node_options(&existing, &config.node.version);
             if !stripped.is_empty() {
                 node_opts_parts.push(stripped);
             }
         }
         if !node_opts_parts.is_empty() {
-            cmd.env("NODE_OPTIONS", node_opts_parts.join(" "));
+            let node_options = node_opts_parts.join(" ");
+            cmd.env("NODE_OPTIONS", &node_options);
+            mark_augmented(&mut cmd, "NODE_OPTIONS", Some(OsStr::new(&node_options)));
         }
 
         // NODE_PATH so the transpile's bare helper requires (e.g.
@@ -697,8 +1411,153 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // NODE_PATH. No-op in dev (runtime/ has no node_modules → walk-up to the
         // repo's), active for an installed package (A30).
         if let Some(node_path) = vendored_node_path(preload.as_deref()) {
-            cmd.env("NODE_PATH", node_path);
+            cmd.env("NODE_PATH", &node_path);
+            mark_augmented(&mut cmd, "NODE_PATH", Some(&node_path));
         }
+    }
+
+    if !config.compat_mode
+        && is_reentrant
+        && let Some(node_options) =
+            reentrant_node_options(node_options.as_deref(), config.runtime_node_options)
+    {
+        cmd.env("NODE_OPTIONS", &node_options);
+        mark_augmented(&mut cmd, "NODE_OPTIONS", Some(OsStr::new(&node_options)));
+    }
+
+    // `preload.is_some()` is kept from the augment block's guard: without our preload
+    // there is nothing to augment, and injecting flags alone is the "half-setup" that
+    // block's comment warns about. Only `!is_reentrant` is dropped, which is the point.
+    if !config.compat_mode && preload.is_some() {
+        // The version-gated feature flags ride argv from HERE, deliberately outside
+        // the augment block above. That block is skipped on a RE-ENTRANT spawn — a
+        // `node` reaching us through the PATH shim from inside a script — and that
+        // child is exactly the real Node process the flags must reach. They used to
+        // arrive through NODE_OPTIONS instead, which worked but is inherited by the
+        // whole subtree and so killed any descendant on an older Node (Electron).
+        // Argv reaches this process and nothing below it, which is the whole point.
+        // Boolean flags are idempotent, so a merged duplicate is harmless.
+        cmd.args(&inject_flags);
+
+        // Web Storage rides argv from here for exactly the reason above, and it is the
+        // last flag to move: its 22.4 floor is ABOVE nub's 18.19 support floor, so while
+        // it sat on the inherited NODE_OPTIONS channel any descendant older than 22.4
+        // aborted on it. That was reachable, not theoretical — a host on the 22.4–24 LTS
+        // band running Electron <= 34 (which embeds Node 20.18.1; Electron 28 embeds
+        // 18.18.2) hit it, and issue #7 was the same flag reaching an older child through
+        // a nested `.nvmrc`. `strip_unsupported_node_options` never covered it, because
+        // that is applied only to the INHERITED string, never to nub's own fresh tokens.
+        //
+        // It is injected here rather than through `compute_inject_flags`, so it sits
+        // OUTSIDE the Stage-4 accepted-flag intersection. Safe: its band is CLOSED
+        // (`22.4–<25`) and the flag stabilized (not removed) at 25 — no open-ended-
+        // removal hazard, so it needs no probe guard. (Any FUTURE open-ended flag should
+        // go through `compute_inject_flags` to inherit that guard, not this path.)
+        //
+        // nub ALWAYS injects it on the band where it is the enabling mechanism (Node
+        // 22.4 through <25, i.e. `webstorage_flag_needed`), regardless of whether the
+        // user opted into localStorage persistence (the maintainer, 2026-06-15: "a flag
+        // that we inject no matter what"). On that band `sessionStorage` needs ONLY the
+        // flag (no file) — gating it behind a `--localstorage-file` opt-in wrongly broke
+        // out-of-the-box sessionStorage. So inject unconditionally in-band; this makes
+        // sessionStorage work everywhere on 22.4–24 and installs the `localStorage`
+        // getter (which still throws `ERR_INVALID_ARG_VALUE` on ACCESS until the user
+        // supplies a `--localstorage-file`). Empirically the flag alone does NOT throw at
+        // startup on 22.4–24, so always-injecting is safe.
+        //
+        // nub NEVER synthesizes `--localstorage-file` — localStorage persistence stays
+        // the user's explicit opt-in (forwarded verbatim if they pass it).
+        //
+        // Below 22.4 the flag is an unrecognized "bad option" (would crash startup), and
+        // on 25+ Web Storage is native so the flag is unnecessary. Skip the inject when
+        // the user already supplied `--experimental-webstorage` /
+        // `--no-experimental-webstorage` (no double-add; respect an explicit disable —
+        // nub never re-enables over a user negation).
+        if flags::should_inject_experimental_webstorage(
+            &config.node.version,
+            config.user_args,
+            node_options.as_deref(),
+        ) {
+            cmd.arg("--experimental-webstorage");
+        }
+
+        // The localStorage neutralization signal moves WITH the flag, and must: on the
+        // band where nub injects `--experimental-webstorage` and the user did NOT supply
+        // `--localstorage-file`, the flag installs a `localStorage` getter that throws
+        // `ERR_INVALID_ARG_VALUE` on any access — even `typeof localStorage` throws.
+        // This tells nub's preload to delete that getter so the global is ABSENT,
+        // matching vanilla Node 24's shape, while `sessionStorage` keeps working.
+        //
+        // Pairing them at one site is what keeps the subtree correct now that the flag
+        // is per-process. The preload deliberately does NOT delete this var (see
+        // runtime/polyfills.cjs), so it still inherits downward — but inheritance alone
+        // can no longer be relied on to cover a descendant, because the flag that makes
+        // it necessary is now applied per spawn. Setting it wherever the flag is set is
+        // both sufficient and idempotent. The signal is an internal `__NUB_*` env var
+        // (brand-boundary-permitted plumbing).
+        if flags::should_neutralize_experimental_webstorage_localstorage(
+            &config.node.version,
+            config.user_args,
+            node_options.as_deref(),
+        ) {
+            cmd.env(flags::NEUTRALIZE_LOCALSTORAGE_ENV, "1");
+        }
+    }
+
+    // `v8Flags` ride argv for the same structural reason as the block above — the
+    // augment block is skipped on a re-entrant spawn, yet that child is the real Node
+    // the flags must reach — and each is applied to each Node process once, because the
+    // ancestor that installed the shim spawned a SHELL, not a Node. Compat mode is the
+    // zero-augmentation contract, so it carries none.
+    //
+    // But they are gated on compat mode ALONE, deliberately NOT on `preload.is_some()`.
+    // They are an explicit user request with nothing to do with nub's preload, and argv
+    // is the only channel that can carry them at all (see the
+    // `runtime_v8_flags` field doc) — so a broken install that cannot locate the preload
+    // must not silently swallow them as well.
+    // The runtime V8 signal is SET or REMOVED by every launch, never inherited: an
+    // ancestor's positive signal must not outlive the decision this launch makes. A
+    // `--no-js-defer-import-eval` on this argv empties the set below, and the parent's
+    // env would otherwise re-arm the preload over that opt-out. Inheritance is for
+    // processes that make no Nub launch decision — a Worker, or a child spawned by
+    // absolute path — see `flags::RUNTIME_V8_FLAGS_ENV`.
+    cmd.env_remove(flags::RUNTIME_V8_FLAGS_ENV);
+    if !config.compat_mode {
+        // Matrix-derived ARGV-only V8 unflags (`Mitigation::UnflagArgv`) ride here for
+        // the same reasons `v8Flags` do: NODE_OPTIONS refuses them outright, and this
+        // site still runs on a re-entrant spawn, which is exactly the real Node process
+        // that must receive them. (Every injected flag now reaches argv from out here
+        // rather than through NODE_OPTIONS — see the block above — so the two differ
+        // only in WHY NODE_OPTIONS is unavailable to them: Node rejects these by name,
+        // while the version-gated ones were pulled off that channel because it is
+        // inherited by the whole subtree and killed older descendants.)
+        let argv_only = flags::argv_inject_flags(
+            Some(config.node.path.as_std_path()),
+            &config.node.version,
+            config.user_args,
+        );
+        // Tell the preload which flags to hide from `process.execArgv`; see
+        // `flags::ARGV_ONLY_FLAGS_ENV` for why leaving them visible breaks real builds.
+        if !argv_only.is_empty() {
+            cmd.env(flags::ARGV_ONLY_FLAGS_ENV, argv_only.join(" "));
+        }
+        cmd.args(&argv_only);
+        // The matrix's runtime V8 flags (`Mitigation::RuntimeV8Flag`) never touch
+        // argv: the preload turns them on inside the process, on first use. Same
+        // probe and user-polarity filters, delivered through an env var stamped with
+        // this Node's version — see `flags::RUNTIME_V8_FLAGS_ENV`.
+        let runtime_v8 = flags::runtime_inject_flags(
+            Some(config.node.path.as_std_path()),
+            &config.node.version,
+            config.user_args,
+        );
+        if !runtime_v8.is_empty() {
+            cmd.env(
+                flags::RUNTIME_V8_FLAGS_ENV,
+                flags::runtime_v8_flags_env_value(&config.node.version, &runtime_v8),
+            );
+        }
+        cmd.args(config.runtime_v8_flags);
     }
 
     // .env vars injected by the CLI layer.
@@ -706,8 +1565,54 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         cmd.env(k, v);
     }
 
-    // User args always pass through.
-    cmd.args(config.user_args);
+    // Only the ordinary fast CJS preload path has the startup ordering required
+    // by the main-isolate GC policy. Unknown/user preloads and environment owners
+    // stand down rather than risking a Worker created before the override resets.
+    cmd.env_remove(super::gc::STARTUP_ENV);
+    if !config.compat_mode
+        && preload.is_some()
+        && config.env_owner.is_none()
+        && config.prefix.is_none()
+        && config.pnp.is_none()
+        // The built-in export condition cannot execute application preload code.
+        && config
+            .runtime_node_options
+            .iter()
+            .all(|option| option == "--conditions=nub")
+        && config.runtime_v8_flags.is_empty()
+        && !config.runtime_has_preloads
+        && !config.env_vars.contains_key("NODE_OPTIONS")
+        && env::var_os("NODE_OPTIONS").is_none_or(|value| value.to_str().is_some())
+        && super::gc::eligible(
+            &config.node.version,
+            config.user_args,
+            node_options.as_deref(),
+            super::gc::constrained_memory,
+        )
+        && let Some(startup) = preload
+            .as_deref()
+            .map(|path| Path::new(path).with_file_name("gc-startup.cjs"))
+            .filter(|path| path.is_file())
+    {
+        let startup_arg = format!("--require={}", startup.display());
+        cmd.arg(super::gc::SEMI_SPACE_FLAG).arg(&startup_arg);
+        cmd.env(super::gc::STARTUP_ENV, startup_arg);
+    }
+
+    // Compat covers the bare `node` descendants of this launch, not only the
+    // one process. The restored PATH deliberately preserves unrelated inherited
+    // entries, which may include a Nub shim from an outer logical invocation;
+    // the marker keeps a `node` that reaches it vanilla. Set after
+    // `restore_compat_environment`, which clears an inherited copy, and after
+    // env-file values, which must not undo `--node` or a resolved `nodeCompat`.
+    if config.compat_mode {
+        cmd.env(COMPAT_LAUNCH_ENV, "1");
+    }
+
+    // User args always pass through, compat mode included: with a runner or watcher
+    // flag in a spelling Node's filters miss, Node recurses.
+    cmd.args(watch_flags);
+    cmd.args(super::argv::child_safe_modes(config.user_args));
 
     // Inherit stdio.
     cmd.stdin(std::process::Stdio::inherit())
@@ -730,8 +1635,7 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // and keeps its existing behavior.
     group_on_spawn(&mut cmd);
 
-    let mut child = cmd
-        .spawn()
+    let mut child = spawn_with_eagain_retry(&mut cmd)
         .with_context(|| format!("failed to spawn {}", config.node.path))?;
 
     // Forward terminating/diagnostic signals to the child's process GROUP.
@@ -739,7 +1643,13 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // The child is its own group leader (see `group_on_spawn` above), so the
     // negative target signals the child and its descendants exactly once.
     // (No-op off Unix.)
-    track_child_group(child.id());
+    let child_pid = child.id();
+    track_child_group(child_pid);
+
+    // SIGKILL-on-the-leader backstop (#480) — macOS-only inside; see
+    // `spawn_group_reaper`. Held across the wait, dropped (disarmed) after.
+    #[cfg(unix)]
+    let _reaper = spawn_group_reaper(child.id());
 
     // Interactive path: hand the terminal foreground to the child (issue #27) so a
     // `nub <file>` that draws a full-screen TUI can read the terminal and receive
@@ -751,27 +1661,15 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     let status = child.wait().with_context(|| "waiting for Node child")?;
 
     // Stop forwarding to this (now-exited) group before returning. (No-op off Unix.)
-    untrack_child();
+    untrack_child(child_pid);
 
     Ok(SpawnResult { status })
-}
-
-/// RAII guard that removes the PATH shim directory on drop.
-pub struct ShimGuard {
-    path: PathBuf,
-}
-
-impl Drop for ShimGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
 }
 
 /// Path of the compile-cache sentinel file (R8) for a given nub PID. spawn.rs
 /// writes the user's original `NODE_COMPILE_CACHE` dir here keyed on nub's own
 /// PID; the child preload reads it from a path derived from `process.ppid` (nub
-/// is the child's direct parent). Same `<tmpdir>/nub-…-<pid>` shape as the PATH
-/// shim, so cleanup is symmetric and a recycled PID can't collide across runs.
+/// is the child's direct parent).
 fn compile_cache_sentinel_path(nub_pid: u32) -> PathBuf {
     compile_cache_tmpdir().join(format!("nub-ccache-{nub_pid}"))
 }
@@ -844,68 +1742,470 @@ impl Drop for CompileCacheSentinelGuard {
     }
 }
 
-fn setup_path_shim(nub_binary: &Path) -> Result<Utf8PathBuf> {
-    let pid = std::process::id();
-    let dir_name = format!("nub-node-shim-{pid}");
-    let shim_dir = env::temp_dir().join(&dir_name);
+/// The name every per-invocation shim directory starts with, which discovery and
+/// the stale-shim reaper recognise them by ([`is_path_shim_candidate`]).
+// @lat: [[architecture#Architecture#Composition]]
+pub const PATH_SHIM_PREFIX: &str = "nub-node-shim-";
+const PATH_SHIM_CREATE_RETRIES: usize = 16;
 
-    fs::create_dir_all(&shim_dir)
-        .with_context(|| format!("creating PATH shim dir: {}", shim_dir.display()))?;
+static PATH_SHIM_MANAGER: PathShimManager = PathShimManager::new();
 
-    #[cfg(unix)]
-    let node_shim = shim_dir.join("node");
+struct PathShimManager {
+    state: Mutex<Option<ShimRecord>>,
+}
+
+struct ShimRecord {
+    dir: PathBuf,
+    dir_identity: FileHandle,
+    node_identity: FileHandle,
+}
+
+#[derive(Default)]
+struct ShimSetupOptions {
     #[cfg(windows)]
-    let node_shim = shim_dir.join("node.exe");
+    force_copy: bool,
+    #[cfg(test)]
+    fail_before_commit: bool,
+}
 
-    // Concurrent workspace spawns (one nub process, N worker threads — see the
-    // run -r work queue in cli.rs) race this setup, so the shim must be
-    // PUBLISHED ATOMICALLY: materialize under a unique temp name, then rename
-    // into place. A racer can then only ever observe `node`/`node.exe` absent
-    // or complete. The naive `exists()`-then-create had two real failure modes:
-    // on Windows the fallback `fs::copy` (hard_link fails across volumes — on
-    // GitHub runners the repo is on D:, TEMP on C:) leaves a half-written
-    // `node.exe` open for write that a sibling's child shell then tries to
-    // EXECUTE → ERROR_SHARING_VIOLATION ("The process cannot access the file
-    // because it is being used by another process", the run_aggregate CI
-    // flake, 2026-06-10); on Unix two threads could both pass `!exists()` and
-    // the loser's `symlink` EEXIST error silently dropped the shim via the
-    // caller's `.ok()`. Losing the rename race is fine — the winner's shim is
-    // complete by definition; clean up our temp and use theirs.
-    if !node_shim.exists() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TMP_N: AtomicU64 = AtomicU64::new(0);
-        let tmp = shim_dir.join(format!(
-            ".node-staging-{pid}-{}",
-            TMP_N.fetch_add(1, Ordering::Relaxed)
-        ));
-        #[cfg(unix)]
-        {
-            unix_fs::symlink(nub_binary, &tmp)
-                .with_context(|| format!("creating node shim symlink in {}", shim_dir.display()))?;
-        }
-        #[cfg(windows)]
-        {
-            fs::hard_link(nub_binary, &tmp)
-                .or_else(|_| fs::copy(nub_binary, &tmp).map(|_| ()))
-                .with_context(|| {
-                    format!(
-                        "creating node shim in {} (tried hard_link then copy)",
-                        shim_dir.display()
-                    )
-                })?;
-        }
-        if let Err(rename_err) = fs::rename(&tmp, &node_shim) {
-            let _ = fs::remove_file(&tmp);
-            // A sibling published first (their shim is complete) — otherwise
-            // the rename failed for a real reason worth surfacing.
-            if !node_shim.exists() {
-                return Err(rename_err)
-                    .with_context(|| format!("publishing node shim into {}", shim_dir.display()));
-            }
+struct PendingShimDir {
+    path: PathBuf,
+    pid: u32,
+    identity: Option<FileHandle>,
+    armed: bool,
+}
+
+impl PendingShimDir {
+    fn new(path: PathBuf, pid: u32) -> Self {
+        Self {
+            path,
+            pid,
+            identity: None,
+            armed: true,
         }
     }
 
-    Utf8PathBuf::try_from(shim_dir).map_err(|e| anyhow::anyhow!("shim dir path not UTF-8: {e}"))
+    fn set_identity(&mut self, identity: FileHandle) {
+        self.identity = Some(identity);
+    }
+
+    fn identity(&self) -> &FileHandle {
+        self.identity
+            .as_ref()
+            .expect("created PATH shim directory has an identity")
+    }
+
+    fn disarm(mut self) -> FileHandle {
+        let identity = self
+            .identity
+            .take()
+            .expect("published PATH shim directory has an identity");
+        self.armed = false;
+        identity
+    }
+}
+
+impl Drop for PendingShimDir {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(created) = self.identity.take() else {
+            let _ = fs::remove_dir(&self.path);
+            return;
+        };
+        let unchanged =
+            validate_shim_dir(&self.path, false).is_ok_and(|current| current.eq(&created));
+        if unchanged {
+            remove_shim_entry(&node_shim_path(&self.path));
+            remove_shim_entry(&staging_shim_path(&self.path, self.pid));
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
+}
+
+impl PathShimManager {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+        }
+    }
+
+    fn setup(&self, nub_binary: &Path) -> Result<Utf8PathBuf> {
+        self.setup_in(
+            nub_binary,
+            &env::temp_dir(),
+            std::process::id(),
+            secure_shim_nonce,
+            ShimSetupOptions::default(),
+        )
+    }
+
+    fn setup_in(
+        &self,
+        nub_binary: &Path,
+        temp_dir: &Path,
+        pid: u32,
+        mut nonce: impl FnMut() -> Result<[u8; 16]>,
+        options: ShimSetupOptions,
+    ) -> Result<Utf8PathBuf> {
+        // Declared before every source/node handle so an error unwinds those
+        // handles before the pending directory guard tries to remove entries.
+        // This matters on Windows, where a delete-pending hardlink keeps its
+        // directory entry until the last file handle closes.
+        let mut pending = None;
+        let mut cached_validation_error = None;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(record) = state.as_ref() {
+            match validate_shim_record(record) {
+                Ok(()) => return shim_dir_utf8(record.dir.clone()),
+                Err(error) => {
+                    cached_validation_error = Some(format!("{error:#}"));
+                    // Keep the manager lock held while retiring the invalid
+                    // record and publishing its replacement. Concurrent callers
+                    // can then observe only the old record before validation or
+                    // the fully validated replacement, never an empty window.
+                    // Do not clean the invalid path here: validation failed, so
+                    // pathname-based cleanup can no longer prove its identity.
+                    drop(state.take().expect("cached PATH shim record is present"));
+                }
+            }
+        }
+
+        let nub_binary = fs::canonicalize(nub_binary)
+            .with_context(|| format!("resolving Nub binary: {}", nub_binary.display()))?;
+        let nub_identity = validate_nub_binary(&nub_binary)?;
+
+        for _ in 0..PATH_SHIM_CREATE_RETRIES {
+            let suffix = nonce_hex(nonce()?);
+            let path = temp_dir.join(format!("{PATH_SHIM_PREFIX}{pid}-{suffix}"));
+            match create_shim_dir(&path) {
+                Ok(()) => {
+                    pending = Some(PendingShimDir::new(path, pid));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("creating PATH shim dir: {}", path.display()));
+                }
+            }
+        }
+        let pending_dir = pending.as_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not create a collision-free PATH shim directory after {PATH_SHIM_CREATE_RETRIES} attempts"
+            )
+        })?;
+
+        set_private_shim_permissions(&pending_dir.path)?;
+        let dir_identity = validate_shim_dir(&pending_dir.path, true)?;
+        pending_dir.set_identity(dir_identity);
+        let published =
+            publish_node_shim(&nub_binary, &nub_identity, &pending_dir.path, pid, &options)?;
+        let utf8_dir = shim_dir_utf8(pending_dir.path.clone())?;
+        validate_shim_candidate(&pending_dir.path, pending_dir.identity(), &published)?;
+        #[cfg(test)]
+        if options.fail_before_commit {
+            anyhow::bail!("injected PATH shim commit failure");
+        }
+        let dir_identity = pending
+            .take()
+            .expect("validated PATH shim directory is pending")
+            .disarm();
+
+        let record = ShimRecord {
+            dir: PathBuf::from(utf8_dir.as_str()),
+            dir_identity,
+            node_identity: published,
+        };
+        *state = Some(record);
+        drop(state);
+        if let Some(error) = cached_validation_error {
+            tracing::warn!(
+                error = %error,
+                "cached Node PATH shim failed validation; created a replacement"
+            );
+        }
+        Ok(utf8_dir)
+    }
+
+    fn cleanup(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = state.take() else { return };
+        let ShimRecord {
+            dir,
+            dir_identity,
+            node_identity,
+        } = record;
+        let valid_dir =
+            validate_shim_dir(&dir, true).is_ok_and(|current| current.eq(&dir_identity));
+        let node = node_shim_path(&dir);
+        let valid_node = open_node_shim(&node).is_ok_and(|current| current.eq(&node_identity));
+        if valid_dir && valid_node {
+            // Windows retains a delete-pending file's directory entry until
+            // its last handle closes. Keep only the directory handle live
+            // across the bounded file + empty-directory removal.
+            drop(node_identity);
+            remove_shim_entry(&node);
+            let _ = fs::remove_dir(&dir);
+        }
+        drop(dir_identity);
+    }
+}
+
+fn setup_path_shim(nub_binary: &Path) -> Result<Utf8PathBuf> {
+    PATH_SHIM_MANAGER.setup(nub_binary)
+}
+
+fn secure_shim_nonce() -> Result<[u8; 16]> {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| anyhow::anyhow!("generating PATH shim nonce: {error}"))?;
+    Ok(nonce)
+}
+
+fn nonce_hex(nonce: [u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(32);
+    for byte in nonce {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    encoded
+}
+
+fn create_shim_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(path)
+    }
+    #[cfg(windows)]
+    {
+        // The exclusive random leaf inherits the established per-user TEMP
+        // DACL; validation separately rejects directory reparse points.
+        fs::create_dir(path)
+    }
+}
+
+fn set_private_shim_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("setting PATH shim permissions: {}", path.display()))?;
+    }
+    #[cfg(windows)]
+    let _ = path;
+    Ok(())
+}
+
+fn validate_nub_binary(path: &Path) -> Result<FileHandle> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading Nub binary metadata: {}", path.display()))?;
+    if !metadata.file_type().is_file() || is_reparse_point(&metadata) {
+        anyhow::bail!("Nub binary is not a regular file: {}", path.display());
+    }
+    FileHandle::from_path(path)
+        .with_context(|| format!("opening Nub binary identity: {}", path.display()))
+}
+
+fn validate_shim_dir(path: &Path, require_private: bool) -> Result<FileHandle> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading PATH shim dir metadata: {}", path.display()))?;
+    if !metadata.file_type().is_dir() || is_reparse_point(&metadata) {
+        anyhow::bail!("PATH shim path is not a real directory: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        if metadata.uid() != euid {
+            anyhow::bail!("PATH shim directory is not owned by the current user");
+        }
+        if require_private && metadata.mode() & 0o7777 != 0o700 {
+            anyhow::bail!("PATH shim directory permissions are not 0700");
+        }
+    }
+    #[cfg(windows)]
+    let _ = require_private;
+    FileHandle::from_path(path)
+        .with_context(|| format!("opening PATH shim dir identity: {}", path.display()))
+}
+
+#[cfg(unix)]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn node_shim_path(dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    let name = "node";
+    #[cfg(windows)]
+    let name = "node.exe";
+    dir.join(name)
+}
+
+fn staging_shim_path(dir: &Path, pid: u32) -> PathBuf {
+    dir.join(format!(".node-staging-{pid}"))
+}
+
+/// Remove one known immediate shim entry, never a directory tree. A concurrent
+/// replacement can make this fail or delete only that immediate file/symlink;
+/// it can never redirect cleanup into unrelated contents.
+fn remove_shim_entry(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !metadata.file_type().is_dir() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn publish_node_shim(
+    nub_binary: &Path,
+    nub_identity: &FileHandle,
+    shim_dir: &Path,
+    pid: u32,
+    options: &ShimSetupOptions,
+) -> Result<FileHandle> {
+    let node_shim = node_shim_path(shim_dir);
+    let staging = staging_shim_path(shim_dir, pid);
+
+    #[cfg(unix)]
+    {
+        let _ = options;
+        unix_fs::symlink(nub_binary, &staging)
+            .with_context(|| format!("creating node shim symlink in {}", shim_dir.display()))?;
+        let identity = validate_node_shim(&staging, nub_identity)?;
+        fs::rename(&staging, &node_shim)
+            .with_context(|| format!("publishing node shim into {}", shim_dir.display()))?;
+        Ok(identity)
+    }
+
+    #[cfg(windows)]
+    {
+        // TEMP may be on a different volume from the running binary, so a
+        // failed hardlink falls back to copying the captured source into staging.
+        let identity = if !options.force_copy && fs::hard_link(nub_binary, &staging).is_ok() {
+            validate_node_shim(&staging, nub_identity)?
+        } else {
+            copy_file_from_handle(nub_identity, &staging)
+                .with_context(|| format!("copying node shim into {}", shim_dir.display()))?
+        };
+        fs::rename(&staging, &node_shim)
+            .with_context(|| format!("publishing node shim into {}", shim_dir.display()))?;
+        Ok(identity)
+    }
+}
+
+#[cfg(unix)]
+fn open_node_shim(path: &Path) -> Result<FileHandle> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading node shim metadata: {}", path.display()))?;
+    if !metadata.file_type().is_symlink() {
+        anyhow::bail!("node shim is not a symlink: {}", path.display());
+    }
+    FileHandle::from_path(path)
+        .with_context(|| format!("opening node shim target: {}", path.display()))
+}
+
+#[cfg(unix)]
+fn validate_node_shim(path: &Path, nub_identity: &FileHandle) -> Result<FileHandle> {
+    let identity = open_node_shim(path)?;
+    if !identity.eq(nub_identity) {
+        anyhow::bail!("node shim does not target the current Nub binary");
+    }
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn open_node_shim(path: &Path) -> Result<FileHandle> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading node shim metadata: {}", path.display()))?;
+    if !metadata.file_type().is_file() || is_reparse_point(&metadata) {
+        anyhow::bail!("node shim is not a regular non-reparse file");
+    }
+    FileHandle::from_path(path)
+        .with_context(|| format!("opening node shim identity: {}", path.display()))
+}
+
+#[cfg(windows)]
+fn validate_node_shim(path: &Path, nub_identity: &FileHandle) -> Result<FileHandle> {
+    let identity = open_node_shim(path)?;
+    if !identity.eq(nub_identity) {
+        anyhow::bail!("node shim hardlink does not target the current Nub binary");
+    }
+    Ok(identity)
+}
+
+fn validate_shim_record(record: &ShimRecord) -> Result<()> {
+    let dir_identity = validate_shim_dir(&record.dir, true)?;
+    if !dir_identity.eq(&record.dir_identity) {
+        anyhow::bail!("PATH shim directory identity changed");
+    }
+    let node_identity = open_node_shim(&node_shim_path(&record.dir))?;
+    if !node_identity.eq(&record.node_identity) {
+        anyhow::bail!("node shim identity changed");
+    }
+    Ok(())
+}
+
+fn validate_shim_candidate(
+    dir: &Path,
+    expected_dir: &FileHandle,
+    published: &FileHandle,
+) -> Result<()> {
+    let dir_identity = validate_shim_dir(dir, true)?;
+    if !dir_identity.eq(expected_dir) {
+        anyhow::bail!("PATH shim directory identity changed during creation");
+    }
+    let node_identity = open_node_shim(&node_shim_path(dir))?;
+    if !node_identity.eq(published) {
+        anyhow::bail!("node shim identity changed during creation");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_file_from_handle(source: &FileHandle, destination: &Path) -> Result<FileHandle> {
+    use std::io::Write;
+    use std::os::windows::fs::FileExt;
+
+    let mut destination_file = fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(destination)?;
+    let mut offset = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source.as_file().seek_read(&mut buffer, offset)?;
+        if read == 0 {
+            break;
+        }
+        destination_file.write_all(&buffer[..read])?;
+        offset += read as u64;
+    }
+    destination_file.flush()?;
+    drop(destination_file);
+    FileHandle::from_path(destination).map_err(Into::into)
+}
+
+fn shim_dir_utf8(path: PathBuf) -> Result<Utf8PathBuf> {
+    Utf8PathBuf::try_from(path).map_err(|error| anyhow::anyhow!("shim dir path not UTF-8: {error}"))
 }
 
 /// Compute the augmentation environment variables (NODE_OPTIONS + PATH)
@@ -917,8 +2217,10 @@ fn setup_path_shim(nub_binary: &Path) -> Result<Utf8PathBuf> {
 /// Returns `None` if already re-entrant (parent nub already set up augmentation)
 /// or if compat mode is active.
 ///
-/// The PATH shim temp dir created here is process-wide (keyed by PID) and
-/// reclaimed exactly once on process exit via [`cleanup_shim`]; it is
+/// The active PATH shim temp dir is process-wide and reclaimed exactly once on
+/// process exit via [`cleanup_shim`]. A record that fails validation is retired
+/// without pathname-based cleanup and replaced; a later dead-process reaper
+/// handles its old directory. The active shim is
 /// deliberately NOT returned as a per-call RAII guard, because concurrent
 /// workspace scripts share the one dir and a per-call drop would `rm -rf` it
 /// out from under sibling scripts still running.
@@ -927,6 +2229,7 @@ pub fn compute_augmentation_env(
     node_version: super::version::NodeVersion,
     compat_mode: bool,
     pnp: Option<&Path>,
+    runtime_node_options: &[String],
 ) -> Option<AugmentationEnv> {
     if compat_mode {
         return None;
@@ -943,10 +2246,10 @@ pub fn compute_augmentation_env(
         .as_deref()
         .map(|p| preload_injection(p, &node_version));
     let reentrancy_key = injection.as_ref().map(|i| i.node_options_token());
-    if is_reentrant_in(
-        env::var("NODE_OPTIONS").ok().as_deref(),
-        reentrancy_key.as_deref(),
-    ) {
+    // Read the inherited NODE_OPTIONS once and reuse it for both the re-entrancy
+    // check and the NODE_OPTIONS rebuild below — the env value is constant here.
+    let node_options = env::var("NODE_OPTIONS").ok();
+    if is_reentrant_in(node_options.as_deref(), reentrancy_key.as_deref()) {
         return None;
     }
     // Nothing to inject if we can't locate our preload (broken install, or a
@@ -955,52 +2258,110 @@ pub fn compute_augmentation_env(
     let preload = preload?;
     let injection = injection.expect("injection is Some when preload is Some");
 
-    let existing_node_options = env::var("NODE_OPTIONS").ok().filter(|s| !s.is_empty());
+    let existing_node_options = node_options.filter(|s| !s.is_empty());
 
-    // Build NODE_OPTIONS. Unlike the direct-spawn path (which passes flags as
-    // argv to `node`), scripts run under a shell, so EVERY flag must travel via
-    // NODE_OPTIONS — injected experimental flags, the preload, and webstorage.
-    // Dedupe injected flags against any existing NODE_OPTIONS so we don't emit a
-    // flag the user already set.
-    let inject = flags::compute_inject_flags(
-        node_version.clone(),
-        &[],
-        existing_node_options.as_deref(),
-        false,
-    );
-    let mut node_opts_parts: Vec<String> = inject.iter().map(|f| f.to_string()).collect();
+    // Build NODE_OPTIONS. It carries the PRELOAD and nothing version-gated.
+    //
+    // It also carries `flags::node_options_safe_inject_flags` — today only
+    // `--enable-source-maps`, which exists from Node 12.12 and so cannot abort any
+    // descendant in nub's supported range. Nothing else.
+    //
+    // `--experimental-webstorage` was the last version-gated token on this inherited
+    // channel and is no longer on it. Its 22.4 floor is above nub's 18.19 support
+    // floor, so a descendant below 22.4 aborted on it, and that was reachable rather
+    // than theoretical: nub injects it whenever the HOST is in the 22.4-24 band, and
+    // Electron 34 embeds Node 20.18.1 while Electron 28 embeds 18.18.2 (Electron 35 is
+    // the first to clear 22.4, at 22.14.0) — so a host on the 22.4-24 LTS band running
+    // Electron <= 34 hit exactly this. `strip_unsupported_node_options` never covered
+    // it: that is applied only to the INHERITED string, never to nub's own freshly
+    // pushed tokens. Issue #7 was the same flag reaching an older child (a nested
+    // `.nvmrc` inside node_modules), and it was closed by the node_modules pin guard
+    // and `strip_unsupported_node_options` rather than by taking the flag off this
+    // channel; taking it off is what finally removed the class.
+    //
+    // The invariant to preserve: a token belongs here ONLY if its floor is at or below
+    // nub's 18.19 support floor. Anything version-gated goes on argv. This function
+    // now satisfies it with no exceptions — note that is STRICTER than `spawn_node`'s
+    // NODE_OPTIONS, which deliberately keeps `--test-coverage-exclude` (floor 22.5)
+    // because that token has to share a channel with the preload. Do not assume the
+    // two sets match.
+    //
+    // WHY NOT THE FEATURE FLAGS. `NODE_OPTIONS` is inherited by the ENTIRE process
+    // subtree, and nub's flag set is matched to the version of the Node it resolved
+    // — the HOST Node. Any descendant running an OLDER Node then aborts at startup
+    // with exit 9, because Node rejects an unknown flag there outright. Electron is
+    // the case that matters in practice: Electron 42 embeds Node 24.17, so a host on
+    // Node 26.5 fed it `--experimental-import-text` and a host on 26.3 fed it
+    // `--experimental-ffi`, and `nub run dev` / `nub exec electron` died on both
+    // (measured; #246 is the same family, caught earlier only in its V8-snapshot
+    // SIGTRAP form). Probing the child cannot fix it either — nub spawns a SHELL
+    // here, and the Electron that breaks is two levels down, spawned by absolute
+    // path by a tool nub never sees.
+    //
+    // Those flags are also REDUNDANT on this path. A script that runs `node` hits
+    // nub's PATH shim, re-enters nub, and reaches `spawn_node`, which passes the
+    // very same set on ARGV — where it reaches only that process and nothing below
+    // it. So dropping them here costs coverage in exactly one case: a tool that
+    // spawns Node by absolute path (`process.execPath`) rather than by name, which
+    // bypasses the shim and now gets the preload without the feature flags.
+    // Accepted deliberately: the preload is what carries transpilation and the
+    // polyfills, `--require` is accepted by every Node ever, and it self-disables
+    // inside Electron.
+    let mut node_opts_parts: Vec<String> =
+        flags::node_options_safe_inject_flags(&node_version, &[], existing_node_options.as_deref())
+            .into_iter()
+            .map(str::to_string)
+            .collect();
     // Yarn PnP `--require <.pnp.cjs>` BEFORE nub's preload token so PnP's
     // resolver installs first in script-runner child shells too. Quoted: a
     // `.pnp.cjs` under a spacey project path would otherwise fragment.
+    // The threadpool sidecar ahead of PnP, as at the direct-spawn site.
+    if let Some(token) = injection.sidecar_token() {
+        node_opts_parts.push(token);
+    }
     if let Some(pnp) = pnp {
         node_opts_parts.push(format!(
             "--require={}",
-            node_options_quote(&pnp.display().to_string())
+            node_options_token(&pnp.display().to_string())
         ));
     }
     node_opts_parts.push(injection.node_options_token());
-    // Web Storage (mirrors `spawn_node`): always inject
-    // `--experimental-webstorage` on the flag-needed band (22.4–24.x) so a
-    // script-run child shell's `node` has `sessionStorage` out of the box, with no
-    // `--localstorage-file` opt-in required. nub never synthesizes
-    // `--localstorage-file`. (Scripts have no argv here — the only user channel is
-    // NODE_OPTIONS.) Guarded against double-add / a user
-    // `--no-experimental-webstorage` disable.
-    if should_inject_webstorage_flag(&node_version, &[], existing_node_options.as_deref()) {
-        node_opts_parts.push("--experimental-webstorage".to_string());
-    }
+    // Quoted for the same reason as the direct-spawn site: the CLI validator lets a
+    // double quote through, and an unmatched one aborts Node's NODE_OPTIONS parse.
+    node_opts_parts.extend(
+        runtime_node_options
+            .iter()
+            .map(|opt| node_option_token(opt)),
+    );
+    // Web Storage is deliberately NOT pushed here (mirrors `spawn_node`). This env
+    // is inherited by the whole script subtree, and the flag's 22.4 floor is above
+    // nub's 18.19 support floor, so a descendant on an older Node aborted on it. A
+    // script's `node` still gets it: that invocation goes through the PATH shim into
+    // `spawn_node`, which puts it on that process's own argv. The cost is the same one
+    // the version-gated feature flags already pay — a script that launches Node by
+    // ABSOLUTE PATH bypasses the shim and so gets the preload without the flag.
+    //
+    // The neutralize signal below still IS set here. It is a plain `__NUB_*` env var
+    // that no Node parses as a flag, so it cannot abort anything at any version; it
+    // seeds the subtree for whichever descendants do receive the flag on argv.
+    //
     // localStorage-neutralize decision: compute BEFORE `existing_node_options` is
     // consumed below. Scripts have no argv here — the only user channel is
     // NODE_OPTIONS. Neutralize when nub injects the flag (flag-needed band, no user
     // `--no-experimental-webstorage`) AND the user hasn't opted into persistence via
     // `--localstorage-file`.
-    let neutralize_localstorage =
-        should_neutralize_localstorage(&node_version, &[], existing_node_options.as_deref());
+    let neutralize_localstorage = flags::should_neutralize_experimental_webstorage_localstorage(
+        &node_version,
+        &[],
+        existing_node_options.as_deref(),
+    );
     if let Some(existing) = existing_node_options {
         // Snip below-floor version-gated flags out of the inherited NODE_OPTIONS
         // before appending (mirror of the direct-spawn site above) — a gated flag
         // the child Node can't parse otherwise aborts it with exit 9. See
         // flags::strip_unsupported_node_options.
+        // Same fold as the main spawn path — see split_inherited_preloads.
+        let (existing, _, _) = split_inherited_preloads(&existing);
         let stripped = flags::strip_unsupported_node_options(&existing, &node_version);
         if !stripped.is_empty() {
             node_opts_parts.push(stripped);
@@ -1028,6 +2389,7 @@ pub fn compute_augmentation_env(
         shim_dir,
         node_path: vendored_node_path(Some(&preload)),
         neutralize_localstorage,
+        threadpool_size: threadpool_size_to_install(),
     })
 }
 
@@ -1039,16 +2401,61 @@ pub struct AugmentationEnv {
     pub shim_dir: Option<String>,
     /// NODE_PATH so CJS `require()` of the transpile's vendored helper deps
     /// resolves from an installed package (A30). `None` in dev / when absent.
-    pub node_path: Option<std::ffi::OsString>,
+    pub node_path: Option<OsString>,
     /// Whether to set the internal `__NUB_NEUTRALIZE_LOCALSTORAGE` env var on the
     /// child so nub's preload replaces the throwing `localStorage` getter with
     /// `undefined` (the flag-needed band, no user `--localstorage-file`). Consumers
     /// apply it via [`AugmentationEnv::apply_localstorage_env`]. See
-    /// `should_neutralize_localstorage`.
+    /// `flags::should_neutralize_experimental_webstorage_localstorage`.
     pub neutralize_localstorage: bool,
+    /// The libuv threadpool size to install — `Some` unless the user already set
+    /// [`THREADPOOL_SIZE_ENV`]. Consumers apply it via
+    /// [`AugmentationEnv::apply_threadpool_size`].
+    pub threadpool_size: Option<String>,
 }
 
 impl AugmentationEnv {
+    /// Install the threadpool size (when nub owns it) together with its ownership
+    /// marker, so a compat boundary removes exactly what nub added.
+    pub fn apply_threadpool_size(&self, mut set_env: impl FnMut(&str, &OsStr)) {
+        if let Some(size) = &self.threadpool_size {
+            set_env(THREADPOOL_SIZE_ENV, OsStr::new(size));
+            apply_expected_augmentation_marker(
+                THREADPOOL_SIZE_ENV,
+                Some(OsStr::new(size)),
+                &mut set_env,
+            );
+        }
+    }
+
+    /// Preserve the environment that a later compat-mode PATH-shim re-entry must
+    /// restore before it launches plain Node. A separate presence bitmask keeps
+    /// an explicitly empty value distinct from an absent variable.
+    pub fn apply_restore_markers(&self, mut set_env: impl FnMut(&str, &OsStr)) {
+        apply_augmentation_restore_markers(&mut set_env);
+        let ambient_node_options = env::var_os("NODE_OPTIONS");
+        let ambient_node_path = env::var_os("NODE_PATH");
+        let ambient_compile_cache = env::var_os("NODE_COMPILE_CACHE");
+        // NODE and PATH are the caller's to stamp: the script launchers compose
+        // them after this call, so only they know the final value.
+        for (name, expected) in [
+            (
+                "NODE_OPTIONS",
+                self.node_options
+                    .as_ref()
+                    .map(|value| value.as_ref())
+                    .or(ambient_node_options.as_deref()),
+            ),
+            (
+                "NODE_PATH",
+                self.node_path.as_deref().or(ambient_node_path.as_deref()),
+            ),
+            ("NODE_COMPILE_CACHE", ambient_compile_cache.as_deref()),
+        ] {
+            apply_expected_augmentation_marker(name, expected, &mut set_env);
+        }
+    }
+
     /// The PATH-shim's `node` entry (a symlink/hardlink → nub), suitable as the
     /// `$NODE` value that npm/pnpm set so userland `$NODE child.js` (and
     /// `spawn(process.env.NODE, …)`) invoke "the same Node this script runs under."
@@ -1067,11 +2474,11 @@ impl AugmentationEnv {
     /// the minimal `env`-setting shape they share.
     pub fn apply_localstorage_env(&self, set_env: impl FnOnce(&str, &str)) {
         if self.neutralize_localstorage {
-            set_env(NEUTRALIZE_LOCALSTORAGE_ENV, "1");
+            set_env(flags::NEUTRALIZE_LOCALSTORAGE_ENV, "1");
         }
     }
 
-    pub fn node_shim_exe(&self) -> Option<std::ffi::OsString> {
+    pub fn node_shim_exe(&self) -> Option<OsString> {
         self.shim_dir.as_deref().map(|dir| {
             #[cfg(windows)]
             let name = "node.exe";
@@ -1113,83 +2520,632 @@ fn is_permission_flag(arg: &str) -> bool {
     PERMISSION_FLAGS.contains(&token)
 }
 
-/// Whether the user already supplied the `--experimental-webstorage` flag in
-/// either polarity (`--experimental-webstorage` or `--no-experimental-webstorage`)
-/// via argv or NODE_OPTIONS. When true, nub must NOT add its own
-/// `--experimental-webstorage`: a duplicate positive is redundant, and overriding a
-/// user's explicit `--no-experimental-webstorage` would defeat their disable
-/// (and nub never re-enables over a user negation). Pure over its inputs.
-fn user_has_webstorage_flag(user_args: &[String], node_options: Option<&str>) -> bool {
-    let is_ws = |t: &str| t == "--experimental-webstorage" || t == "--no-experimental-webstorage";
-    let in_argv = user_args.iter().any(|a| is_ws(a));
-    let in_opts = node_options
-        .map(|o| o.split_whitespace().any(is_ws))
-        .unwrap_or(false);
-    in_argv || in_opts
+/// Carries the running binary's version (`env!("CARGO_PKG_VERSION")`) to the
+/// preload, which publishes it as `process.versions.nub` — the universal
+/// `process.versions.<runtime>` self-identification marker (cf. `.bun`,
+/// `.electron`) that lets tooling detect "running under nub". Set only inside the
+/// augment block, coupled to preload injection: under `--node`/`NODE_COMPAT` no
+/// preload runs and the var is unset, so the marker is correctly absent (plain
+/// Node). An internal `__NUB_*` plumbing var, NOT a user knob — explicitly
+/// permitted by the brand boundary. Unlike the localStorage signal it is NOT
+/// deleted by the preload, so it inherits into augmented descendants (which run
+/// the same preload via NODE_OPTIONS) and they advertise the marker too.
+const VERSION_ENV: &str = "__NUB_VERSION";
+
+/// Carries the resolved `nub.jsonc` runtime snapshot (preloads, loaders,
+/// TypeScript transforms, and the selected tsconfig) to the runtime as JSON.
+/// Resolved ONCE by the Rust frontend after the final
+/// cwd is known and transported unchanged through nested shim launches, so every
+/// process in a run transpiles against the same config. Internal plumbing, not a
+/// user knob — and denylisted from `.env` sources, since a repo-supplied value
+/// would rewrite the code nub transpiles.
+pub const RUNTIME_CONFIG_ENV: &str = "__NUB_RUNTIME_CONFIG";
+
+/// Tells nub's fast-tier preload to register its module hooks via the ASYNC
+/// loader-worker path (`module.register`) instead of the sync
+/// `module.registerHooks`, even on a Node that supports the sync fast tier. Set
+/// only when nub is about to host a FOREIGN async `module.register` loader
+/// (tsx/ts-node) on a Node whose sync/async hook composition is broken
+/// ([`node_hook_compose_broken`]). Inherited by the whole augmented subtree
+/// (like [`VERSION_ENV`]) so every child in a tsx run composes async. An internal
+/// `__NUB_*` plumbing var, NOT a user knob — explicitly permitted by the brand
+/// boundary.
+const FORCE_ASYNC_TIER_ENV: &str = "__NUB_FORCE_ASYNC_TIER";
+
+/// Carries a compat launch to the bare `node` descendants that continue it. A
+/// compat child keeps whatever PATH it inherited, which can still hold a Nub
+/// shim from an outer invocation; a `node` that lands there reads this and stays
+/// vanilla ([`inherits_compat_launch`]).
+///
+/// Deliberately NOT the public `NODE_COMPAT`. That variable is the user's
+/// tree-wide opt-out and every Nub entry point honors it, so stamping it made a
+/// compat launch the user never asked to persist (a plain `node` through the
+/// persistent shim, a `--node` run) switch off a later `nub file.ts` in the same
+/// tree. This marker is read on the `node` continuation path only and is dropped
+/// at the fresh-invocation boundary with the rest of the parent's state.
+pub const COMPAT_LAUNCH_ENV: &str = "__NUB_NODE_COMPAT";
+
+/// Whether this process descends from a compat launch that no fresh Nub
+/// invocation has superseded. Meaningful only on the `node` shim path: every
+/// other entry point clears [`COMPAT_LAUNCH_ENV`] before reading anything.
+pub fn inherits_compat_launch() -> bool {
+    env::var_os(COMPAT_LAUNCH_ENV).is_some_and(|value| value == "1")
 }
 
-/// Whether nub should inject `--experimental-webstorage` for this invocation
-/// (the maintainer, 2026-06-15: "a flag that we inject no matter what"). True iff the Node
-/// version is on the flag-needed band (22.4 through <25, where the flag both EXISTS
-/// and is still REQUIRED) AND the user hasn't already supplied the flag in either
-/// polarity. The inject is UNCONDITIONAL on the band — it does not depend on any
-/// `--localstorage-file` opt-in — so `sessionStorage` works out of the box; it
-/// installs the `localStorage` getter too (which throws on access until the user
-/// supplies their own `--localstorage-file`; nub never synthesizes one). Below 22.4
-/// the flag is a "bad option" startup crash; on 25+ Web Storage is native so the
-/// flag is unnecessary. Pure over its inputs for testability.
-fn should_inject_webstorage_flag(
+/// The presence bitmask stamped alongside the `__NUB_COMPAT_*` capture, so a
+/// variable captured EMPTY stays distinguishable from one that was absent.
+const COMPAT_PRESENT_ENV: &str = "__NUB_COMPAT_PRESENT";
+
+/// An environment variable nub rewrites when it augments a child, together with
+/// the wire vars a descendant needs to undo that rewrite:
+///
+/// - `compat` — the value the variable held before the OUTERMOST augmentation.
+///   A compat re-entry or a fresh nested invocation restores it.
+/// - `augmented` / `augmented_present` — the exact value nub installed, so a
+///   later `.env` or script mutation stays distinguishable from an untouched
+///   parent-owned value and survives the boundary.
+/// - `bit` — this variable's slot in the [`COMPAT_PRESENT_ENV`] mask.
+struct RestorableVar {
+    name: &'static str,
+    compat: &'static str,
+    augmented: &'static str,
+    augmented_present: &'static str,
+    bit: u8,
+}
+
+impl RestorableVar {
+    fn lookup(name: &str) -> Option<&'static Self> {
+        RESTORABLE_VARS.iter().find(|var| var.name == name)
+    }
+
+    fn was_present(&self, presence_mask: u8) -> bool {
+        presence_mask & self.bit != 0
+    }
+}
+
+/// PATH is the odd one out: nub COMPOSES it (`shim:.bin:system`) rather than
+/// replacing it, so it gets its own restore rule ([`restored_path`]).
+static RESTORABLE_VARS: [RestorableVar; 6] = [
+    RestorableVar {
+        name: "NODE_OPTIONS",
+        compat: "__NUB_COMPAT_NODE_OPTIONS",
+        augmented: "__NUB_AUGMENTED_NODE_OPTIONS",
+        augmented_present: "__NUB_AUGMENTED_NODE_OPTIONS_PRESENT",
+        bit: 1 << 0,
+    },
+    RestorableVar {
+        name: "NODE_PATH",
+        compat: "__NUB_COMPAT_NODE_PATH",
+        augmented: "__NUB_AUGMENTED_NODE_PATH",
+        augmented_present: "__NUB_AUGMENTED_NODE_PATH_PRESENT",
+        bit: 1 << 1,
+    },
+    RestorableVar {
+        name: "NODE",
+        compat: "__NUB_COMPAT_NODE",
+        augmented: "__NUB_AUGMENTED_NODE",
+        augmented_present: "__NUB_AUGMENTED_NODE_PRESENT",
+        bit: 1 << 2,
+    },
+    RestorableVar {
+        name: "NODE_COMPILE_CACHE",
+        compat: "__NUB_COMPAT_NODE_COMPILE_CACHE",
+        augmented: "__NUB_AUGMENTED_NODE_COMPILE_CACHE",
+        augmented_present: "__NUB_AUGMENTED_NODE_COMPILE_CACHE_PRESENT",
+        bit: 1 << 3,
+    },
+    RestorableVar {
+        name: "PATH",
+        compat: "__NUB_COMPAT_PATH",
+        augmented: "__NUB_AUGMENTED_PATH",
+        augmented_present: "__NUB_AUGMENTED_PATH_PRESENT",
+        bit: 1 << 4,
+    },
+    RestorableVar {
+        name: THREADPOOL_SIZE_ENV,
+        compat: "__NUB_COMPAT_UV_THREADPOOL_SIZE",
+        augmented: "__NUB_AUGMENTED_UV_THREADPOOL_SIZE",
+        augmented_present: "__NUB_AUGMENTED_UV_THREADPOOL_SIZE_PRESENT",
+        // Read by the preload too (preload-common.cjs THREADPOOL_PRESENT_BIT): a
+        // value nub introduced, and only that, is stripped from `process.env`.
+        bit: 1 << 5,
+    },
+];
+
+/// libuv's threadpool size, which Node reads ONCE at startup and never from
+/// `process.env` afterwards — so the spawn is the only place it can be set.
+///
+/// Node leaves libuv's default of 4 threads regardless of core count, and every
+/// `fs` call, `dns.lookup` (so every `fetch` to a new host), async `zlib` and async
+/// `crypto` (`pbkdf2`, `scrypt`, `randomBytes`) queues on those four. The Node
+/// performance team's open proposal (nodejs/performance#193) is exactly
+/// `max(4, cores)`; nub applies it. Measured on an 8-core box, Node 22.23.2, 4 → 8
+/// threads: pbkdf2 route +21–26% req/s, 400 concurrent `dns.lookup` 99 → 55 ms;
+/// main-thread-bound routes (gzip, file read) unchanged, 16 threads no better than
+/// 8. Cores come from `std::thread::available_parallelism`, which honors a cgroup
+/// CPU quota, so a container gets its quota, not the host's count.
+///
+/// A `UV_THREADPOOL_SIZE` the user set, in the shell or in an env file, is never
+/// overwritten. The shell case is the plain absence check below; the env-file
+/// case needs [`threadpool_size_is_nub_default`], because the launcher that
+/// installed nub's value never saw the file and a nested boundary (`nub run`'s
+/// script re-entering through the `node` shim, `nub watch` handing Node its
+/// `--env-file`) would otherwise read that value as the user's shell value. The
+/// variable is restorable, so a compat re-entry (`--node`, `NODE_COMPAT`) or a
+/// fresh nested nub sees the pre-augmentation environment.
+/// Every augmented launcher applies it: the direct spawn here, and `nub run`,
+/// `nubx`/`exec`, lifecycle scripts and `nub watch` through
+/// [`AugmentationEnv::apply_threadpool_size`] or its equivalent.
+///
+/// The value is for the process it is handed to. Node's own maintainers closed
+/// the same default (nodejs/node#61533) because the cores a host shows are not
+/// necessarily free, so the preload (`installThreadpoolPolicy`, preload-common.cjs)
+/// deletes nub's own value from `process.env` once Node has read it — a cluster or
+/// PM2 fork and any child spawn start with Node's default, a `nub` child is sized
+/// again — and on Linux runs the workers beyond Node's four at nice 10, so on a
+/// busy box they only take idle cycles. Windows is capped at
+/// [`WINDOWS_THREADPOOL_CAP`] threads.
+///
+/// libuv creates the WHOLE pool on first use and aborts the process if one
+/// thread fails (`uv_thread_create_ex` → `abort()` in threadpool.c), and
+/// `available_parallelism` knows nothing of a cgroup `pids.max` or
+/// `RLIMIT_NPROC`. So the value is clamped by [`crate::resource_limits::spawn_headroom`],
+/// the same detector that keeps the package manager's pools under a
+/// constrained box's ceiling.
+pub const THREADPOOL_SIZE_ENV: &str = "UV_THREADPOOL_SIZE";
+
+/// Set by the preload of a process whose pool is not built yet (preload-common.cjs
+/// `installThreadpoolPolicy`, which builds it at the first loop turn so the program
+/// can still choose its own size): a child spawned before then inherits nub's value
+/// beside this mark and deletes it, keeping Node's default. Every fresh invocation
+/// sheds it with the other markers, so a nested `nub` sizes its child again.
+const THREADPOOL_TAKEN_ENV: &str = "__NUB_UV_THREADPOOL_SIZE_TAKEN";
+
+/// The pool nub asks for on this box — see [`THREADPOOL_SIZE_ENV`].
+pub fn threadpool_size() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    threadpool_size_from(cores, crate::resource_limits::spawn_headroom())
+}
+
+/// The most threads nub asks for on Windows. libuv gives every pool thread an 8 MB
+/// stack, and Windows passes that to `_beginthreadex` as the COMMIT size (Linux
+/// and macOS reserve it and touch it lazily), so a 32-core box would commit 256 MB
+/// the moment any fs, dns or crypto call starts the pool (nodejs/node#57911
+/// measured about 8 MB per thread). Eight threads is 64 MB.
+const WINDOWS_THREADPOOL_CAP: usize = 8;
+
+/// `max(4, cores)`, clamped to the detected thread headroom and never below
+/// libuv's own default of 4 (where plain Node would abort just the same).
+pub fn threadpool_size_from(cores: usize, headroom: Option<usize>) -> usize {
+    threadpool_size_from_on(cores, headroom, cfg!(windows))
+}
+
+/// [`threadpool_size_from`] with the platform explicit, for the cap test.
+fn threadpool_size_from_on(cores: usize, headroom: Option<usize>, windows: bool) -> usize {
+    let mut wanted = cores.max(4);
+    if windows {
+        wanted = wanted.min(WINDOWS_THREADPOOL_CAP);
+    }
+    match headroom {
+        Some(room) if room < wanted => room.max(4),
+        _ => wanted,
+    }
+}
+
+/// Whether the ambient [`THREADPOOL_SIZE_ENV`] is nub's own automatic value
+/// rather than the user's: present, and equal to the ownership marker the
+/// installing launcher stamped beside it. An env file may still set the pool
+/// size over such a value; over a shell value it may not. The preload
+/// (`installThreadpoolPolicy` in preload-common.cjs) decides what to strip from
+/// `process.env` with the same marker plus the compat presence bit, because the
+/// direct spawn records a passed-through shell value under the same marker.
+pub fn threadpool_size_is_nub_default() -> bool {
+    let Some(current) = env::var_os(THREADPOOL_SIZE_ENV) else {
+        return false;
+    };
+    let Some(var) = RestorableVar::lookup(THREADPOOL_SIZE_ENV) else {
+        return false;
+    };
+    matches!(expected_augmentation_value(var), Some(Some(expected)) if expected == current)
+}
+
+/// The threadpool value an augmented launcher installs: `Some` when the user
+/// has not set [`THREADPOOL_SIZE_ENV`], `None` to leave theirs alone.
+fn threadpool_size_to_install() -> Option<String> {
+    env::var_os(THREADPOOL_SIZE_ENV)
+        .is_none()
+        .then(|| threadpool_size().to_string())
+}
+
+/// Stamp the exact value a parent installed for one rewritten environment
+/// variable. A fresh child restores the captured ambient value only while the
+/// current value still matches this ownership marker; user replacements win.
+/// Names outside [`RESTORABLE_VARS`] carry no marker and are ignored.
+pub fn apply_expected_augmentation_marker(
+    name: &str,
+    value: Option<&OsStr>,
+    mut set_env: impl FnMut(&str, &OsStr),
+) {
+    let Some(var) = RestorableVar::lookup(name) else {
+        return;
+    };
+    set_env(var.augmented, value.unwrap_or_else(|| OsStr::new("")));
+    set_env(
+        var.augmented_present,
+        OsStr::new(if value.is_some() { "1" } else { "0" }),
+    );
+}
+
+/// [`apply_expected_augmentation_marker`] for the common case of stamping the
+/// marker onto a child `Command`.
+fn mark_augmented(cmd: &mut Command, name: &str, value: Option<&OsStr>) {
+    apply_expected_augmentation_marker(name, value, |key, value| {
+        cmd.env(key, value);
+    });
+}
+
+fn decode_expected_augmentation_value(
+    value: Option<OsString>,
+    present: Option<&str>,
+) -> Option<Option<OsString>> {
+    match present {
+        Some("1") => Some(Some(value.unwrap_or_default())),
+        Some("0") => Some(None),
+        _ => None,
+    }
+}
+
+fn expected_augmentation_value(var: &RestorableVar) -> Option<Option<OsString>> {
+    let present = env::var(var.augmented_present).ok();
+    decode_expected_augmentation_value(env::var_os(var.augmented), present.as_deref())
+}
+
+fn inherited_presence_mask() -> u8 {
+    env::var(COMPAT_PRESENT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(0)
+}
+
+/// The pre-augmentation value to carry forward for `var`: an outer nub's capture
+/// if there is one, otherwise this process's current value.
+fn compat_restore_value(var: &RestorableVar, inherited_presence: u8) -> (OsString, bool) {
+    if let Some(captured) = env::var_os(var.compat) {
+        (captured, var.was_present(inherited_presence))
+    } else if let Some(current) = env::var_os(var.name) {
+        (current, true)
+    } else {
+        (OsString::new(), false)
+    }
+}
+
+/// Stamp the pre-augmentation environment onto a child. The snapshot serves two
+/// exits: `NODE_COMPAT` restores plain Node, while an explicitly nested
+/// `nub`/`nubx`/PM shim restores a fresh user invocation before discovering its
+/// own config.
+pub fn apply_augmentation_restore_markers(mut set_env: impl FnMut(&str, &OsStr)) {
+    let inherited_presence = inherited_presence_mask();
+    let mut presence = 0;
+    for var in &RESTORABLE_VARS {
+        let (value, present) = compat_restore_value(var, inherited_presence);
+        if present {
+            presence |= var.bit;
+        }
+        set_env(var.compat, &value);
+    }
+    set_env(COMPAT_PRESENT_ENV, OsStr::new(&presence.to_string()));
+}
+
+/// Decide whether and how to remove a parent's NODE_OPTIONS augmentation.
+///
+/// `None` means preserve the current user-replaced value. `Some(value)` applies
+/// the change, where the inner `None` removes the variable. The common mutation
+/// shape (`NODE_OPTIONS="$NODE_OPTIONS …"` or the prepend equivalent) retains
+/// the user's addition by replacing the exact parent-produced substring with the
+/// captured ambient value.
+fn restored_node_options(
+    current: Option<&OsStr>,
+    expected: Option<Option<&OsStr>>,
+    original: OsString,
+    original_present: bool,
+) -> Option<Option<OsString>> {
+    // No ownership marker at all: a legacy parent, whose value is not ours to touch.
+    let expected = expected?;
+    if current == expected {
+        return Some(original_present.then_some(original));
+    }
+    // The parent installed nothing, so there is no substring of ours to splice out.
+    let expected = expected?;
+    let (current, expected) = (current?.to_str()?, expected.to_str()?);
+    if expected.is_empty() || !current.contains(expected) {
+        return None;
+    }
+    let preserved = current.replacen(expected, original.to_str()?, 1);
+    let preserved = preserved.trim();
+    Some((!preserved.is_empty()).then(|| OsString::from(preserved)))
+}
+
+/// PATH's restore rule. An untouched marker means nub owned the whole value, so
+/// the capture goes back verbatim. Any other shape means a launcher composed
+/// `shim:.bin:system` or the user appended to it, so only nub's own shim
+/// component is dropped and every other entry survives.
+fn restored_path(
+    current: Option<OsString>,
+    expected: Option<Option<OsString>>,
+    original: OsString,
+    original_present: bool,
+) -> Option<Option<OsString>> {
+    if expected.is_some_and(|expected| current == expected) {
+        return Some(original_present.then_some(original));
+    }
+    let current = current?;
+    match remove_parent_shim_from_path(&current, &original)? {
+        Ok(path) => Some(Some(path)),
+        Err(e) => {
+            eprintln!(
+                "nub: could not remove the compat shim from PATH ({e}); \
+                 a bare `node` run from this process may re-enter nub"
+            );
+            None
+        }
+    }
+}
+
+/// One restoration's stable identity for the randomized parent PATH shim.
+/// Most PATH entries cannot be a Nub shim, so [`Self::matches`] rejects them by
+/// basename before opening or canonicalizing anything. Windows prepares the
+/// reference identity once so paths that cannot be canonicalized still compare
+/// without repeated I/O over unrelated or unreachable PATH entries.
+struct ShimPathMatcher {
+    component: OsString,
+    #[cfg(windows)]
+    identity: Option<FileHandle>,
+    #[cfg(windows)]
+    canonical: Option<PathBuf>,
+    #[cfg(windows)]
+    normalized: String,
+}
+
+impl ShimPathMatcher {
+    fn new(component: &OsStr) -> Self {
+        #[cfg(windows)]
+        let path = Path::new(component);
+        Self {
+            component: component.to_os_string(),
+            #[cfg(windows)]
+            identity: FileHandle::from_path(path).ok(),
+            #[cfg(windows)]
+            canonical: path.canonicalize().ok(),
+            #[cfg(windows)]
+            normalized: path.as_os_str().to_string_lossy().replace('/', "\\"),
+        }
+    }
+
+    fn matches(&self, entry: &Path) -> bool {
+        if entry.as_os_str() == self.component.as_os_str() {
+            return true;
+        }
+        if !is_path_shim_candidate(entry) {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            // Windows canonicalization can fail outright for real directories:
+            // an SMB component the user cannot list, a volume without a drive
+            // letter, or a mount outside the Mount Manager. Compare stable file
+            // identity first, then canonical paths, with a textual fallback.
+            if let (Some(component), Ok(entry)) = (&self.identity, FileHandle::from_path(entry))
+                && &entry == component
+            {
+                return true;
+            }
+            if let (Some(component), Ok(entry)) = (&self.canonical, entry.canonicalize())
+                && entry.as_path() == component.as_path()
+            {
+                return true;
+            }
+            entry
+                .as_os_str()
+                .to_string_lossy()
+                .replace('/', "\\")
+                .eq_ignore_ascii_case(&self.normalized)
+        }
+        #[cfg(not(windows))]
+        false
+    }
+}
+
+/// Whether `path` names a per-invocation shim directory. `pub(crate)` because
+/// discovery filters the same directories out of PATH, and a second prefix
+/// matcher living there could disagree with this one about a Windows case
+/// variant — which is the whole reason the Windows arm below exists.
+pub(crate) fn is_path_shim_candidate(path: &Path) -> bool {
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    let file_name = file_name.to_string_lossy();
+    #[cfg(windows)]
+    {
+        file_name
+            .get(..PATH_SHIM_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PATH_SHIM_PREFIX))
+    }
+    #[cfg(not(windows))]
+    {
+        file_name.starts_with(PATH_SHIM_PREFIX)
+    }
+}
+
+/// `None` when the current PATH carries no parent-owned shim and needs no edit.
+fn remove_parent_shim_from_path(
+    current: &OsStr,
+    original: &OsStr,
+) -> Option<std::result::Result<OsString, env::JoinPathsError>> {
+    // The parent captures PATH before adding its randomized shim. Compare the
+    // current candidate shims to that snapshot instead of depending on a
+    // separately captured spelling of the added directory. Preparing only the
+    // original shim identities keeps pre-existing unrelated Nub shims while the
+    // new candidate is the parent-owned augmentation to remove.
+    let original_shims = env::split_paths(original)
+        .filter(|entry| is_path_shim_candidate(entry))
+        .map(|entry| ShimPathMatcher::new(entry.as_os_str()))
+        .collect::<Vec<_>>();
+    let mut removed = false;
+    let filtered = env::split_paths(current)
+        .filter(|entry| {
+            if !is_path_shim_candidate(entry) {
+                return true;
+            }
+            let inherited = original_shims.iter().any(|matcher| matcher.matches(entry));
+            removed |= !inherited;
+            inherited
+        })
+        .collect::<Vec<_>>();
+    removed.then(|| env::join_paths(filtered))
+}
+
+/// The env edits that shed a parent's augmentation, as `(name, value)` pairs
+/// where `None` removes the variable. Each restorable variable contributes its
+/// restored value (when the ownership markers say the parent still owns it) plus
+/// the removal of its own wire vars, so the boundary leaves nothing behind.
+fn augmentation_environment_restoration() -> Vec<(&'static str, Option<OsString>)> {
+    let presence_mask = inherited_presence_mask();
+    let mut changes = Vec::new();
+
+    for var in &RESTORABLE_VARS {
+        if let Some(original) = env::var_os(var.compat) {
+            let present = var.was_present(presence_mask);
+            let current = env::var_os(var.name);
+            let expected = expected_augmentation_value(var);
+            let restored = match var.name {
+                "NODE_OPTIONS" => restored_node_options(
+                    current.as_deref(),
+                    expected.as_ref().map(|expected| expected.as_deref()),
+                    original,
+                    present,
+                ),
+                "PATH" => restored_path(current, expected, original, present),
+                // Replaced outright, so the marker settles ownership on its own:
+                // restore only while the installed value is untouched. A later
+                // `.env` or script mutation is the user's and must survive.
+                _ => expected
+                    .is_none_or(|expected| current == expected)
+                    .then(|| present.then_some(original)),
+            };
+            if let Some(value) = restored {
+                changes.push((var.name, value));
+            }
+        }
+        changes.extend([
+            (var.compat, None),
+            (var.augmented, None),
+            (var.augmented_present, None),
+        ]);
+    }
+
+    for marker in [
+        COMPAT_PRESENT_ENV,
+        COMPAT_LAUNCH_ENV,
+        RUNTIME_CONFIG_ENV,
+        VERSION_ENV,
+        flags::NEUTRALIZE_LOCALSTORAGE_ENV,
+        FORCE_ASYNC_TIER_ENV,
+        THREADPOOL_TAKEN_ENV,
+    ] {
+        changes.push((marker, None));
+    }
+    changes
+}
+
+fn restore_compat_environment(cmd: &mut Command) {
+    for (name, value) in augmentation_environment_restoration() {
+        match value {
+            Some(value) => {
+                cmd.env(name, value);
+            }
+            None => {
+                cmd.env_remove(name);
+            }
+        }
+    }
+}
+
+/// Restore the ambient environment captured before a parent Nub installed its
+/// augmentation. Call this for a fresh nested Nub-family user invocation, never
+/// for the `node` PATH shim (which continues the parent's logical invocation).
+///
+/// # Safety
+///
+/// Process-environment mutation is safe only before any other thread can read
+/// or write it. The Nub binary calls this as its first action in `main`.
+pub unsafe fn restore_fresh_invocation_environment() {
+    for (name, value) in augmentation_environment_restoration() {
+        match value {
+            Some(value) => {
+                // SAFETY: upheld by this function's caller.
+                unsafe { env::set_var(name, value) };
+            }
+            None => {
+                // SAFETY: upheld by this function's caller.
+                unsafe { env::remove_var(name) };
+            }
+        }
+    }
+}
+
+/// Node versions where the async `module.register` loader's `resolveSync`/
+/// `loadSync` are unimplemented stubs that throw `ERR_METHOD_NOT_IMPLEMENTED`.
+/// nub's sync `module.registerHooks` fast tier forces resolution synchronous, so
+/// composing it with a foreign async loader (tsx/ts-node) reaches that throwing
+/// stub and crashes the run. Node implemented these methods in 24.11.1
+/// (block-on-loader-worker), so the broken window is 22.15.0 ..= 24.11.0
+/// inclusive; 24.11.1+/25.2+/26 are fine. Refs nodejs/node#59666. (A later 22.x
+/// that backported the fix would be over-covered here — harmless, since the
+/// async tier composes correctly on every version.)
+// @lat: [[research/registerhooks-coverage-matrix#registerHooks coverage & sync/async-composition matrix (empirical)#Consequences]]
+fn node_hook_compose_broken(v: &super::version::NodeVersion) -> bool {
+    use super::version::NodeVersion;
+    *v >= NodeVersion::new(22, 15, 0) && *v <= NodeVersion::new(24, 11, 0)
+}
+
+/// Whether the child nub is about to launch hosts a FOREIGN async ESM loader — a
+/// tsx/ts-node executable, or an explicit `--import`/`--loader`/
+/// `--experimental-loader` that registers one. Scans ALL tokens (not just
+/// argv[0]) so an env-prefixed/compound script (`NODE_ENV=prod tsx x`) is still
+/// caught; a rare false positive (a literal `echo tsx`) only makes that one
+/// process use nub's async tier, which is always correct — never a crash.
+fn child_hosts_async_loader<'a>(tokens: impl IntoIterator<Item = &'a str>) -> bool {
+    tokens.into_iter().any(|tok| {
+        let flag = tok.split_once('=').map_or(tok, |(f, _)| f);
+        if matches!(flag, "--import" | "--loader" | "--experimental-loader") {
+            return true;
+        }
+        let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+        // Strip the Windows launcher-shim suffixes npm generates (`tsx.cmd`,
+        // `tsx.ps1`, a native `.exe`) so the basename compares as the tool name.
+        let base = base
+            .strip_suffix(".cmd")
+            .or_else(|| base.strip_suffix(".exe"))
+            .or_else(|| base.strip_suffix(".ps1"))
+            .unwrap_or(base);
+        matches!(base, "tsx" | "ts-node" | "ts-node-esm")
+    })
+}
+
+/// The `(key, "1")` env pair that forces nub's async tier for a child that will
+/// host a foreign async loader on a broken-compose Node — or `None` when the
+/// fast tier is safe. Callers set it on the child only when nub is establishing
+/// augmentation (not compat/`--node`, not re-entrant); a re-entrant descendant
+/// inherits the already-set var through the environment.
+pub fn force_async_tier_env<'a>(
     node_version: &super::version::NodeVersion,
-    user_args: &[String],
-    node_options: Option<&str>,
-) -> bool {
-    flags::webstorage_flag_needed(node_version)
-        && !user_has_webstorage_flag(user_args, node_options)
+    child_tokens: impl IntoIterator<Item = &'a str>,
+) -> Option<(&'static str, &'static str)> {
+    (node_hook_compose_broken(node_version) && child_hosts_async_loader(child_tokens))
+        .then_some((FORCE_ASYNC_TIER_ENV, "1"))
 }
-
-/// Whether the user supplied a `--localstorage-file[=<path>]` (in either argv or
-/// NODE_OPTIONS). When true, the user has explicitly opted into persistent
-/// `localStorage`, so nub must NOT neutralize the global — it forwards the file
-/// verbatim and `localStorage` works normally. Matches both the `=`-joined form
-/// (`--localstorage-file=/p`) and the space-separated form (`--localstorage-file /p`),
-/// which appears as a bare `--localstorage-file` token. Pure over its inputs.
-fn user_has_localstorage_file(user_args: &[String], node_options: Option<&str>) -> bool {
-    let is_lsf = |t: &str| t == "--localstorage-file" || t.starts_with("--localstorage-file=");
-    let in_argv = user_args.iter().any(|a| is_lsf(a));
-    let in_opts = node_options
-        .map(|o| o.split_whitespace().any(is_lsf))
-        .unwrap_or(false);
-    in_argv || in_opts
-}
-
-/// Whether nub should NEUTRALIZE the `localStorage` global to read `undefined`
-/// (matching Node 25+'s clean shape) for this invocation (the maintainer, 2026-06-15). True
-/// iff nub is injecting `--experimental-webstorage` on the flag-needed band AND the
-/// user did NOT supply their own `--localstorage-file`. On that band the injected
-/// flag installs a `localStorage` getter that THROWS `ERR_INVALID_ARG_VALUE` on
-/// access (even `typeof localStorage` throws) until a `--localstorage-file` is
-/// supplied — so when the user hasn't opted into persistence, nub replaces that
-/// throwing getter with a plain `undefined` value in its startup preload, leaving
-/// `sessionStorage` (which needs only the flag) fully working and making
-/// `typeof localStorage === "undefined"` feature-detection safe. When the user DOES
-/// pass `--localstorage-file`, this is false — `localStorage` works normally. The
-/// neutralization is signaled to the preload via the internal
-/// `__NUB_NEUTRALIZE_LOCALSTORAGE` env var. Pure over its inputs for testability.
-fn should_neutralize_localstorage(
-    node_version: &super::version::NodeVersion,
-    user_args: &[String],
-    node_options: Option<&str>,
-) -> bool {
-    should_inject_webstorage_flag(node_version, user_args, node_options)
-        && !user_has_localstorage_file(user_args, node_options)
-}
-
-/// Internal env var that tells nub's startup preload to neutralize the
-/// `localStorage` global (replace the throwing getter with `undefined`). An
-/// internal `__NUB_*` plumbing var, NOT a user knob — explicitly permitted by the
-/// brand boundary. The preload deletes it after reading so it does not leak to
-/// grandchild processes.
-pub(crate) const NEUTRALIZE_LOCALSTORAGE_ENV: &str = "__NUB_NEUTRALIZE_LOCALSTORAGE";
 
 /// Whether Node's test-runner coverage is active for this invocation — i.e. the
 /// user passed `--experimental-test-coverage` directly in argv or via NODE_OPTIONS.
@@ -1225,9 +3181,78 @@ fn coverage_active_for_cache(
     coverage_active(user_args, node_options) || node_v8_coverage.is_some_and(|v| !v.is_empty())
 }
 
-/// The `--test-coverage-exclude=<glob>` flag nub injects to keep its own preloaded
-/// runtime modules out of the user's coverage report (R9), or `None` when coverage
-/// isn't active or the runtime dir can't be resolved. The glob is keyed to the
+/// Node's own default coverage exclusion, which it applies ONLY when no
+/// `--test-coverage-exclude` is set at all: `kDefaultPattern` in
+/// `lib/internal/test_runner/utils.js`, reached by the
+/// `coverageExcludeGlobs.length === 0` fallback in `parseCommandLine`. nub's
+/// runtime exclude below is itself a `--test-coverage-exclude`, so injecting it
+/// silently switches that default OFF and folds the user's own `*.test.js` back
+/// into their report. Where the target Node HAS that default — 23.5.0 and up, see
+/// `should_restate_default_coverage_exclude` — the argv site re-states the default
+/// beside the runtime exclude, so the union is Node's default behavior plus nub's
+/// runtime exclusion. The NODE_OPTIONS site deliberately does not (see the comment
+/// there). Below 23.5 Node applies no default at all, and the runtime exclude goes
+/// out alone.
+///
+/// The TypeScript extensions are stated unconditionally where Node appends them
+/// only under `--strip-types` (default-on since 22.18 / 23.6). nub transpiles TS
+/// on every supported Node regardless of that flag, so under nub a `*.test.ts` is
+/// a test file on the whole supported band, not just where stock Node could have
+/// loaded one.
+const NODE_DEFAULT_COVERAGE_EXCLUDE: &str =
+    "**/{test,test/**/*,test-*,*[._-]test}.{js,mjs,cjs,ts,mts,cts}";
+
+/// Whether the USER asked for a specific coverage exclusion, on argv or through an
+/// inherited NODE_OPTIONS. Node drops its default pattern the moment any exclude is
+/// present, so nub must drop it too — re-adding it would hide files the user asked
+/// to see. An ancestor nub's NODE_OPTIONS carries ITS runtime exclude (the same
+/// `<runtime dir>/**` glob this process would inject, `own_runtime_glob`), and
+/// that token is nub's, not the user's. It reaches here when the ancestor's
+/// preload token no longer matches ours byte-for-byte — re-quoted in transit by a
+/// tool that re-emits NODE_OPTIONS, or a different tier's preload — so the raw
+/// `contains` re-entrancy check misses and this process injects again; without
+/// the subtraction the default would be dropped and the report would list the
+/// test files. (An exact match is re-entrant and injects nothing at all.)
+///
+/// The comparison is on the token's VALUE after `split_node_options`, not on the
+/// raw string: an inherited token is re-emitted through `node_options_token` as
+/// a whole (see `split_inherited_preloads`), which moves a spacey path's quotes
+/// from the value to the front of the token, and tools such as Next.js re-parse
+/// and re-emit NODE_OPTIONS in their own quoting.
+///
+/// KNOWN LIMIT: the runtime exclude of a DIFFERENT nub install upstream (another
+/// version, another cache dir) names a directory this process does not own, so
+/// it counts as a user exclude here and the default is not restated. And a
+/// grandchild spawned by absolute `process.execPath` never passes through nub at
+/// all, so nothing here can see its argv; see the NODE_OPTIONS site for what that
+/// grandchild gets and why.
+fn user_supplied_coverage_exclude(
+    user_args: &[String],
+    node_options: Option<&str>,
+    own_runtime_glob: Option<&str>,
+) -> bool {
+    let is_exclude = |token: &str| {
+        token == "--test-coverage-exclude" || token.starts_with("--test-coverage-exclude=")
+    };
+    let is_own = |token: &str| {
+        own_runtime_glob.is_some_and(|glob| {
+            token
+                .strip_prefix("--test-coverage-exclude=")
+                .is_some_and(|value| value == glob)
+        })
+    };
+    user_args.iter().any(|arg| is_exclude(arg))
+        || node_options.is_some_and(|opts| {
+            split_node_options(opts)
+                .iter()
+                .any(|token| is_exclude(token) && !is_own(token))
+        })
+}
+
+/// The `--test-coverage-exclude=<glob>` flags nub injects on argv when coverage is
+/// active — nub's own preloaded runtime modules (R9), plus Node's default test-file
+/// pattern that injecting them would otherwise disable. Empty when coverage isn't
+/// active or the runtime dir can't be resolved. The runtime glob is keyed to the
 /// ABSOLUTE directory holding the injected preload — the same dir `find_preload`
 /// returns the preload from — so it can never accidentally match a user's own
 /// `runtime/` directory the way a relative `**/runtime/**` would.
@@ -1238,19 +3263,47 @@ fn coverage_active_for_cache(
 /// denominator a hair. This is a stock-Node quirk of `--test-coverage-exclude`,
 /// NOT something nub introduces; a future reader comparing nub's aggregate to a
 /// hand-computed one should not be surprised by a fractional branch-% difference.
-fn coverage_exclude_glob(
+fn coverage_exclude_globs(
+    node_version: &NodeVersion,
     user_args: &[String],
     node_options: Option<&str>,
     preload: Option<&str>,
-) -> Option<String> {
+) -> Vec<String> {
     if !coverage_active(user_args, node_options) {
-        return None;
+        return Vec::new();
     }
-    let runtime_dir = Path::new(preload?).parent()?;
-    Some(format!(
-        "--test-coverage-exclude={}/**",
-        runtime_dir.display()
-    ))
+    let Some(runtime_dir) = preload.map(Path::new).and_then(Path::parent) else {
+        return Vec::new();
+    };
+    let runtime_glob = format!("{}/**", runtime_dir.display());
+    let mut globs = vec![format!("--test-coverage-exclude={runtime_glob}")];
+    if should_restate_default_coverage_exclude(
+        node_version,
+        user_args,
+        node_options,
+        Some(&runtime_glob),
+    ) {
+        globs.push(format!(
+            "--test-coverage-exclude={NODE_DEFAULT_COVERAGE_EXCLUDE}"
+        ));
+    }
+    globs
+}
+
+/// Whether nub must re-state Node's default coverage exclusion beside the runtime
+/// exclude it is about to inject. Both conditions are load-bearing and neither
+/// implies the other: the host Node must HAVE that default (23.5+, a strictly
+/// higher floor than the flag's own 22.5 — see
+/// `flags::test_coverage_default_exclusion_applied`), and the user must not have
+/// supplied an exclude of their own, which turns the default off for stock node too.
+fn should_restate_default_coverage_exclude(
+    node_version: &NodeVersion,
+    user_args: &[String],
+    node_options: Option<&str>,
+    own_runtime_glob: Option<&str>,
+) -> bool {
+    flags::test_coverage_default_exclusion_applied(node_version)
+        && !user_supplied_coverage_exclude(user_args, node_options, own_runtime_glob)
 }
 
 /// True when `node_options` already carries OUR specific preload path — i.e. a
@@ -1268,11 +3321,30 @@ fn is_reentrant_in(node_options: Option<&str>, preload: Option<&str>) -> bool {
     }
 }
 
+/// Whether a launch of `version` from this process would count as re-entrant in
+/// [`spawn_node`]. A binary that cannot find its preload passes `NODE_OPTIONS` through
+/// untouched, which also continues the parent's invocation.
+pub fn is_reentrant_launch(nub_binary: &Path, version: &NodeVersion) -> bool {
+    let Some(preload) = find_preload(nub_binary) else {
+        return true;
+    };
+    let key = preload_injection(&preload, version).node_options_token();
+    is_reentrant_in(env::var("NODE_OPTIONS").ok().as_deref(), Some(&key))
+}
+
 /// Strip Windows' verbatim / extended-length path prefixes (`\\?\` and
 /// `\\?\UNC\`) that `fs::canonicalize` emits. Node's module loader and NODE_PATH
 /// reject them. Returns a native Windows path (backslashes preserved — valid for
 /// NODE_PATH and fs ops). Pure over `windows` so both branches test on any host.
-fn strip_verbatim(path: &str, windows: bool) -> String {
+///
+/// The loader's refusal is not cosmetic. CJS resolution ends in
+/// `fs.realpathSync`, whose Windows walk lstats the path's ROOT first; for
+/// `\\?\C:\…` that root is `\\?\C:\`, which Node's native `ToNamespacedPath`
+/// re-resolves to `\\?\C:` — the volume DEVICE rather than its root directory —
+/// and the call fails `EISDIR: illegal operation on a directory, lstat 'C:'`
+/// (the bare `C:` is the namespace prefix stripped back off for the message).
+/// So a single `\\?\` path handed to Node kills every `require` in the process.
+pub fn strip_verbatim(path: &str, windows: bool) -> String {
     if windows {
         if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
             return format!(r"\\{rest}");
@@ -1284,6 +3356,45 @@ fn strip_verbatim(path: &str, windows: bool) -> String {
     path.to_string()
 }
 
+/// [`strip_verbatim`] for a path that is about to become a Node command-line
+/// argument rather than a filesystem handle.
+///
+/// A path that is not valid UTF-8 is returned untouched: it cannot be handed to
+/// Node as an argument in any spelling, so re-spelling it would only mask the
+/// real failure. Pure over `windows` so both branches test on any host.
+pub fn strip_verbatim_path(path: &Path, windows: bool) -> PathBuf {
+    match path.to_str() {
+        Some(text) => PathBuf::from(strip_verbatim(text, windows)),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Whether a preload spec names an absolute path rather than a bare module
+/// specifier, deciding whether it needs the `file://` spelling.
+///
+/// Pure over `windows`, for the same reason [`to_file_url`] is: `Path::is_absolute`
+/// answers for the HOST, so a fixture like `/proj/pre.cjs` reads absolute on Unix
+/// and NOT absolute on Windows (there it is rooted but not drive-qualified). Mixing
+/// that into an otherwise-`windows`-parameterized function makes the pair disagree
+/// on a Windows host and silently emit a bare `--import=/proj/pre.cjs`. Matches
+/// `Path::is_absolute` on each platform for the paths that actually reach here.
+fn is_absolute_path(spec: &str, windows: bool) -> bool {
+    if !windows {
+        return spec.starts_with('/');
+    }
+    // UNC (`\\server\share`, `//server/share`) and the verbatim `\\?\C:\…` form
+    // both lead with a doubled separator; everything else must be drive-qualified
+    // (`C:\a`, `C:/a`). A lone leading slash is rooted-but-relative on Windows.
+    if spec.starts_with(r"\\") || spec.starts_with("//") {
+        return true;
+    }
+    let bytes = spec.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
 /// Convert a filesystem path to a `file://` URL Node's loader accepts on every
 /// platform. On Windows a path is `C:\a\b` (or a canonicalized `\\?\C:\a\b`); a
 /// naive `format!("file://{path}")` yields `file://C:\a\b`, which Node's
@@ -1292,6 +3403,12 @@ fn strip_verbatim(path: &str, windows: bool) -> String {
 /// paths and `file://server/share/...` for UNC. On Unix the path is already an
 /// absolute forward-slash path, so `file://` + path gives the correct
 /// `file:///abs/...`. Pure over `windows` so both branches test on any host.
+/// Public wrapper over [`to_file_url`] for the current platform, for callers that
+/// build their own `--import` value (the synthesized preload chainer).
+pub fn file_url_for(path: &str) -> String {
+    to_file_url(path, cfg!(windows))
+}
+
 fn to_file_url(path: &str, windows: bool) -> String {
     if !windows {
         return format!("file://{path}");
@@ -1304,12 +3421,6 @@ fn to_file_url(path: &str, windows: bool) -> String {
         // Drive: C:/a/b -> file:///C:/a/b
         format!("file:///{forward}")
     }
-}
-
-/// Public path -> `file://` URL conversion for the current platform. Used wherever
-/// nub injects `--import <url>` for the preload.
-pub fn path_to_file_url(path: &str) -> String {
-    to_file_url(path, cfg!(windows))
 }
 
 /// How nub injects its preload, chosen BY TIER. The fast tier (Node 22.15+) loads a
@@ -1328,6 +3439,13 @@ pub struct PreloadInjection {
     pub flag: &'static str,
     /// The injected value: a raw path for `--require`, a `file://` URL for `--import`.
     pub value: String,
+    /// A `--require` sidecar that runs before the preload: the compat tier on Linux
+    /// carries `runtime/threadpool-snapshot.cjs`, because the `--import` preload is
+    /// read through the very threadpool the policy needs to build itself (see that
+    /// file). Its own NODE_OPTIONS token, ahead of PnP's and the preload's, and
+    /// never part of the re-entrancy key: a consumer that re-parses NODE_OPTIONS by
+    /// flag name may drop it, which costs the demotion and nothing else.
+    pub sidecar: Option<String>,
 }
 
 impl PreloadInjection {
@@ -1335,14 +3453,30 @@ impl PreloadInjection {
     /// which doubles as the re-entrancy key: a child detects a parent-injected
     /// preload by finding this exact token in its inherited NODE_OPTIONS.
     ///
-    /// The VALUE half is quoted with [`node_options_quote`] so a preload path
+    /// The VALUE half is quoted with [`node_options_token`] so a preload path
     /// containing a space (e.g. a cache or temp dir under `C:\Users\John Doe\…`,
     /// or a macOS `~/Library/Application Support/…`) survives Node's NODE_OPTIONS
     /// tokenizer, which splits on unquoted spaces. The re-entrancy detector
     /// ([`is_reentrant_in`]) compares against this same quoted form, so the key
     /// still round-trips.
     pub fn node_options_token(&self) -> String {
-        format!("{}={}", self.flag, node_options_quote(&self.value))
+        format!("{}={}", self.flag, node_options_token(&self.value))
+    }
+
+    /// The sidecar's own `--require` token, when there is one.
+    pub fn sidecar_token(&self) -> Option<String> {
+        self.sidecar
+            .as_deref()
+            .map(|path| format!("--require={}", node_options_token(path)))
+    }
+
+    /// Every token nub writes for this injection: the sidecar's `--require`, when
+    /// there is one, then [`Self::node_options_token`].
+    pub fn node_options_tokens(&self) -> Vec<String> {
+        self.sidecar_token()
+            .into_iter()
+            .chain(std::iter::once(self.node_options_token()))
+            .collect()
     }
 }
 
@@ -1356,18 +3490,308 @@ impl PreloadInjection {
 /// Single quotes do NOT work — Node has no single-quote handling, so they'd
 /// become literal characters in the path (`ERR_INVALID_STATE` on the store).
 ///
-/// Values WITHOUT a space are returned unchanged: they tokenize fine bare, and
-/// not quoting them keeps NODE_OPTIONS readable and matches plain-Node argv.
+/// A value that is empty or carries whitespace or a double quote is wrapped and
+/// escaped; anything else is returned bare, which tokenizes identically while
+/// keeping NODE_OPTIONS readable and argv-like.
+///
 /// Use this for EVERY value-bearing flag nub writes into NODE_OPTIONS
 /// (`--test-coverage-exclude=`, the preload `--require=`/`--import=` token,
 /// PnP `--require=`).
-fn node_options_quote(value: &str) -> String {
-    if value.contains(' ') {
+pub fn node_options_token(value: &str) -> String {
+    if value.is_empty() || value.chars().any(char::is_whitespace) || value.contains('"') {
         let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
         format!("\"{escaped}\"")
     } else {
         value.to_string()
     }
+}
+
+/// One complete option for NODE_OPTIONS, quoting its value alone: `--flag="a value"`.
+/// Node's tokenizer accepts a quote anywhere in a token, but the runtime's own scans
+/// (`anotherPreloadMayFollow`, `foreignAsyncLoaderFlagPresent`) look for `--import=` at a
+/// token's start. One they cannot see is a chainer they let the entry run ahead of.
+pub fn node_option_token(option: &str) -> String {
+    match option.split_once('=') {
+        Some((flag, value)) if flag.starts_with("--") && !value.is_empty() => {
+            format!("{flag}={}", node_options_token(value))
+        }
+        _ => node_options_token(option),
+    }
+}
+
+/// Whether a `--require` / `--import` value names one of NUB'S OWN preload entry
+/// points — the runtime preload, or a synthesized preload chainer — rather than a
+/// user's. `value` must already be slash-normalized; a `file://` prefix is
+/// irrelevant because only the last two path components are read.
+///
+/// Recognized by SHAPE, deliberately, because the recognizer has to hold for a nub of
+/// any version whose token this process inherited, and because the directory the
+/// preload lives in is not one path but two:
+///
+/// - `<...>/runtime/preload.{mjs,cjs}` — the in-repo sidecar an `embed-runtime`-off
+///   dev build resolves to.
+/// - `<cache>/runtime-<version>-<hash8>/preload.{mjs,cjs}` — the extracted runtime
+///   cache every SHIPPED build resolves to (`runtime_cache::CACHE_KEY`).
+///
+/// A substring test for the first spelling alone silently misses every released
+/// binary, which is exactly how nub's own `--import` came to be folded into the
+/// chainer that nub's preload then imports: on the compat tier that is an ESM cycle
+/// through a top-level await, so the child hangs and Node exits 13 with no output
+/// (#746). CJS cycles resolve to a partial export instead of deadlocking, which is
+/// why the fast tier survived the same fold and hid the bug.
+///
+/// The cache spelling is matched against the FULL key grammar rather than a
+/// `runtime-` prefix, because over-claiming here is its own bug: a user entry wrongly
+/// held out of the chainer keeps its own `NODE_OPTIONS` token, and on the compat tier
+/// that token is a `--require` Node re-runs inside the loader worker — the double
+/// execution the chainer's compat-tier routing exists to prevent. A package directory
+/// named `runtime-hooks` is enough to trip a prefix test.
+fn is_nub_preload_entry(value: &str) -> bool {
+    let Some((parent, file)) = value.rsplit_once('/') else {
+        return false;
+    };
+    match file {
+        "preload.mjs" | "preload.cjs" | THREADPOOL_SNAPSHOT_SIDECAR => {
+            is_nub_runtime_dir(parent.rsplit('/').next().unwrap_or_default())
+        }
+        // The chainer nub synthesizes into `<preload root>/node_modules/.nub/`, whose
+        // name carries a content hash when it holds tsconfig mapper registers. The
+        // runtime's `NUB_CHAIN_MARKER` matches the same `preload-chain.` prefix.
+        _ if file.starts_with("preload-chain.")
+            && (file.ends_with(".mjs") || file.ends_with(".cjs")) =>
+        {
+            parent.ends_with("/.nub")
+        }
+        _ => false,
+    }
+}
+
+/// The directory name a nub preload sits in: the dev sidecar's plain `runtime`, or a
+/// shipped `runtime-<version>-<blobhash8>` cache key (`crates/nub-core/build.rs`,
+/// where `blobhash8` is the first four bytes of the blob's SHA-256 rendered as
+/// lowercase hex). The version is not validated — it is `CARGO_PKG_VERSION` and may
+/// carry a prerelease suffix with its own dashes — so the hex suffix is what carries
+/// the discrimination.
+fn is_nub_runtime_dir(dir: &str) -> bool {
+    if dir == "runtime" {
+        return true;
+    }
+    let Some(rest) = dir.strip_prefix("runtime-") else {
+        return false;
+    };
+    let Some((version, hash8)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    !version.is_empty()
+        && hash8.len() == 8
+        && hash8
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
+/// Split a NODE_OPTIONS-shaped string into individual flag tokens — the inverse of
+/// [`node_options_token`], mirroring Node's own `ParseNodeOptionsEnvVar`
+/// (.repos/node/src/node_options.cc): split on whitespace EXCEPT inside a
+/// double-quoted run, where a backslash escapes the next character.
+///
+/// Needed because callers that accept a raw NODE_OPTIONS string from OUTSIDE
+/// nub.jsonc (npm's `node-options` npmrc field) must hand `compute_augmentation_env`
+/// one element PER FLAG: it re-quotes every element individually, so pushing
+/// `--a --b` as a single element would emit the one broken token `"--a --b"`.
+/// Preload entries carried by an INHERITED `NODE_OPTIONS`, split out so nub can fold
+/// them into its own chainers instead of letting them ride as extra tokens.
+///
+/// Returns `(passthrough, requires, imports)` — the flags to forward unchanged, and
+/// the values of any `--require` / `--import` entries.
+///
+/// Why only those two names: a consumer that re-parses `NODE_OPTIONS` keys it by flag
+/// NAME and keeps one value per key (Next.js does — vercel/next.js#96582), so a token
+/// only collides with nub's own if it shares a name. nub emits exactly `--require`
+/// and `--import`.
+///
+/// Deliberately NOT folded:
+/// - `--loader` / `--experimental-loader` — nub emits neither, so they cannot collide,
+///   and folding one into an `import` would silently drop its hook registration. A
+///   loader is not an import.
+/// - Yarn PnP (`.pnp.cjs`, `.pnp.loader.mjs`) — PnP's resolver has to install before
+///   nub's preload, and the chainers run after it.
+/// - nub's own preload and chainer ([`is_nub_preload_entry`]) — the chainer is rebuilt
+///   on every spawn, re-entrant ones included, so an inherited nub token really does
+///   reach here and folding it would make nub's preload load itself.
+pub fn split_inherited_preloads(value: &str) -> (String, Vec<String>, Vec<String>) {
+    // Left in place rather than folded. PnP's resolver must install before nub's
+    // preload, and nub's OWN tokens must stay exactly where they are: a NESTED nub
+    // inherits them, and folding them into the new chainer would re-run nub's preload
+    // from inside itself and break the re-entrancy detection that keys on that token.
+    fn keep_in_place(value: &str) -> bool {
+        let v = value.trim_matches('"').replace('\\', "/");
+        v.ends_with(".pnp.cjs") || v.ends_with(".pnp.loader.mjs") || is_nub_preload_entry(&v)
+    }
+
+    let tokens = split_node_options(value);
+    let mut passthrough: Vec<String> = Vec::new();
+    let mut requires: Vec<String> = Vec::new();
+    let mut imports: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        // Both spellings: `--require=<v>` and `--require <v>`.
+        let split = token
+            .split_once('=')
+            .map(|(flag, value)| (flag, Some(value.to_string())))
+            .unwrap_or((token.as_str(), None));
+        let (flag, inline) = split;
+        let had_inline = inline.is_some();
+        let sink = match flag {
+            "--require" | "-r" => Some(&mut requires),
+            "--import" => Some(&mut imports),
+            _ => None,
+        };
+        match (sink, inline) {
+            (Some(sink), Some(value)) if !keep_in_place(&value) => sink.push(value),
+            (Some(sink), None)
+                if index + 1 < tokens.len() && !keep_in_place(&tokens[index + 1]) =>
+            {
+                sink.push(tokens[index + 1].clone());
+                index += 1;
+            }
+            // A PnP token, or a value-less trailing flag: forward verbatim, taking the
+            // separated value with it so the pair stays intact.
+            _ => {
+                passthrough.push(token.clone());
+                if !had_inline
+                    && matches!(flag, "--require" | "-r" | "--import")
+                    && index + 1 < tokens.len()
+                {
+                    index += 1;
+                    passthrough.push(tokens[index].clone());
+                }
+            }
+        }
+        index += 1;
+    }
+    (
+        passthrough
+            .iter()
+            .map(|token| node_option_token(token))
+            .collect::<Vec<_>>()
+            .join(" "),
+        requires,
+        imports,
+    )
+}
+
+/// The `NODE_OPTIONS` for a re-entrant launch whose entry brought tsconfig mappers the
+/// inherited chainer lacks, or `None` to leave the inherited value alone.
+///
+/// A re-entrant launch otherwise keeps `NODE_OPTIONS` as it is, so a new chainer has to
+/// take the old one's place here or an ordinary spawned grandchild never sees it. It
+/// must REPLACE rather than sit beside the old one: the new chainer holds the whole
+/// effective set in order, and a preload the old one registered first would then be a
+/// module-cache hit, leaving a new mapper above an explicit `preload` entry. Argv was
+/// no alternative, since `spawn` inherits the environment and not `execArgv`. Entries
+/// folded out of the inherited value are in the new chainer too, so they go as well.
+fn reentrant_node_options(existing: Option<&str>, runtime_options: &[String]) -> Option<String> {
+    let chain = runtime_options
+        .iter()
+        .find(|token| {
+            token.strip_prefix("--import=").is_some_and(|value| {
+                let value = value.replace('\\', "/");
+                is_nub_preload_entry(&value) && !value.ends_with("/preload-chain.mjs")
+            })
+        })?
+        .clone();
+    let (rest, _, _) = split_inherited_preloads(existing?);
+    let tokens = split_node_options(&rest);
+    if tokens.contains(&chain) {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len() + 1);
+    let mut placed = false;
+    let mut tokens = tokens.into_iter().peekable();
+    while let Some(token) = tokens.next() {
+        let is_chain = |value: &str| {
+            let value = value.replace('\\', "/");
+            is_nub_preload_entry(&value) && value.ends_with(".mjs")
+        };
+        let inherited_chain = match token.strip_prefix("--import=") {
+            Some(value) => is_chain(value),
+            None if token == "--import" && tokens.peek().is_some_and(|v| is_chain(v)) => {
+                tokens.next();
+                true
+            }
+            None => false,
+        };
+        if !inherited_chain {
+            out.push(token);
+        } else if !placed {
+            out.push(chain.clone());
+            placed = true;
+        }
+    }
+    if !placed {
+        out.push(chain);
+    }
+    Some(
+        out.iter()
+            .map(|token| node_option_token(token))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// `NODE_OPTIONS` read the way Node's `ParseNodeOptionsEnvVar` reads it: only a space
+/// separates tokens, so a tab or newline stays inside one.
+pub fn split_node_options(value: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_string = false;
+    let mut start_new = true;
+    let mut chars = value.chars();
+    while let Some(mut c) = chars.next() {
+        if c == '\\' && in_string {
+            // A trailing escape is malformed; Node aborts, we simply drop it.
+            match chars.next() {
+                Some(next) => c = next,
+                None => break,
+            }
+        } else if c == ' ' && !in_string {
+            start_new = true;
+            continue;
+        } else if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if start_new {
+            out.push(String::new());
+            start_new = false;
+        }
+        out.last_mut().expect("pushed above").push(c);
+    }
+    out
+}
+
+/// The `NODE_OPTIONS` `cmd` will start with: its own setting, or else this process's.
+fn effective_node_options(cmd: &Command) -> Option<String> {
+    match cmd
+        .get_envs()
+        .find(|(name, _)| *name == OsStr::new("NODE_OPTIONS"))
+    {
+        Some((_, value)) => value.and_then(OsStr::to_str).map(str::to_string),
+        None => env::var("NODE_OPTIONS").ok(),
+    }
+}
+
+/// Take the watch flags out of the `NODE_OPTIONS` `cmd` would start with, and return
+/// them for its argv. See [`super::argv::lift_watch_flags`].
+pub fn lift_inherited_watch_flags(cmd: &mut Command) -> Vec<String> {
+    let Some((rest, flags)) = effective_node_options(cmd)
+        .as_deref()
+        .and_then(super::argv::lift_watch_flags)
+    else {
+        return Vec::new();
+    };
+    cmd.env("NODE_OPTIONS", rest);
+    flags
 }
 
 /// Pick the preload injection for a Node version, given the located ESM preload
@@ -1379,6 +3803,7 @@ fn preload_injection_for(
     preload_mjs: &str,
     version: &super::version::NodeVersion,
     windows: bool,
+    linux: bool,
 ) -> PreloadInjection {
     if version.supports_augmentation() {
         // Sibling .cjs in the same runtime dir. `--require` resolves a plain path
@@ -1391,21 +3816,145 @@ fn preload_injection_for(
         PreloadInjection {
             flag: "--require",
             value: cjs,
+            sidecar: None,
         }
     } else {
+        // The threadpool policy has to build the pool itself to know its threads,
+        // and the ESM loader builds it while reading this very preload; a `--require`
+        // runs first (`PreloadInjection::sidecar`). Only where the policy demotes: Linux.
+        let sidecar = linux
+            .then(|| preload_mjs.strip_suffix("preload.mjs"))
+            .flatten()
+            .map(|dir| format!("{dir}{THREADPOOL_SNAPSHOT_SIDECAR}"));
         PreloadInjection {
             flag: "--import",
             value: to_file_url(preload_mjs, windows),
+            sidecar,
         }
     }
 }
+
+/// The compat tier's `--require` sidecar, a sibling of the preload (see the file).
+const THREADPOOL_SNAPSHOT_SIDECAR: &str = "threadpool-snapshot.cjs";
 
 /// Public wrapper over [`preload_injection_for`] for the current platform.
 pub fn preload_injection(
     preload_mjs: &str,
     version: &super::version::NodeVersion,
 ) -> PreloadInjection {
-    preload_injection_for(preload_mjs, version, cfg!(windows))
+    preload_injection_for(
+        preload_mjs,
+        version,
+        cfg!(windows),
+        cfg!(target_os = "linux"),
+    )
+}
+
+/// SUPERSEDED — no longer on the spawn path. `nub.jsonc` `preload` entries are now
+/// loaded by a single synthesized chainer (`prepare_preload_chain` in nub-cli), because
+/// one NODE_OPTIONS token PER ENTRY is destroyed by any consumer that re-parses the
+/// variable (vercel/next.js#96582). Kept, with its tests, for the two measured Node
+/// facts below — they still govern which channel the chainer rides. Safe to delete
+/// once those facts are restated at the new site.
+///
+/// How a USER preload (`nub.jsonc` `preload`) reaches Node — chosen by tier so it
+/// always lands AFTER nub's own preload and runs exactly once.
+///
+/// Two upstream Node facts drive this, both measured against plain `node` with no
+/// nub in the picture (18.19.0 through 26.5.0):
+///
+/// 1. Node runs EVERY `--require` preload before ANY `--import` preload, whatever
+///    order the tokens appear in on argv or in NODE_OPTIONS.
+/// 2. Every `module.register()` loader worker RE-RUNS the `--require` preloads in
+///    its own realm. The worker reads the immutable per-process option store, so
+///    scrubbing `process.env.NODE_OPTIONS` or `process.execArgv` before the
+///    `register()` call does NOT suppress it — there is no JS-side workaround.
+///    `--import` preloads are skipped in loader workers, which is why nub's own
+///    compat preload does not recurse.
+///
+/// On the COMPAT tier nub is itself an `--import` ([`preload_injection_for`]) and
+/// always registers a loader worker (`runtime/preload.mjs`), so a `.cjs` user
+/// preload injected as `--require` would run BEFORE nub's hooks are installed and
+/// run TWICE. Injecting it as `--import` fixes both at once.
+///
+/// So a `.cjs` preload may keep `--require` only when NOTHING in this invocation
+/// pulls in the ESM loader: nub's own preload is a `--require` (fast tier) AND no
+/// sibling entry in the list rides `--import`. A sibling `--import` is enough on its
+/// own, because it makes the runtime auto-select the async loader-worker tier
+/// (`shouldAutoAsyncTierAtPreload`) — measured: `["./b.mjs", "./a.cjs"]` on Node
+/// 22.15 ran `a.cjs` twice, ahead of `b.mjs`. Rerouting the `.cjs` in that case
+/// costs nothing, since the sibling has already forced eager ESM-loader init.
+///
+/// Where no sibling forces it, `--require` is retained deliberately: routing a CJS
+/// preload through `--import` would itself force that eager init and break the
+/// synchronous `Module.runMain` semantics of the user's ENTRY (the R1 cluster
+/// documented on [`PreloadInjection`]).
+///
+/// Takes the whole list because the decision is a property of the list, not of one
+/// entry. Order is preserved, which is the user-visible contract.
+pub fn user_preload_injections(
+    specs: &[String],
+    version: &super::version::NodeVersion,
+) -> Vec<PreloadInjection> {
+    user_preload_injections_for(specs, version, cfg!(windows))
+}
+
+fn user_preload_injections_for(
+    specs: &[String],
+    version: &super::version::NodeVersion,
+    windows: bool,
+) -> Vec<PreloadInjection> {
+    // Nub's own preload is `--import` below 22.15; above it, any non-CJS entry in
+    // the user's own list drags the ESM loader in just the same.
+    let esm_loader_forced =
+        !version.supports_augmentation() || specs.iter().any(|spec| !is_cjs_preload(spec));
+    specs
+        .iter()
+        .map(|spec| user_preload_injection_for(spec, esm_loader_forced, windows))
+        .collect()
+}
+
+fn is_cjs_preload(spec: &str) -> bool {
+    Path::new(spec)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cjs"))
+}
+
+fn user_preload_injection_for(
+    spec: &str,
+    esm_loader_forced: bool,
+    windows: bool,
+) -> PreloadInjection {
+    let path = Path::new(spec);
+    // Only the exact lowercase `.cjs` can be rerouted. Node's ESM loader maps
+    // extensions case-SENSITIVELY and aborts on one it does not know
+    // (ERR_UNKNOWN_FILE_EXTENSION), while `require` falls back to loading an
+    // unrecognized extension as JS — so an oddly-cased `.CJS` stays on `--require`
+    // everywhere, keeping exactly the behavior it already had rather than trading a
+    // preload-ordering bug for a hard startup crash.
+    let reroutable = path.extension().and_then(|e| e.to_str()) == Some("cjs");
+    if is_cjs_preload(spec) && !(esm_loader_forced && reroutable) {
+        // `--require` does NOT accept a file:// URL, so the raw path goes through.
+        return PreloadInjection {
+            flag: "--require",
+            value: spec.to_string(),
+            sidecar: None,
+        };
+    }
+    PreloadInjection {
+        flag: "--import",
+        // A bare specifier (`my-preload`, `@scope/pkg`) stays bare — Node resolves it
+        // as an import from the cwd. Only a real path needs the file:// spelling,
+        // which is what stops a Windows `C:\…` from parsing its drive as the URL
+        // authority (ERR_INVALID_FILE_URL_PATH).
+        value: if is_absolute_path(spec, windows) {
+            to_file_url(spec, windows)
+        } else {
+            spec.to_string()
+        },
+        sidecar: None,
+    }
 }
 
 /// NODE_PATH value that makes nub's vendored runtime deps resolvable to a
@@ -1417,7 +3966,7 @@ pub fn preload_injection(
 /// to any existing NODE_PATH — but only when that dir exists (an installed
 /// package). In dev `runtime/` has no `node_modules`, so this is None and the
 /// requires resolve by walking up to the repo's `node_modules`, unchanged.
-fn vendored_node_path(preload: Option<&str>) -> Option<std::ffi::OsString> {
+fn vendored_node_path(preload: Option<&str>) -> Option<OsString> {
     let vendored = Path::new(preload?).parent()?.join("node_modules");
     if !vendored.is_dir() {
         return None;
@@ -1432,28 +3981,95 @@ fn vendored_node_path(preload: Option<&str>) -> Option<std::ffi::OsString> {
 
 /// Find the preload entry script relative to the Nub binary.
 ///
-/// In development: `<repo>/runtime/preload.mjs`
-/// In distribution: `<nub-install-dir>/runtime/preload.mjs`
+/// In development (`embed-runtime` off): `<repo>/runtime/preload.mjs`
+/// In distribution: `<cache>/runtime-<version>-<hash8>/preload.mjs` — the extracted
+/// runtime cache, NOT a `runtime/` directory beside the binary. Anything matching
+/// this path by shape has to accept both spellings ([`is_nub_preload_entry`]).
 pub fn find_public_preload(nub_binary: &Path) -> Option<String> {
     find_preload(nub_binary)
 }
 
 fn find_preload(nub_binary: &Path) -> Option<String> {
-    // Walk up from the binary's directory to find runtime/preload.mjs.
-    let mut dir = nub_binary.parent()?.to_path_buf();
-    for _ in 0..5 {
-        let candidate = dir.join("runtime").join("preload.mjs");
-        if candidate.is_file() {
-            // Strip the `\\?\` verbatim prefix `fs::canonicalize` adds on Windows so
-            // the path is usable in NODE_PATH and convertible to a valid file:// URL.
-            return candidate.to_str().map(|s| strip_verbatim(s, cfg!(windows)));
-        }
-        if !dir.pop() {
-            break;
-        }
+    // Single-binary mode: the runtime is embedded in the binary. Extract it once
+    // (memoized) to a versioned cache dir and point the preload there. This runs
+    // synchronously, BEFORE preload injection / NODE_OPTIONS assembly / the child
+    // spawn (find_preload is the first thing spawn touches), so extraction is
+    // complete before any path is read. The returned `.mjs` path is the
+    // byte-identical sibling of today's sidecar `preload.mjs`; only its directory
+    // moved (sidecar → cache), so `preload_injection_for`'s `--require <stem>.cjs`,
+    // `vendored_node_path`'s `<dir>/node_modules`, and the addon's
+    // `./addons/nub-native.node` all resolve unchanged. A `None` here (no writable
+    // cache dir anywhere) leaves nub un-augmented, exactly as a not-found sidecar
+    // would — never falls through to the (sidecar-less) walk below.
+    #[cfg(feature = "embed-runtime")]
+    {
+        let _ = nub_binary; // resolution is from the embedded blob, not the binary's dir
+        super::runtime_cache::ensure_runtime().and_then(|dir| {
+            let preload = dir.join("preload.mjs");
+            // Defense-in-depth: never trust a dir that isn't actually backed by the
+            // preload on disk (a self-heal that lost a race could hand back a dead dir);
+            // a missing file degrades to un-augmented rather than bricking the child.
+            preload
+                .is_file()
+                .then(|| preload.to_str().map(|s| strip_verbatim(s, cfg!(windows))))
+                .flatten()
+        })
     }
-    tracing::warn!("preload not found relative to nub binary");
-    None
+
+    // Dev / feature-off: locate runtime/preload.mjs (the in-repo, live-editable
+    // sidecar) by two independent routes, so a dev binary augments identically to
+    // CI no matter which target dir the build landed in.
+    //
+    // Route 1 — walk up from the binary's directory. Hits the sidecar when the
+    // target dir sits under the repo (a plain `cargo build` into `<repo>/target`,
+    // which is what CI does).
+    //
+    // Route 2 — the source tree that COMPILED this binary (`CARGO_MANIFEST_DIR` →
+    // `<repo>/runtime`). A build routed to a target dir with no `runtime/` ancestor
+    // — the shared cross-worktree dir (`~/.cache/nub/shared-target`) that
+    // `scripts/rust-build.sh` uses on the fast path — has no sidecar to walk to, so
+    // route 1 fails and the binary would otherwise run WHOLLY un-augmented. That
+    // silent local/CI behavior split is exactly the gap that let a
+    // lifecycle-augmentation hang survive the whole suite (#528); route 2 is
+    // layout-agnostic and closes it.
+    //
+    // Both routes compile ONLY here: the shipped binary is built with
+    // `embed-runtime` and resolves its preload from the embedded blob above, never
+    // reaching this branch — so the compile-time source path can never leak into a
+    // released nub.
+    #[cfg(not(feature = "embed-runtime"))]
+    {
+        if let Some(mut dir) = nub_binary.parent().map(Path::to_path_buf) {
+            for _ in 0..5 {
+                let candidate = dir.join("runtime").join("preload.mjs");
+                if candidate.is_file() {
+                    // Strip the `\\?\` verbatim prefix `fs::canonicalize` adds on Windows so
+                    // the path is usable in NODE_PATH and convertible to a valid file:// URL.
+                    return candidate.to_str().map(|s| strip_verbatim(s, cfg!(windows)));
+                }
+                if !dir.pop() {
+                    break;
+                }
+            }
+        }
+        // `canonicalize` doubles as the existence check and resolves the `../..`
+        // (and any symlink) so NODE_OPTIONS / the file:// URL carry a clean absolute
+        // path, matching route 1's output shape.
+        let source_preload =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/preload.mjs");
+        if let Ok(canon) = fs::canonicalize(&source_preload) {
+            return canon.to_str().map(|s| strip_verbatim(s, cfg!(windows)));
+        }
+        tracing::warn!("preload not found relative to nub binary or source root");
+        None
+    }
+}
+
+/// The directory holding the runtime tree — the extracted embed, or the in-repo
+/// `runtime/` on a dev build — located through [`find_preload`] so both builds
+/// agree on what "the runtime" is. `None` when the preload cannot be found.
+pub fn find_runtime_dir(nub_binary: &Path) -> Option<PathBuf> {
+    find_preload(nub_binary).and_then(|p| Path::new(&p).parent().map(Path::to_path_buf))
 }
 
 /// Resolve the path to the currently running Nub binary (follows symlinks).
@@ -1488,70 +4104,128 @@ pub fn exit_code(result: &SpawnResult) -> i32 {
     exit_code_from_status(&result.status)
 }
 
-/// Clean up any PATH shim directories left by this process.
+/// Clean up this process's active validated PATH shim directory.
 pub fn cleanup_shim() {
-    let pid = std::process::id();
-    let dir_name = format!("nub-node-shim-{pid}");
-    let shim_dir = env::temp_dir().join(&dir_name);
-    if shim_dir.exists() {
-        let _ = fs::remove_dir_all(&shim_dir);
-    }
+    PATH_SHIM_MANAGER.cleanup();
 }
 
 /// Cap on directories examined in a single reaper sweep. A sweep is best-effort
 /// and bounded so it can never spin on a pathologically large `TMPDIR`; any
 /// leftover stale dirs are simply collected on a later run.
 const REAP_SCAN_CAP: usize = 4096;
+// A legacy directory can contain several abandoned concurrent-publication
+// staging files. Bound that inner scan too; later invocations resume cleanup.
+const REAP_LEGACY_ENTRY_CAP: usize = 256;
 
-/// `nub run`/exec creates a process-wide PATH shim dir `nub-node-shim-<pid>`,
-/// reclaimed on normal exit by [`cleanup_shim`]. A run that is KILLED or crashes
-/// before that drop runs leaks its dir, so stale dirs accumulate unbounded in
-/// `TMPDIR` over time. This reaps them: it scans the temp dir for
-/// `nub-node-shim-<pid>` entries whose `<pid>` is no longer a live process and
-/// removes those, leaving live runs' dirs (including any concurrent nub run, and
-/// our own, which [`cleanup_shim`] owns) untouched.
+/// Reap randomized PATH shim directories leaked by dead processes, plus the
+/// legacy PID-only directories created by older Nub versions.
 ///
 /// HOT PATH: this is NOT called on the run/spawn/teardown critical path. It does
 /// a directory scan + per-entry `stat`, which is exactly the synchronous cost the
 /// latency-sensitive run path must not pay. Drive it ONLY off the thread via
 /// [`spawn_stale_shim_reaper`], which detaches it so the run never waits on it.
-pub fn reap_stale_shims() {
-    reap_stale_shims_in(&env::temp_dir(), std::process::id(), pid_is_alive);
-}
-
-/// Core of [`reap_stale_shims`], parameterized over the temp dir, this process's
-/// pid, and a pid-liveness probe so it is unit-testable without touching the
-/// shared global temp dir or real process state.
+///
+/// Parameterized over the temp dir, this process's pid, and a pid-liveness
+/// probe so it is unit-testable without touching the shared global temp dir or
+/// real process state.
 fn reap_stale_shims_in(temp: &Path, self_pid: u32, is_alive: impl Fn(u32) -> bool) {
     let Ok(entries) = fs::read_dir(temp) else {
         return;
     };
 
-    for entry in entries.flatten().take(REAP_SCAN_CAP) {
+    for entry in entries.take(REAP_SCAN_CAP).flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(pid_str) = name.strip_prefix("nub-node-shim-") else {
+        let Some((pid, kind)) = parse_shim_dir_name(name) else {
             continue;
         };
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        // Never touch our own dir (cleanup_shim owns it) or a live process's dir.
         if pid == self_pid || is_alive(pid) {
             continue;
         }
-        let _ = fs::remove_dir_all(entry.path());
+        let require_private = matches!(kind, ShimDirNameKind::Randomized);
+        let Ok(dir_identity) = validate_shim_dir(&entry.path(), require_private) else {
+            continue;
+        };
+        remove_shim_entry(&node_shim_path(&entry.path()));
+        remove_shim_entry(&staging_shim_path(&entry.path(), pid));
+        if matches!(kind, ShimDirNameKind::Legacy) {
+            remove_legacy_staging_entries(&entry.path(), pid);
+        }
+        let _ = fs::remove_dir(entry.path());
+        drop(dir_identity);
     }
 }
 
-/// Spawn [`reap_stale_shims`] on a DETACHED background thread so the sweep's
+fn remove_legacy_staging_entries(dir: &Path, pid: u32) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.take(REAP_LEGACY_ENTRY_CAP).flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if is_legacy_staging_name(name, pid) {
+            remove_shim_entry(&entry.path());
+        }
+    }
+}
+
+fn is_legacy_staging_name(name: &str, pid: u32) -> bool {
+    let prefix = format!(".node-staging-{pid}-");
+    let Some(counter) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    if counter.is_empty()
+        || (counter.len() > 1 && counter.starts_with('0'))
+        || !counter.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    counter.parse::<u64>().is_ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShimDirNameKind {
+    Legacy,
+    Randomized,
+}
+
+fn parse_shim_dir_name(name: &str) -> Option<(u32, ShimDirNameKind)> {
+    let tail = name.strip_prefix(PATH_SHIM_PREFIX)?;
+    let (pid, kind) = match tail.split_once('-') {
+        Some((pid, nonce)) => {
+            if nonce.len() != 32
+                || !nonce
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return None;
+            }
+            (pid, ShimDirNameKind::Randomized)
+        }
+        None => (tail, ShimDirNameKind::Legacy),
+    };
+    if pid.is_empty() || pid.starts_with('0') || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let pid = pid.parse::<u32>().ok()?;
+    (pid != 0).then_some((pid, kind))
+}
+
+/// Spawn [`reap_stale_shims_in`] on a DETACHED background thread so the sweep's
 /// directory scan never adds latency to the run/spawn/teardown path. Fire and
 /// forget: if the process exits before the sweep finishes, any not-yet-reaped
 /// stale dirs are collected by a later run. Call once, early.
+///
+/// The temp dir is resolved HERE, on the calling thread. With `TMPDIR` unset
+/// macOS answers `temp_dir` through `confstr`, whose first call initializes
+/// libSystem's notify state. Run on the reaper thread, that raced the launch
+/// thread's `fork` for the Node child: the child inherited the half-initialized
+/// state, aborted in `_notify_fork_child` before `exec`, and the run exited 137.
 pub fn spawn_stale_shim_reaper() {
+    let temp = env::temp_dir();
     let _ = std::thread::Builder::new()
         .name("nub-shim-reaper".into())
-        .spawn(reap_stale_shims);
+        .spawn(move || reap_stale_shims_in(&temp, std::process::id(), pid_is_alive));
 }
 
 /// Is `pid` a currently-live process? Used by the shim reaper to avoid reaping a
@@ -1562,7 +4236,12 @@ fn pid_is_alive(pid: u32) -> bool {
     // kill(pid, 0) performs the permission/existence check WITHOUT sending a
     // signal: 0 → alive; ESRCH → no such process (reapable); EPERM → process
     // exists but is owned by another user (alive — do not reap).
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        // Negative pid_t values address process groups or every permitted
+        // process. Never reinterpret an out-of-range directory name that way.
+        return true;
+    };
+    let rc = unsafe { libc::kill(pid, 0) };
     if rc == 0 {
         return true;
     }
@@ -1600,7 +4279,7 @@ fn pid_is_alive(pid: u32) -> bool {
 /// The nub-owned default compile-cache dir (`<cache>/nub/v8-compile-cache`),
 /// created best-effort. `None` when the cache root can't be resolved (no HOME) —
 /// the spawn simply proceeds uncached, never errors.
-pub fn default_compile_cache_dir() -> Option<std::ffi::OsString> {
+pub fn default_compile_cache_dir() -> Option<OsString> {
     let dir = crate::node::discovery::cache_dir()?.join("v8-compile-cache");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.into_os_string())
@@ -1612,217 +4291,457 @@ mod tests {
     use crate::node::version::NodeVersion;
 
     #[test]
-    fn node_options_quote_only_wraps_spacey_values() {
+    fn node_options_token_preserves_spaces_quotes_and_backslashes() {
         // No space → returned bare (tokenizes fine, stays readable / argv-like).
-        assert_eq!(node_options_quote("/tmp/store.sqlite"), "/tmp/store.sqlite");
+        assert_eq!(node_options_token("/tmp/store.sqlite"), "/tmp/store.sqlite");
         // Space → wrapped in double quotes (single quotes are literal to Node's
         // tokenizer and would corrupt the path → ERR_INVALID_STATE).
         assert_eq!(
-            node_options_quote("/tmp/nub cache/store.sqlite"),
+            node_options_token("/tmp/nub cache/store.sqlite"),
             "\"/tmp/nub cache/store.sqlite\""
         );
         // Windows: backslashes inside the quotes are escape chars to Node, so each
         // must be doubled or `\U`/`\J`/`\.` get eaten. Only quoted when spacey.
         assert_eq!(
-            node_options_quote(r"C:\Users\John Doe\.cache\store.sqlite"),
+            node_options_token(r"C:\Users\John Doe\.cache\store.sqlite"),
             r#""C:\\Users\\John Doe\\.cache\\store.sqlite""#
         );
         // A backslash path WITHOUT a space stays bare — Node only treats `\` as an
         // escape INSIDE a quoted string, so an unquoted backslash is literal.
         assert_eq!(
-            node_options_quote(r"C:\Users\John\.cache\store.sqlite"),
+            node_options_token(r"C:\Users\John\.cache\store.sqlite"),
             r"C:\Users\John\.cache\store.sqlite"
         );
         // An embedded double-quote in a spacey value is backslash-escaped.
-        assert_eq!(node_options_quote(r#"/tmp/a "b" c"#), r#""/tmp/a \"b\" c""#);
+        assert_eq!(node_options_token(r#"/tmp/a "b" c"#), r#""/tmp/a \"b\" c""#);
+        assert_eq!(
+            node_options_token(r#"--conditions=a"b"#),
+            r#""--conditions=a\"b""#
+        );
+        assert_eq!(node_options_token(""), r#""""#);
     }
 
     #[test]
-    fn webstorage_flag_always_injected_on_band_without_localstorage_file() {
-        // the maintainer, 2026-06-15: nub injects --experimental-webstorage "no matter what"
-        // on the flag-needed band (22.4–24), with NO --localstorage-file present —
-        // so sessionStorage works out of the box. (a) in-band with no file → inject.
-        for ver in [
-            NodeVersion::new(22, 4, 0),
+    fn a_reentrant_launch_replaces_the_chainer_only_when_mappers_change_it() {
+        let ours = "--require=/nub/runtime/preload.cjs";
+        let hashed = "--import=file:///p/node_modules/.nub/preload-chain.aaaa.mjs";
+        let new = "--import=file:///p/node_modules/.nub/preload-chain.bbbb.mjs";
+        let fixed = "--import=file:///p/node_modules/.nub/preload-chain.mjs";
+        let options = |token: &str| vec!["--conditions=nub".to_string(), token.to_string()];
+
+        // In place, with the rest kept and an already-folded entry gone.
+        assert_eq!(
+            reentrant_node_options(
+                Some(&format!(
+                    "{ours} {hashed} --max-old-space-size=99 --import=/agent.mjs"
+                )),
+                &options(new)
+            )
+            .as_deref(),
+            Some(format!("{ours} {new} --max-old-space-size=99").as_str())
+        );
+        // The inherited chainer may be the fixed-name one, or absent.
+        assert_eq!(
+            reentrant_node_options(Some(&format!("{ours} {fixed}")), &options(new)).as_deref(),
+            Some(format!("{ours} {new}").as_str())
+        );
+        assert_eq!(
+            reentrant_node_options(Some(ours), &options(new)).as_deref(),
+            Some(format!("{ours} {new}").as_str())
+        );
+        // Unchanged, or no mappers in the new chainer: the inherited value stands.
+        assert_eq!(
+            reentrant_node_options(Some(&format!("{ours} {new}")), &options(new)),
+            None
+        );
+        assert_eq!(reentrant_node_options(Some(ours), &options(fixed)), None);
+
+        // A space in the project's path: quoted once, as one token.
+        let spaced = "--import=file:///sp ace/node_modules/.nub/preload-chain.bbbb.mjs";
+        assert_eq!(
+            reentrant_node_options(Some(ours), &options(spaced)).as_deref(),
+            Some(format!("{ours} --import=\"{}\"", &spaced[9..]).as_str())
+        );
+    }
+
+    #[test]
+    fn windows_spelled_nub_tokens_are_not_folded_and_the_chainer_is_replaced() {
+        let chain = |hash: &str| {
+            format!(
+                "--import=file:///C:/Users/RUNNER~1/AppData/Local/Temp/.tmpAb/node_modules/.nub/preload-chain.{hash}.mjs"
+            )
+        };
+        let inherited = format!(
+            r"--require=D:\a\nub\nub\runtime\preload.cjs --conditions=nub {}",
+            chain("15e604a265d9faa0")
+        );
+        let (rest, requires, imports) = split_inherited_preloads(&inherited);
+        assert!(
+            requires.is_empty() && imports.is_empty(),
+            "{requires:?} {imports:?}"
+        );
+        assert_eq!(rest, inherited);
+
+        let quoted = r#"--require="C:\\Program Files\\nub\\runtime\\preload.cjs""#;
+        let (_, requires, _) = split_inherited_preloads(quoted);
+        assert!(requires.is_empty(), "{requires:?}");
+
+        assert_eq!(
+            reentrant_node_options(Some(&inherited), &[chain("97573208cbce4ee3")]),
+            Some(format!(
+                r"--require=D:\a\nub\nub\runtime\preload.cjs --conditions=nub {}",
+                chain("97573208cbce4ee3")
+            ))
+        );
+    }
+
+    #[test]
+    fn split_inherited_preloads_folds_only_the_names_nub_emits() {
+        let (rest, req, imp) = split_inherited_preloads(
+            "--enable-source-maps --require /a.cjs --import /b.mjs --title=x",
+        );
+        assert_eq!(req, vec!["/a.cjs"]);
+        assert_eq!(imp, vec!["/b.mjs"]);
+        assert_eq!(rest, "--enable-source-maps --title=x");
+
+        // Both spellings, and several of one name (the shape that collides).
+        let (rest, req, imp) =
+            split_inherited_preloads("--require=/a.cjs --require /b.cjs --import=/c.mjs");
+        assert_eq!(req, vec!["/a.cjs", "/b.cjs"]);
+        assert_eq!(imp, vec!["/c.mjs"]);
+        assert!(rest.is_empty(), "everything foldable was folded: {rest:?}");
+
+        // A loader is NOT an import: folding it would drop its hook registration.
+        let (rest, req, imp) =
+            split_inherited_preloads("--loader /l.mjs --experimental-loader=/m.mjs");
+        assert!(req.is_empty() && imp.is_empty());
+        assert_eq!(rest, "--loader /l.mjs --experimental-loader=/m.mjs");
+
+        // Yarn PnP must keep its position ahead of nub's preload.
+        let (rest, req, _) = split_inherited_preloads("--require /proj/.pnp.cjs --require /a.cjs");
+        assert_eq!(req, vec!["/a.cjs"], "only the non-PnP entry folds");
+        assert_eq!(rest, "--require /proj/.pnp.cjs");
+
+        // nub's OWN tokens stay put: a nested nub inherits them, and folding them
+        // would re-run nub's preload from inside itself and defeat re-entrancy
+        // detection, which keys on that exact token.
+        let (rest, req, imp) = split_inherited_preloads(
+            "--require=/nub/runtime/preload.cjs --import=/p/node_modules/.nub/preload-chain.mjs --require /a.cjs",
+        );
+        assert_eq!(req, vec!["/a.cjs"]);
+        assert!(imp.is_empty());
+        assert!(
+            rest.contains("runtime/preload.cjs") && rest.contains("preload-chain.mjs"),
+            "nub's own tokens must be forwarded verbatim: {rest}"
+        );
+        // The compat tier's threadpool sidecar is nub's own too.
+        let (rest, req, imp) = split_inherited_preloads(
+            "--require=/nub/runtime/threadpool-snapshot.cjs --import=file:///nub/runtime/preload.mjs --require /a.cjs",
+        );
+        assert_eq!(req, vec!["/a.cjs"]);
+        assert!(imp.is_empty());
+        assert!(
+            rest.contains("threadpool-snapshot.cjs") && rest.contains("runtime/preload.mjs"),
+            "the sidecar must be forwarded verbatim: {rest}"
+        );
+
+        // A value with a space survives the round-trip through the tokenizer.
+        let (rest, req, _) = split_inherited_preloads(r#"--require "/a b/c.cjs" --title=t"#);
+        assert_eq!(req, vec!["/a b/c.cjs"]);
+        assert_eq!(rest, "--title=t");
+    }
+
+    /// A SHIPPED nub resolves its preload out of the extracted runtime cache
+    /// (`runtime-<version>-<hash8>/`), never a plain `runtime/` sidecar — so the
+    /// recognizer has to hold for that spelling too. It did not, and folding nub's
+    /// own compat-tier `--import` into the chainer that nub's preload then imports
+    /// made an ESM cycle through a top-level await: exit 13, no output, on every
+    /// nested `node` a script ran under Node < 22.15 (#746). Every fixture in the
+    /// suite used the dev sidecar path, so the whole gate was dead in release.
+    #[test]
+    fn nub_preload_is_recognized_in_the_shipped_runtime_cache_layout() {
+        // Each path is spelled the way its platform spells it, and the `--import`
+        // URL comes from `to_file_url` rather than a hand-built `file://` prefix, so
+        // every token here is one nub can really emit. A hand-built URL got the
+        // Windows drive form wrong (`file://C:/…`, whose `C:` parses as the URL
+        // authority and which Node rejects) — and a fixture that is not the real
+        // shape is precisely what let this bug through in the first place.
+        for (own, windows) in [
+            (
+                "/home/u/.cache/nub/runtime-0.8.2-e6384feb/preload.mjs",
+                false,
+            ),
+            (
+                "/home/u/.cache/nub/runtime-0.8.2-e6384feb/preload.cjs",
+                false,
+            ),
+            ("/opt/nub/runtime/preload.mjs", false),
+            ("/p/node_modules/.nub/preload-chain.mjs", false),
+            (
+                r"C:\Users\u\AppData\Local\nub\runtime-0.8.2-e6384feb\preload.cjs",
+                true,
+            ),
+        ] {
+            let url = to_file_url(own, windows);
+            let (rest, req, imp) = split_inherited_preloads(&format!(
+                "--import={url} --require={own} --require /a.cjs"
+            ));
+            assert_eq!(req, vec!["/a.cjs"], "only the user entry folds: {own}");
+            assert!(imp.is_empty(), "nub's own import must not fold: {own}");
+            assert_eq!(
+                rest.matches("preload").count(),
+                2,
+                "both nub tokens forwarded verbatim for {own}: {rest}"
+            );
+        }
+
+        // Over-claiming is its own bug, so the negative half matters as much: a user
+        // entry wrongly held back keeps its own token, and on the compat tier that
+        // `--require` is re-run inside the loader worker. A shared basename is not
+        // enough (A26), and neither is a `runtime-` prefix without the cache key's
+        // 8-hex blob suffix — `runtime-hooks` is an ordinary package name.
+        for theirs in [
+            "/my/app/preload.cjs",
+            "/app/runtime-hooks/preload.cjs",
+            "/n/node_modules/@scope/runtime-hooks/preload.mjs",
+            "/app/runtime-/preload.mjs",
+            "/app/runtime-0.8.2-E6384FEB/preload.mjs",
+            "/app/runtime-0.8.2-e6384fe/preload.mjs",
+            "/app/.nub/preload.mjs",
+        ] {
+            let (rest, req, _) = split_inherited_preloads(&format!("--require={theirs}"));
+            assert_eq!(req, vec![theirs], "a user entry must fold: {theirs}");
+            assert!(rest.is_empty(), "nothing left behind for {theirs}: {rest}");
+        }
+    }
+
+    /// The recognizer and [`find_preload`] must agree on THIS build's layout,
+    /// whichever one it is. Binds the two together so a future move of the runtime
+    /// cache cannot silently re-open #746 under the feature set that ships.
+    #[test]
+    fn nub_recognizes_the_preload_it_actually_injects() {
+        let exe = std::env::current_exe().expect("test binary path");
+        match find_preload(&exe) {
+            Some(preload) => assert!(
+                is_nub_preload_entry(&preload.replace('\\', "/")),
+                "nub must recognize its own preload as un-foldable: {preload}"
+            ),
+            // Nothing resolvable means nothing is injected either, so there is no
+            // token to recognize — but a feature-on build carries the blob and must
+            // always extract one.
+            #[cfg(feature = "embed-runtime")]
+            None => panic!("an embed-runtime build must resolve its own preload"),
+            #[cfg(not(feature = "embed-runtime"))]
+            None => {}
+        }
+    }
+
+    #[test]
+    fn split_node_options_is_the_inverse_of_node_options_token() {
+        // One element per FLAG is the contract: `compute_augmentation_env` re-quotes
+        // each element individually, so a value left whole would emit the single
+        // broken token `"--a --b"`.
+        assert_eq!(
+            split_node_options("--max-old-space-size=8192 --trace-warnings"),
+            vec!["--max-old-space-size=8192", "--trace-warnings"]
+        );
+        // A quoted run holds a space together — the reason a naive `split_whitespace`
+        // is wrong. This is the `--require=/Users/John Doe/x.cjs` shape.
+        assert_eq!(
+            split_node_options(r#"--title="a b c" --trace-warnings"#),
+            vec!["--title=a b c", "--trace-warnings"]
+        );
+        // Inside a quoted run a backslash escapes, so a Windows path survives.
+        assert_eq!(
+            split_node_options(r#""--require=C:\\Users\\John Doe\\x.cjs""#),
+            vec![r#"--require=C:\Users\John Doe\x.cjs"#]
+        );
+        // Only a space separates, as in Node.
+        assert_eq!(
+            split_node_options("--title=foo\tbar --trace-warnings"),
+            vec!["--title=foo\tbar", "--trace-warnings"]
+        );
+        // Empty and space-only inputs yield nothing, never a bogus empty flag.
+        assert!(split_node_options("").is_empty());
+        assert!(split_node_options("   ").is_empty());
+
+        // The pair round-trips: anything token() quotes, split() takes back apart.
+        for value in [
+            "--title=plain",
+            "--title=a b c",
+            "--title=foo\tbar",
+            r#"--title=a"b"#,
+            r#"--require=C:\Users\John Doe\x.cjs"#,
+        ] {
+            assert_eq!(
+                split_node_options(&node_options_token(value)),
+                vec![value.to_string()],
+                "round-trip failed for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_options_token_round_trips_as_one_real_node_option() {
+        // The second case is the shape a project `nub.jsonc` can actually deliver:
+        // the CLI validator rejects whitespace and NUL but not a double quote, and
+        // `--title` is in Node's allowedNodeEnvironmentFlags — so an unquoted
+        // `--title=a"b` would reach the tokenizer with an unmatched quote.
+        for title in [r#"hello "quoted" C:\tmp"#, r#"a"b"#] {
+            let output = std::process::Command::new("node")
+                .arg("-e")
+                .arg("process.stdout.write(process.title)")
+                .env(
+                    "NODE_OPTIONS",
+                    node_options_token(&format!("--title={title}")),
+                )
+                .output()
+                .expect("host Node must run");
+            assert!(
+                output.status.success(),
+                "node rejected NODE_OPTIONS for title {title:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), title);
+        }
+    }
+
+    #[test]
+    fn direct_spawn_policy_respects_quoted_node_options() {
+        // `spawn_node` passes its original argv plus inherited NODE_OPTIONS to the
+        // shared policy. A quoted explicit disable must prevent a direct child
+        // from receiving nub's positive Web Storage flag.
+        let version = NodeVersion::new(22, 15, 0);
+        let user_args = ["app.js".to_string()];
+        assert!(!flags::should_inject_experimental_webstorage(
+            &version,
+            &user_args,
+            Some("\"--no-experimental-webstorage\""),
+        ));
+        assert!(
+            !flags::should_neutralize_experimental_webstorage_localstorage(
+                &version,
+                &user_args,
+                Some("\"--no-experimental-webstorage\""),
+            )
+        );
+
+        // A quoted storage-file value preserves the flag injection for
+        // sessionStorage while keeping localStorage usable.
+        let storage_file = "--localstorage-file=\"/tmp/nub storage.sqlite\"";
+        assert!(flags::should_inject_experimental_webstorage(
+            &version,
+            &user_args,
+            Some(storage_file),
+        ));
+        assert!(
+            !flags::should_neutralize_experimental_webstorage_localstorage(
+                &version,
+                &user_args,
+                Some(storage_file),
+            )
+        );
+    }
+
+    #[test]
+    fn script_spawn_policy_respects_quoted_node_options() {
+        // `compute_augmentation_env` has no argv channel, so its script-shell Web
+        // Storage decision reads inherited NODE_OPTIONS alone. It no longer PUSHES the
+        // flag (that moved to argv in `spawn_node`), but it still decides the
+        // localStorage neutralize signal the same way, and a user's quoted intent must
+        // land identically on both paths — which is what this pins.
+        let version = NodeVersion::new(22, 15, 0);
+        assert!(!flags::should_inject_experimental_webstorage(
+            &version,
+            &[],
+            Some("'--experimental-webstorage'"),
+        ));
+        assert!(
+            !flags::should_neutralize_experimental_webstorage_localstorage(
+                &version,
+                &[],
+                Some("'--experimental-webstorage'"),
+            )
+        );
+
+        let storage_file = "--localstorage-file='/tmp/nub storage.sqlite'";
+        assert!(flags::should_inject_experimental_webstorage(
+            &version,
+            &[],
+            Some(storage_file),
+        ));
+        assert!(
+            !flags::should_neutralize_experimental_webstorage_localstorage(
+                &version,
+                &[],
+                Some(storage_file),
+            )
+        );
+    }
+
+    #[test]
+    fn hook_compose_broken_band_is_22_15_through_24_11_0_inclusive() {
+        // Broken (async-loader resolveSync stub throws): the whole 22.15.0–24.11.0 window.
+        for v in [
             NodeVersion::new(22, 15, 0),
-            NodeVersion::new(24, 0, 0),
-            NodeVersion::new(24, 99, 0),
+            NodeVersion::new(22, 16, 0),
+            NodeVersion::new(23, 11, 0),
+            NodeVersion::new(24, 11, 0),
         ] {
             assert!(
-                should_inject_webstorage_flag(&ver, &[], None),
-                "must inject --experimental-webstorage on {ver:?} with no --localstorage-file"
+                node_hook_compose_broken(&v),
+                "{v:?} must be in the broken band"
             );
         }
-    }
-
-    #[test]
-    fn webstorage_flag_not_injected_below_floor_or_when_native() {
-        // (b) below 22.4 the flag is an unrecognized "bad option" → never inject.
-        for ver in [NodeVersion::new(18, 19, 0), NodeVersion::new(22, 3, 0)] {
-            assert!(
-                !should_inject_webstorage_flag(&ver, &[], None),
-                "must NOT inject below the 22.4 floor ({ver:?}) — would crash startup"
-            );
-        }
-        // (c) on 25+ Web Storage is native → the flag is unnecessary, don't inject.
-        for ver in [NodeVersion::new(25, 0, 0), NodeVersion::new(26, 2, 0)] {
-            assert!(
-                !should_inject_webstorage_flag(&ver, &[], None),
-                "must NOT inject on {ver:?} — Web Storage is native there"
-            );
-        }
-    }
-
-    #[test]
-    fn webstorage_flag_not_double_injected_when_user_supplied() {
-        // (e) user already passed the flag (either polarity, either channel) → nub
-        // must not double-inject / must respect an explicit disable.
-        let s = |v: &str| v.to_string();
-        let v = NodeVersion::new(22, 15, 0);
-        assert!(!should_inject_webstorage_flag(
-            &v,
-            &[s("--experimental-webstorage")],
-            None
-        ));
-        assert!(!should_inject_webstorage_flag(
-            &v,
-            &[],
-            Some("--experimental-webstorage")
-        ));
-        assert!(!should_inject_webstorage_flag(
-            &v,
-            &[s("--no-experimental-webstorage")],
-            None
-        ));
-        assert!(!should_inject_webstorage_flag(
-            &v,
-            &[],
-            Some("--no-experimental-webstorage")
-        ));
-        // A --localstorage-file opt-in does NOT change the in-band decision — the
-        // flag injects either way; (d) nub never synthesizes --localstorage-file, so
-        // its presence/absence is irrelevant to whether the flag is injected.
-        assert!(should_inject_webstorage_flag(
-            &v,
-            &[s("--localstorage-file=/tmp/x.sqlite")],
-            None
-        ));
-    }
-
-    #[test]
-    fn existing_user_webstorage_flag_suppresses_injection() {
-        let s = |v: &str| v.to_string();
-        // Neither polarity present → nub may inject.
-        assert!(!user_has_webstorage_flag(&[s("app.js")], None));
-        // User already passed the positive → don't double-add.
-        assert!(user_has_webstorage_flag(
-            &[s("--experimental-webstorage")],
-            None
-        ));
-        assert!(user_has_webstorage_flag(
-            &[],
-            Some("--experimental-webstorage")
-        ));
-        // User explicitly disabled → respect it, never re-enable.
-        assert!(user_has_webstorage_flag(
-            &[s("--no-experimental-webstorage")],
-            None
-        ));
-        assert!(user_has_webstorage_flag(
-            &[],
-            Some("--no-experimental-webstorage --localstorage-file=/tmp/x")
-        ));
-    }
-
-    #[test]
-    fn user_localstorage_file_detected_in_either_channel() {
-        let s = |v: &str| v.to_string();
-        // Absent → not detected.
-        assert!(!user_has_localstorage_file(&[s("app.js")], None));
-        // `=`-joined form, argv.
-        assert!(user_has_localstorage_file(
-            &[s("--localstorage-file=/tmp/x.sqlite")],
-            None
-        ));
-        // Space-separated form (bare token), argv.
-        assert!(user_has_localstorage_file(
-            &[s("--localstorage-file"), s("/tmp/x.sqlite")],
-            None
-        ));
-        // Via NODE_OPTIONS.
-        assert!(user_has_localstorage_file(
-            &[],
-            Some("--experimental-webstorage --localstorage-file=/tmp/x.sqlite")
-        ));
-        // A look-alike that is NOT the flag must not match.
-        assert!(!user_has_localstorage_file(
-            &[s("--localstorage-file-extra")],
-            None
-        ));
-    }
-
-    #[test]
-    fn neutralize_localstorage_gate_set_iff_flag_injected_and_no_user_file() {
-        let s = |v: &str| v.to_string();
-        // (a) On the flag-needed band with NO user --localstorage-file → neutralize:
-        // nub injects the flag, the user didn't opt into persistence, so the throwing
-        // getter must be replaced with `undefined`.
-        for ver in [
-            NodeVersion::new(22, 4, 0),
-            NodeVersion::new(22, 15, 0),
-            NodeVersion::new(24, 99, 0),
-        ] {
-            assert!(
-                should_neutralize_localstorage(&ver, &[], None),
-                "must neutralize on {ver:?} with no --localstorage-file"
-            );
-        }
-
-        // (b) User passed --localstorage-file (either channel/form) → do NOT
-        // neutralize; localStorage works normally.
-        let v = NodeVersion::new(22, 15, 0);
-        assert!(!should_neutralize_localstorage(
-            &v,
-            &[s("--localstorage-file=/tmp/x.sqlite")],
-            None
-        ));
-        assert!(!should_neutralize_localstorage(
-            &v,
-            &[s("--localstorage-file"), s("/tmp/x.sqlite")],
-            None
-        ));
-        assert!(!should_neutralize_localstorage(
-            &v,
-            &[],
-            Some("--localstorage-file=/tmp/x.sqlite")
-        ));
-
-        // (c) Off the flag-needed band (pre-22.4 / 25+ native) → no flag injected, so
-        // never neutralize regardless of file.
-        for ver in [
-            NodeVersion::new(18, 19, 0),
-            NodeVersion::new(22, 3, 0),
-            NodeVersion::new(25, 0, 0),
+        // Fixed at 24.11.1 (Node implemented resolveSync/loadSync), and below the
+        // fast-tier floor there is no sync registerHooks to force the crash.
+        for v in [
+            NodeVersion::new(22, 14, 99),
+            NodeVersion::new(24, 11, 1),
+            NodeVersion::new(24, 12, 0),
+            NodeVersion::new(25, 2, 0),
             NodeVersion::new(26, 2, 0),
         ] {
             assert!(
-                !should_neutralize_localstorage(&ver, &[], None),
-                "must NOT neutralize off the flag-needed band ({ver:?})"
+                !node_hook_compose_broken(&v),
+                "{v:?} must be outside the broken band"
             );
         }
+    }
 
-        // User-supplied/disabled --experimental-webstorage suppresses the inject, so
-        // there is no nub-installed throwing getter to neutralize.
-        assert!(!should_neutralize_localstorage(
-            &v,
-            &[s("--experimental-webstorage")],
-            None
-        ));
-        assert!(!should_neutralize_localstorage(
-            &v,
-            &[s("--no-experimental-webstorage")],
-            None
-        ));
+    #[test]
+    fn child_hosts_async_loader_detects_tsx_ts_node_and_loader_flags() {
+        let t = |toks: &[&str]| child_hosts_async_loader(toks.iter().copied());
+        // Bare + path-prefixed + platform-suffixed tsx/ts-node launchers.
+        assert!(t(&["tsx", "--conditions", "@zod/source"]));
+        assert!(t(&["node_modules/.bin/tsx", "x.ts"]));
+        assert!(t(&["ts-node", "x.ts"]));
+        assert!(t(&["C:\\proj\\node_modules\\.bin\\tsx.cmd", "x.ts"]));
+        assert!(t(&["C:\\proj\\node_modules\\.bin\\tsx.ps1", "x.ts"]));
+        // Loader flags in either form register an async loader.
+        assert!(t(&["node", "--import", "tsx/esm", "app.mjs"]));
+        assert!(t(&["node", "--loader=ts-node/esm", "app.mjs"]));
+        assert!(t(&["node", "--experimental-loader", "x.mjs"]));
+        // No foreign loader → fast tier stays. A stray `tsx` SUBSTRING must not match.
+        assert!(!t(&["webpack", "--mode", "production"]));
+        assert!(!t(&["node", "server.js"]));
+        assert!(!t(&["mytsx", "x"]));
+        assert!(!t(&["tsx.ts"]));
+    }
+
+    #[test]
+    fn force_async_tier_env_gated_on_band_and_loader() {
+        let broken = NodeVersion::new(22, 16, 0);
+        let fixed = NodeVersion::new(24, 12, 0);
+        // Broken band + foreign loader → the signal.
+        assert_eq!(
+            force_async_tier_env(&broken, ["tsx", "x.ts"]),
+            Some((FORCE_ASYNC_TIER_ENV, "1"))
+        );
+        // Broken band, no foreign loader → fast tier (None).
+        assert_eq!(force_async_tier_env(&broken, ["node", "x.js"]), None);
+        // Foreign loader but a fixed Node → no need to force (None).
+        assert_eq!(force_async_tier_env(&fixed, ["tsx", "x.ts"]), None);
     }
 
     // `ctrl_c::CURRENT_CHILD` is a process-global AtomicU32. The two tests that
@@ -1852,26 +4771,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ctrl_c_forwards_to_the_latest_child_not_the_first() {
+    fn ctrl_c_forwards_to_every_live_child_not_just_the_latest() {
         let _serial = CTRL_C_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        // The bug A20 fixes: a second spawn's set_handler no-op'd, so the single
-        // handler kept the first (dead) pid. Now the global pid updates per spawn,
-        // so the handler always targets the current child; untrack clears it so a
-        // stray SIGINT after exit is a no-op rather than a kill of a reused pid.
-        ctrl_c::untrack(); // reset the shared global before asserting on it
+        // Two bugs meet here. A20: a second spawn's set_handler no-op'd, so the lone
+        // handler kept the FIRST (dead) pid — a later spawn has to be reachable.
+        // #685: a single slot then meant a later spawn EVICTED the earlier one, so a
+        // `nub run -r` Ctrl-C signalled one member and orphaned its concurrent
+        // siblings. Only a set satisfies both — every live child is a target, and
+        // each removes exactly its own on exit.
+        ctrl_c::reset();
         ctrl_c::track(111);
-        assert_eq!(ctrl_c::current(), 111);
         ctrl_c::track(222);
         assert_eq!(
-            ctrl_c::current(),
-            222,
-            "a later spawn must become the forwarded target"
+            ctrl_c::tracked(),
+            vec![111, 222],
+            "both concurrent children stay reachable — a later spawn adds, never evicts"
         );
-        ctrl_c::untrack();
+        ctrl_c::untrack(111);
         assert_eq!(
-            ctrl_c::current(),
-            0,
-            "untrack clears the pid after the child exits"
+            ctrl_c::tracked(),
+            vec![222],
+            "one child exiting must leave its still-running sibling tracked"
+        );
+        ctrl_c::untrack(222);
+        assert!(
+            ctrl_c::tracked().is_empty(),
+            "a stray signal after the last child exits must find no target"
         );
     }
 
@@ -1883,7 +4808,7 @@ mod tests {
         // must return the child's real status AND leave the global untracked, so a
         // stray signal after the script exits can't kill a reused pid.
         let _serial = CTRL_C_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        ctrl_c::untrack();
+        ctrl_c::reset();
         let status = status_forwarding_signals(Command::new("sh").arg("-c").arg("exit 7"))
             .expect("spawn sh");
         assert_eq!(
@@ -1891,10 +4816,9 @@ mod tests {
             7,
             "the child's code passes through"
         );
-        assert_eq!(
-            ctrl_c::current(),
-            0,
-            "the tracked pid is cleared once the child exits"
+        assert!(
+            ctrl_c::tracked().is_empty(),
+            "the tracked group is removed once the child exits"
         );
     }
 
@@ -1905,11 +4829,18 @@ mod tests {
         // process GROUP (sh + the node it forks), not just sh — the orphan the
         // single-pid path left under a dash that forks its `sh -c` child.
         let _serial = CTRL_C_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        ctrl_c::untrack();
+        ctrl_c::reset();
         track_child_group(4321);
-        assert_eq!(ctrl_c::current(), -4321, "group target is the negated pid");
-        untrack_child();
-        assert_eq!(ctrl_c::current(), 0);
+        assert_eq!(
+            ctrl_c::tracked(),
+            vec![-4321],
+            "group target is the negated pid"
+        );
+        untrack_child(4321);
+        assert!(
+            ctrl_c::tracked().is_empty(),
+            "untrack_child takes the same pid and removes that group"
+        );
     }
 
     #[cfg(unix)]
@@ -1931,7 +4862,7 @@ mod tests {
         // interactive TTY Ctrl-C is not reproducible in CI without a pty; this pins
         // the own-group + single-forward invariant that makes it correct.)
         let _serial = CTRL_C_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        ctrl_c::untrack();
+        ctrl_c::reset();
 
         let marker = env::temp_dir().join(format!(
             "nub-sigint-count-{}-{}.marker",
@@ -1956,7 +4887,8 @@ mod tests {
 
         // Forward to the child's GROUP — the single, sole delivery path now that the
         // child is in its own group (nothing else signals it).
-        track_child_group(child.id());
+        let child_pid = child.id();
+        track_child_group(child_pid);
 
         // Let the trap install before delivering.
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1968,7 +4900,7 @@ mod tests {
         }
 
         let status = loop_wait(&mut child, std::time::Duration::from_secs(5));
-        untrack_child();
+        untrack_child(child_pid);
 
         let deliveries = fs::read_to_string(&marker)
             .map(|s| s.lines().count())
@@ -2022,7 +4954,8 @@ mod tests {
 
         // Register nub's forwarder for this child (installs the SIGUSR2 handler that
         // overrides the parent's terminate-on-USR2 default and relays to the child).
-        ctrl_c::track(child.id() as i32);
+        let tracked_pid = child.id() as i32;
+        ctrl_c::track(tracked_pid);
 
         // Give the child's `trap` a moment to install before we deliver the signal.
         std::thread::sleep(std::time::Duration::from_millis(150));
@@ -2037,7 +4970,7 @@ mod tests {
         // The relay is async (signal-hook self-pipe → forwarder thread → kill child),
         // so poll for the marker / child exit rather than racing it.
         let status = loop_wait(&mut child, std::time::Duration::from_secs(5));
-        ctrl_c::untrack();
+        ctrl_c::untrack(tracked_pid);
 
         let marker_written = marker.exists();
         let _ = fs::remove_file(&marker);
@@ -2055,6 +4988,111 @@ mod tests {
         );
         // Reaching here at all is the parent-survival half: a process killed by USR2
         // never runs these assertions.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_signal_reaches_every_concurrently_tracked_child() {
+        let _serial = CTRL_C_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Regression for #685. `nub run -r` runs members on concurrent worker threads
+        // — its concurrency defaults to `min(4, cpus)`, so this is the DEFAULT shape,
+        // not just `--parallel`. Each spawn used to overwrite a single global target
+        // slot, so one Ctrl-C reached whichever child happened to be tracked last
+        // (a race), every sibling was orphaned holding its port, and nub then blocked
+        // forever waiting on children it could no longer signal.
+        //
+        // Two own-group children, both tracked, ONE signal delivered to this process:
+        // both must run their trap. SIGUSR2 rather than SIGINT because it exercises
+        // the same fan-out through the identical forwarder path without perturbing the
+        // test harness's own interrupt handling — the defect is in which TARGETS get
+        // signalled, which is signal-agnostic.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let markers: Vec<_> = (0..2)
+            .map(|i| {
+                env::temp_dir().join(format!(
+                    "nub-fanout-{}-{}-{i}.marker",
+                    std::process::id(),
+                    stamp
+                ))
+            })
+            .collect();
+        for m in &markers {
+            let _ = fs::remove_file(m);
+        }
+
+        ctrl_c::reset();
+        let mut children = Vec::new();
+        for m in &markers {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(format!(
+                "trap 'echo got >{m}; exit 0' USR2; sleep 5 & wait",
+                m = m.display()
+            ));
+            // Own process group, exactly as the real `-r` script path does.
+            group_on_spawn(&mut cmd);
+            let child = cmd.spawn().expect("spawn fan-out child");
+            track_child_group(child.id());
+            children.push(child);
+        }
+
+        // Let both traps install before delivering.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        // SAFETY: kill(2) on our own pid with a signal nub has a handler for.
+        unsafe {
+            libc::kill(std::process::id() as i32, libc::SIGUSR2);
+        }
+
+        let codes: Vec<_> = children
+            .iter_mut()
+            .map(|c| loop_wait(c, std::time::Duration::from_secs(5)).and_then(|s| s.code()))
+            .collect();
+        for c in &mut children {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let written: Vec<bool> = markers.iter().map(|m| m.exists()).collect();
+        for m in &markers {
+            let _ = fs::remove_file(m);
+        }
+        for c in &children {
+            untrack_child(c.id());
+        }
+
+        assert_eq!(
+            written,
+            vec![true, true],
+            "ONE signal must reach BOTH tracked children — {written:?} means a sibling \
+             was orphaned, which is the #685 defect"
+        );
+        assert_eq!(
+            codes,
+            vec![Some(0), Some(0)],
+            "each child must exit 0 through its OWN trap, not be hard-killed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_exiting_leaves_its_siblings_signalable() {
+        let _serial = CTRL_C_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // The second half of #685, and the one a set alone doesn't buy: `untrack` used
+        // to CLEAR the slot, so the first member of a `-r` run to finish disarmed
+        // forwarding for everyone still running. A later Ctrl-C then reached nothing
+        // at all. Removing only its own entry is what keeps the survivors reachable.
+        ctrl_c::reset();
+        track_child_group(4321);
+        track_child_group(8765);
+        untrack_child(4321);
+        assert_eq!(
+            ctrl_c::tracked(),
+            vec![-8765],
+            "the finished child must remove only ITS OWN group and leave the sibling"
+        );
+        ctrl_c::reset();
     }
 
     // ---- issue #27: terminal-foreground hand-off to an interactive child ----
@@ -2112,7 +5150,7 @@ mod tests {
             if libc::setsid() < 0 {
                 return 2;
             }
-            libc::ioctl(slave, libc::TIOCSCTTY as libc::c_ulong, 0);
+            libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
             libc::dup2(slave, libc::STDIN_FILENO);
             if slave > 2 {
                 libc::close(slave);
@@ -2125,7 +5163,7 @@ mod tests {
         // stdout/stderr go to /dev/null so the worker's own captured output stays
         // clean; stdin is inherited (our pty slave) — that's the terminal under test.
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("read x; exit 0");
+        cmd.arg("-c").arg("read x");
         cmd.stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -2136,16 +5174,41 @@ mod tests {
         };
         let child_pid = child.id();
 
+        // Force the child-first ordering: tcsetpgrp alone cannot resume a child
+        // that already stopped on SIGTTIN before the parent ran the handoff.
+        let stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let stopped = loop {
+            let mut status: libc::c_int = 0;
+            // SAFETY: observe our live child without blocking past the deadline.
+            let r = unsafe {
+                libc::waitpid(
+                    child_pid as libc::pid_t,
+                    &mut status,
+                    libc::WNOHANG | libc::WUNTRACED,
+                )
+            };
+            if r == child_pid as libc::pid_t {
+                break libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGTTIN;
+            }
+            if r < 0 || std::time::Instant::now() >= stop_deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        if !stopped {
+            let _ = child.kill();
+            let _ = child.wait();
+            // SAFETY: close the live PTY master after reaping the child.
+            unsafe { libc::close(master) };
+            return 2;
+        }
+
         // Apply the fix under test (or not).
         let _fg = if apply_fix {
             foreground_child(child_pid)
         } else {
             None
         };
-
-        // Let the grandchild reach its blocking terminal read; if it's going to
-        // SIGTTIN-stop (no fix), it will have stopped by now.
-        std::thread::sleep(std::time::Duration::from_millis(300));
 
         // The "keystroke": a newline to the PTY master. With the fix the child is
         // foreground and reads it → exits 0; without it the child is stopped.
@@ -2158,6 +5221,9 @@ mod tests {
         // Observe the child with WUNTRACED so a SIGTTIN STOP is reported, polling ~2s.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let verdict = loop {
+            if !apply_fix {
+                break 1; // the observed SIGTTIN stop is the negative control
+            }
             let mut status: libc::c_int = 0;
             // SAFETY: waitpid on our child, non-blocking + report-stops.
             let r = unsafe {
@@ -2172,7 +5238,7 @@ mod tests {
                     break 1; // stopped (SIGTTIN) → the hang
                 }
                 if libc::WIFEXITED(status) {
-                    break 0; // read the keystroke and exited cleanly
+                    break if libc::WEXITSTATUS(status) == 0 { 0 } else { 2 };
                 }
             }
             if std::time::Instant::now() >= deadline {
@@ -2241,7 +5307,7 @@ mod tests {
             if libc::setsid() < 0 {
                 return 2;
             }
-            libc::ioctl(slave, libc::TIOCSCTTY as libc::c_ulong, 0);
+            libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
             libc::dup2(slave, libc::STDIN_FILENO);
             if slave > 2 {
                 libc::close(slave);
@@ -2258,11 +5324,22 @@ mod tests {
             "nub-pty-sigint-count-{}.marker",
             std::process::id()
         ));
+        // Readiness handshake: the child writes `ready` AFTER installing the INT trap
+        // and BEFORE its `read`. The driver waits for it (below) before sending the
+        // ETX, so the SIGINT can never land before the trap is in place — closing the
+        // verdict-3 race where a fixed grace sleep was too short on a loaded runner and
+        // the default disposition killed the child before it could record the delivery.
+        let ready = std::env::temp_dir().join(format!(
+            "nub-pty-sigint-ready-{}.marker",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&marker);
+        let _ = fs::remove_file(&ready);
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(format!(
-            "trap 'echo x >>{m}' INT; read ignored; sleep 0.3; exit 130",
-            m = marker.display()
+            "trap 'echo x >>{m}' INT; echo r >{r}; read ignored; sleep 0.3; exit 130",
+            m = marker.display(),
+            r = ready.display()
         ));
         cmd.stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::null())
@@ -2276,34 +5353,65 @@ mod tests {
 
         // The full nub topology: register the forwarder (the #26 double-delivery
         // path) AND hand the terminal foreground to the child (tcsetpgrp + suppress).
-        ctrl_c::untrack();
+        ctrl_c::reset();
         track_child_group(child_pid);
         let _fg = foreground_child(child_pid);
 
-        // Let the trap install + the child reach its terminal read as foreground.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Wait for the child to signal its INT trap is installed (it writes `ready`
+        // AFTER `trap ... INT`). Bounded poll — no fixed-duration timing assumption, so
+        // a loaded runner can't deliver the ETX before the trap is in place (the original
+        // flake: a too-short fixed grace let the SIGINT land pre-trap and the default
+        // disposition killed the child, recording nothing). Once the trap is installed
+        // the SIGINT is caught whether or not the child has yet reached its `read` (ISIG
+        // raises it for the foreground group regardless).
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            if std::time::Instant::now() >= ready_deadline {
+                // SAFETY: reap the child we spawned so the bail-out never leaks it.
+                unsafe {
+                    libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
+                    libc::close(master);
+                }
+                let _ = child.wait();
+                let _ = fs::remove_file(&marker);
+                let _ = fs::remove_file(&ready);
+                return 2; // setup error: child never signalled trap-installed
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
-        // The "Ctrl-C": ETX on the master. With ISIG (default), the line discipline
-        // raises SIGINT for the terminal's foreground group = the child's group.
+        // The "Ctrl-C": ETX on the master. With ISIG (default) the line discipline raises
+        // SIGINT for the terminal's foreground group = the child's group.
         // SAFETY: write to the live master fd.
         unsafe {
             let etx = b"\x03";
             libc::write(master, etx.as_ptr() as *const libc::c_void, 1);
         }
 
-        // Wait for the child to take the SIGINT and exit (poll ~2s).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let mut status: libc::c_int = 0;
-            // SAFETY: waitpid on our child, non-blocking.
-            let r = unsafe { libc::waitpid(child_pid as libc::pid_t, &mut status, libc::WNOHANG) };
-            if r == child_pid as libc::pid_t && libc::WIFEXITED(status) {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        // Gate the verdict on the child's ACTUAL recorded receipt (the line its INT trap
+        // appends to `marker`), polled with a generous deadline that tolerates scheduling
+        // latency on a loaded runner — NOT a fixed-duration window (the verdict-3 flake
+        // fix). The child does not exit on its own: after the trap fires its `read`
+        // restarts (a trapped signal does not make `read` return on dash/sh) and it
+        // blocks until the SIGKILL below, so we cannot wait on its exit. A delivered SIGINT
+        // is recorded in milliseconds; the full window only elapses when the synthetic ETX
+        // failed to raise a signal at all (see the verdict-3 note below).
+        let marker_lines = |p: &Path| {
+            fs::read_to_string(p)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let recv_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while marker_lines(&marker) == 0 && std::time::Instant::now() < recv_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Once the first receipt lands, a short bounded settle surfaces a #26 DOUBLE: the
+        // kernel's TTY delivery and nub's redundant forward fire off the SAME ETX,
+        // microseconds apart, so 500ms is ample to catch a second receipt before we read
+        // the authoritative count. No per-run cost when there is no double to see.
+        if marker_lines(&marker) >= 1 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
 
         // Clean up before reading the verdict so we never leak the child.
@@ -2315,14 +5423,21 @@ mod tests {
         let _ = child.wait();
         drop(_fg);
 
-        let deliveries = fs::read_to_string(&marker)
-            .map(|s| s.lines().count())
-            .unwrap_or(0);
+        let deliveries = marker_lines(&marker);
         let _ = fs::remove_file(&marker);
+        let _ = fs::remove_file(&ready);
 
         match deliveries {
             1 => 0, // exactly once — #26 preserved under the handoff
-            0 => 3, // lost SIGINT
+            // Empty marker: the synthetic ETX did not raise a SIGINT at all. In THIS
+            // topology that can ONLY be a pty-stimulus miss, never a nub fault: the
+            // kernel delivers a terminal Ctrl-C to the foreground child independently of
+            // nub (nub's suppression gates only its own *forward*, it cannot eat the TTY
+            // delivery), and the diagnostics confirm the child stays the live foreground
+            // group across the whole window. The miss is persistent for a given pty
+            // instance (resending the ETX does not help), so the DRIVER re-runs a FRESH
+            // worker on this verdict — see the retry loop there.
+            0 => 3,
             _ => 4, // double (or more) — the #26 regression
         }
     }
@@ -2400,25 +5515,39 @@ mod tests {
         // Driver mode: re-exec ourselves as a fresh (non-forked) worker process.
         let _serial = CTRL_C_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let exe = std::env::current_exe().expect("current_exe");
-        let code = Command::new(exe)
-            .args([
-                "--exact",
-                "node::spawn::tests::ctrl_c_under_foreground_handoff_delivers_sigint_to_child_exactly_once",
-            ])
-            .env("NUB_PTY_SIGINT_COUNT", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("re-exec test binary for PTY sigint-count scenario")
-            .code()
-            .unwrap_or(-1);
+        let run_worker = || -> i32 {
+            Command::new(&exe)
+                .args([
+                    "--exact",
+                    "node::spawn::tests::ctrl_c_under_foreground_handoff_delivers_sigint_to_child_exactly_once",
+                ])
+                .env("NUB_PTY_SIGINT_COUNT", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("re-exec test binary for PTY sigint-count scenario")
+                .code()
+                .unwrap_or(-1)
+        };
+
+        // Verdict 3 = the synthetic ETX did not raise a SIGINT for that pty instance at
+        // all (a pty-stimulus miss, NOT a nub fault — see `pty_sigint_count_worker`). The
+        // miss is persistent for a given pty, so re-run a FRESH worker (fresh openpty) to
+        // get a conclusive verdict. We retry ONLY on 3; a real #26 regression surfaces as
+        // 4 (double) and must fail immediately, never be retried away.
+        let mut code = run_worker();
+        let mut tries = 1;
+        while code == 3 && tries < 8 {
+            code = run_worker();
+            tries += 1;
+        }
 
         assert_eq!(
             code, 0,
             "under the #27 foreground hand-off a terminal Ctrl-C must deliver SIGINT to \
-             the child EXACTLY ONCE (issue #26); worker verdict {code} \
-             (0=exactly-once 3=lost-sigint 4=double 2=setup-err)"
+             the child EXACTLY ONCE (issue #26); final worker verdict {code} after {tries} \
+             attempt(s) (0=exactly-once 3=stimulus-miss 4=double 2=setup-err)"
         );
     }
 
@@ -2585,100 +5714,642 @@ mod tests {
         assert_eq!(resolve(&[("TEMP", "C:\\")]), PathBuf::from("C:\\"));
     }
 
-    #[test]
-    fn path_shim_setup_and_cleanup() {
-        let nub_bin = env::current_exe().unwrap();
-        // Race 8 concurrent setups first — the workspace runner calls this from
-        // its worker threads, and publication must be atomic (every call
-        // succeeds and agrees on the dir; no loser errors with EEXIST, no
-        // half-written shim). Then assert on the published result below.
-        let dirs: Vec<_> = std::thread::scope(|s| {
-            (0..8)
-                .map(|_| s.spawn(|| setup_path_shim(&nub_bin).unwrap()))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect()
-        });
-        assert!(
-            dirs.windows(2).all(|w| w[0] == w[1]),
-            "all concurrent setups must agree on one shim dir: {dirs:?}"
-        );
-        let shim_dir = setup_path_shim(&nub_bin).unwrap();
-        let dir = PathBuf::from(shim_dir.as_str());
-        assert!(
-            !fs::read_dir(&dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .any(|e| e.file_name().to_string_lossy().contains("staging")),
-            "lost-race staging temps must be cleaned up"
-        );
-
-        // The shim entry is platform-specific: a `node` symlink on Unix, a
-        // `node.exe` hardlink/copy on Windows (A-WIN2). Check the right one — and
-        // that it actually links/points to the binary we passed.
-        #[cfg(unix)]
-        {
-            let node_shim = dir.join("node");
-            assert!(
-                node_shim.symlink_metadata().is_ok(),
-                "unix: node symlink created"
-            );
-            assert_eq!(
-                fs::read_link(&node_shim).unwrap(),
-                nub_bin,
-                "unix: node symlinks to the nub binary"
-            );
+    fn shim_test_root(label: &str) -> PathBuf {
+        for _ in 0..PATH_SHIM_CREATE_RETRIES {
+            let root = env::temp_dir().join(format!(
+                "nub-path-shim-test-{}-{label}-{}",
+                std::process::id(),
+                nonce_hex(secure_shim_nonce().unwrap())
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => return root,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("creating isolated PATH shim test root: {error}"),
+            }
         }
-        #[cfg(windows)]
-        {
-            let node_shim = dir.join("node.exe");
-            assert!(
-                node_shim.is_file(),
-                "windows: node.exe (hardlink/copy) created"
-            );
-        }
+        panic!("could not create an isolated PATH shim test root")
+    }
 
-        cleanup_shim();
-        assert!(!dir.exists());
+    fn shim_test_binary(root: &Path, name: &str, contents: &[u8]) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, contents).unwrap();
+        path
     }
 
     #[test]
-    fn reaper_removes_dead_pid_dirs_and_spares_live_and_own() {
-        // Isolated scratch temp dir so we never touch the real TMPDIR.
-        let root = env::temp_dir().join(format!("nub-reaper-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-
-        let self_pid = 1000u32;
-        let live_pid = 2000u32; // a concurrent run, still alive
-        let dead_pid = 3000u32; // a run that was killed before cleanup
-
-        let mk = |pid: u32| {
-            let d = root.join(format!("nub-node-shim-{pid}"));
-            fs::create_dir_all(&d).unwrap();
-            fs::write(d.join("node"), b"shim").unwrap();
-            d
-        };
-        let own = mk(self_pid);
-        let live = mk(live_pid);
-        let dead = mk(dead_pid);
-        // A non-shim dir must be ignored entirely.
-        let unrelated = root.join("some-other-tmp");
-        fs::create_dir_all(&unrelated).unwrap();
-
-        // Liveness probe: every pid alive EXCEPT the dead one.
-        reap_stale_shims_in(&root, self_pid, |pid| pid != dead_pid);
-
+    fn path_shim_is_private_randomized_and_shared_by_concurrent_setups() {
+        let root = shim_test_root("concurrent");
+        let nub_binary = shim_test_binary(&root, "nub-bin", b"current nub");
+        let manager = PathShimManager::new();
+        let pid = 4242;
+        let dirs: Vec<_> = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        manager
+                            .setup_in(
+                                &nub_binary,
+                                &root,
+                                pid,
+                                || Ok([0xab; 16]),
+                                ShimSetupOptions::default(),
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect()
+        });
         assert!(
-            own.exists(),
-            "the current process's own dir is never reaped"
+            dirs.windows(2).all(|pair| pair[0] == pair[1]),
+            "concurrent callers published different PATH shim dirs: {dirs:?}"
         );
-        assert!(live.exists(), "a live concurrent run's dir is never reaped");
-        assert!(!dead.exists(), "a dead pid's leaked dir is reaped");
-        assert!(unrelated.exists(), "non-shim entries are left untouched");
 
-        let _ = fs::remove_dir_all(&root);
+        let dir = PathBuf::from(dirs[0].as_str());
+        assert_eq!(
+            parse_shim_dir_name(dir.file_name().unwrap().to_str().unwrap()),
+            Some((pid, ShimDirNameKind::Randomized))
+        );
+        assert!(
+            !fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains("staging"))
+        );
+        #[cfg(unix)]
+        {
+            let metadata = fs::symlink_metadata(&dir).unwrap();
+            assert_eq!(metadata.mode() & 0o7777, 0o700);
+            // SAFETY: `geteuid` has no preconditions.
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(
+                fs::read_link(node_shim_path(&dir)).unwrap(),
+                fs::canonicalize(&nub_binary).unwrap()
+            );
+        }
+
+        manager.cleanup();
+        assert!(!dir.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_same_pid_collision_is_never_adopted() {
+        let root = shim_test_root("collision");
+        let nub_binary = shim_test_binary(&root, "nub-bin", b"current nub");
+        let pid = 5151;
+        let stale_nonce = [0x11; 16];
+        let fresh_nonce = [0x22; 16];
+        let stale = root.join(format!(
+            "{PATH_SHIM_PREFIX}{pid}-{}",
+            nonce_hex(stale_nonce)
+        ));
+        create_shim_dir(&stale).unwrap();
+        set_private_shim_permissions(&stale).unwrap();
+        fs::write(node_shim_path(&stale), b"obsolete shim").unwrap();
+
+        let mut nonces = [stale_nonce, fresh_nonce].into_iter();
+        let manager = PathShimManager::new();
+        let created = manager
+            .setup_in(
+                &nub_binary,
+                &root,
+                pid,
+                || Ok(nonces.next().unwrap()),
+                ShimSetupOptions::default(),
+            )
+            .unwrap();
+        let expected = root.join(format!(
+            "{PATH_SHIM_PREFIX}{pid}-{}",
+            nonce_hex(fresh_nonce)
+        ));
+        assert_eq!(Path::new(created.as_str()), expected);
+        assert_eq!(fs::read(node_shim_path(&stale)).unwrap(), b"obsolete shim");
+
+        manager.cleanup();
+        assert!(stale.exists(), "cleanup removed a stale same-PID collision");
+        assert!(!expected.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unpublished_path_shim_rolls_back_before_retry() {
+        let root = shim_test_root("rollback");
+        let nub_binary = shim_test_binary(&root, "nub-bin", b"current nub");
+        let pid = 6161;
+        let nonce = [0x33; 16];
+        let dir = root.join(format!("{PATH_SHIM_PREFIX}{pid}-{}", nonce_hex(nonce)));
+        let manager = PathShimManager::new();
+
+        let error = manager
+            .setup_in(
+                &nub_binary,
+                &root,
+                pid,
+                || Ok(nonce),
+                ShimSetupOptions {
+                    #[cfg(windows)]
+                    force_copy: false,
+                    fail_before_commit: true,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected PATH shim commit failure")
+        );
+        assert!(!dir.exists(), "an unpublished PATH shim directory leaked");
+        assert!(manager.state.lock().unwrap().is_none());
+
+        manager
+            .setup_in(
+                &nub_binary,
+                &root,
+                pid,
+                || Ok(nonce),
+                ShimSetupOptions::default(),
+            )
+            .unwrap();
+        manager.cleanup();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_cached_shim_is_replaced_once_for_concurrent_callers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = shim_test_root("cached-invalid");
+        let nub_binary = shim_test_binary(&root, "nub-bin", b"current nub");
+        let replacement = shim_test_binary(&root, "replacement-bin", b"not nub");
+        let manager = PathShimManager::new();
+        let dir = manager
+            .setup_in(
+                &nub_binary,
+                &root,
+                7171,
+                || Ok([0x44; 16]),
+                ShimSetupOptions::default(),
+            )
+            .unwrap();
+        let node = node_shim_path(Path::new(dir.as_str()));
+        fs::rename(&node, node.with_extension("old")).unwrap();
+        #[cfg(unix)]
+        unix_fs::symlink(&replacement, &node).unwrap();
+        #[cfg(windows)]
+        fs::copy(&replacement, &node).unwrap();
+
+        let nonce_calls = AtomicUsize::new(0);
+        let replacements: Vec<_> = std::thread::scope(|scope| {
+            (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        manager
+                            .setup_in(
+                                &nub_binary,
+                                &root,
+                                7171,
+                                || {
+                                    nonce_calls.fetch_add(1, Ordering::Relaxed);
+                                    Ok([0x55; 16])
+                                },
+                                ShimSetupOptions::default(),
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect()
+        });
+        assert_eq!(nonce_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            replacements.windows(2).all(|pair| pair[0] == pair[1]),
+            "concurrent callers published different replacements: {replacements:?}"
+        );
+        assert_ne!(replacements[0], dir);
+        let replacement_dir = PathBuf::from(replacements[0].as_str());
+        assert!(replacement_dir.exists());
+
+        manager.cleanup();
+        assert!(!replacement_dir.exists());
+        assert!(
+            Path::new(dir.as_str()).exists(),
+            "cleanup removed a directory whose node entry changed identity"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_cached_shim_replacement_can_retry_later() {
+        let root = shim_test_root("cached-retry");
+        let nub_binary = shim_test_binary(&root, "nub-bin", b"current nub");
+        let replacement = shim_test_binary(&root, "replacement-bin", b"not nub");
+        let manager = PathShimManager::new();
+        let original = manager
+            .setup_in(
+                &nub_binary,
+                &root,
+                7272,
+                || Ok([0x66; 16]),
+                ShimSetupOptions::default(),
+            )
+            .unwrap();
+        let node = node_shim_path(Path::new(original.as_str()));
+        fs::rename(&node, node.with_extension("old")).unwrap();
+        #[cfg(unix)]
+        unix_fs::symlink(&replacement, &node).unwrap();
+        #[cfg(windows)]
+        fs::copy(&replacement, &node).unwrap();
+
+        let failed_nonce = [0x77; 16];
+        let failed_dir = root.join(format!(
+            "{PATH_SHIM_PREFIX}{}-{}",
+            7272,
+            nonce_hex(failed_nonce)
+        ));
+        let error = manager
+            .setup_in(
+                &nub_binary,
+                &root,
+                7272,
+                || Ok(failed_nonce),
+                ShimSetupOptions {
+                    #[cfg(windows)]
+                    force_copy: false,
+                    fail_before_commit: true,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected PATH shim commit failure")
+        );
+        assert!(manager.state.lock().unwrap().is_none());
+        assert!(!failed_dir.exists());
+
+        let retry_nonce = [0x88; 16];
+        let retried = manager
+            .setup_in(
+                &nub_binary,
+                &root,
+                7272,
+                || Ok(retry_nonce),
+                ShimSetupOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            Path::new(retried.as_str()),
+            root.join(format!(
+                "{PATH_SHIM_PREFIX}{}-{}",
+                7272,
+                nonce_hex(retry_nonce)
+            ))
+        );
+
+        manager.cleanup();
+        assert!(!Path::new(retried.as_str()).exists());
+        assert!(Path::new(original.as_str()).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn randomized_shim_name_parser_is_canonical() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_shim_dir_name("nub-node-shim-1"),
+            Some((1, ShimDirNameKind::Legacy))
+        );
+        assert_eq!(
+            parse_shim_dir_name(&format!("nub-node-shim-4294967295-{nonce}")),
+            Some((u32::MAX, ShimDirNameKind::Randomized))
+        );
+        assert!(is_legacy_staging_name(".node-staging-1-0", 1));
+        assert!(is_legacy_staging_name(
+            ".node-staging-1-18446744073709551615",
+            1
+        ));
+
+        for invalid in [
+            "nub-node-shim-01",
+            "nub-node-shim-4294967296",
+            "nub-node-shim-1-0123456789abcdef0123456789abcde",
+            "nub-node-shim-1-0123456789abcdef0123456789abcdeF",
+            "nub-node-shim-1-0123456789abcdef0123456789abcdef-extra",
+        ] {
+            assert_eq!(parse_shim_dir_name(invalid), None, "accepted {invalid}");
+        }
+        for invalid in [
+            ".node-staging-1-01",
+            ".node-staging-1-18446744073709551616",
+            ".node-staging-1-0-extra",
+        ] {
+            assert!(!is_legacy_staging_name(invalid, 1), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn reaper_handles_randomized_and_legacy_names_without_pid_reuse_damage() {
+        let root = shim_test_root("reaper");
+        let make = |name: &str| {
+            let dir = root.join(name);
+            create_shim_dir(&dir).unwrap();
+            set_private_shim_permissions(&dir).unwrap();
+            fs::write(node_shim_path(&dir), b"shim").unwrap();
+            dir
+        };
+        let own = make("nub-node-shim-1000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let live = make("nub-node-shim-2000-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let dead = make("nub-node-shim-3000-dddddddddddddddddddddddddddddddd");
+        let legacy_dead = make("nub-node-shim-3001");
+        fs::write(legacy_dead.join(".node-staging-3001-0"), b"staged").unwrap();
+        let dead_with_foreign = make("nub-node-shim-3005-55555555555555555555555555555555");
+        fs::write(dead_with_foreign.join("foreign-entry"), b"keep").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&legacy_dead, fs::Permissions::from_mode(0o755)).unwrap();
+        let malformed = make("nub-node-shim-3002-EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE");
+        #[cfg(unix)]
+        let non_private = {
+            let dir = make("nub-node-shim-3003-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        };
+        #[cfg(unix)]
+        let redirected = {
+            let target = root.join("redirect-target");
+            fs::create_dir(&target).unwrap();
+            let path = root.join("nub-node-shim-3004-ffffffffffffffffffffffffffffffff");
+            unix_fs::symlink(target, &path).unwrap();
+            path
+        };
+
+        reap_stale_shims_in(&root, 1000, |pid| pid == 2000);
+
+        assert!(own.exists());
+        assert!(live.exists());
+        assert!(!dead.exists());
+        assert!(!legacy_dead.exists());
+        assert!(
+            dead_with_foreign.join("foreign-entry").exists(),
+            "reaper recursively removed foreign directory contents"
+        );
+        assert!(malformed.exists());
+        #[cfg(unix)]
+        assert!(
+            non_private.exists(),
+            "a non-private randomized dir was reaped"
+        );
+        #[cfg(unix)]
+        assert!(
+            redirected.symlink_metadata().is_ok(),
+            "a redirected randomized path was reaped"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_staging_reaping_is_bounded_per_directory() {
+        let root = shim_test_root("legacy-reap-cap");
+        let dir = root.join("nub-node-shim-7777");
+        fs::create_dir(&dir).unwrap();
+        for counter in 0..=REAP_LEGACY_ENTRY_CAP {
+            fs::write(dir.join(format!(".node-staging-7777-{counter}")), b"staged").unwrap();
+        }
+
+        remove_legacy_staging_entries(&dir, 7777);
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().flatten().count(),
+            1,
+            "one sweep exceeded the per-directory reaper cap"
+        );
+        remove_legacy_staging_entries(&dir, 7777);
+        assert_eq!(fs::read_dir(&dir).unwrap().flatten().count(), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_identity_compares_the_full_128_bit_file_id() {
+        let lower_64_bits = [0x5a; 8];
+        let mut first_id = [0u8; 16];
+        first_id[..8].copy_from_slice(&lower_64_bits);
+        let mut second_id = first_id;
+        second_id[15] = 1;
+
+        assert_ne!(
+            WindowsFileIdentity {
+                volume_serial: 7,
+                file_id: first_id,
+            },
+            WindowsFileIdentity {
+                volume_serial: 7,
+                file_id: second_id,
+            },
+            "ReFS identities that differ above 64 bits must remain distinct"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_identity_rejects_unsupported_sentinel_values() {
+        assert!(windows_file_identity(7, [0; 16]).is_err());
+        assert!(windows_file_identity(7, [u8::MAX; 16]).is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_hardlink_and_forced_copy_keep_distinct_validated_identities() {
+        let root = shim_test_root("windows-publication");
+        let source = shim_test_binary(&root, "nub-bin", b"current nub bytes");
+
+        let hardlink_probe = root.join("hardlink-probe");
+        if fs::hard_link(&source, &hardlink_probe).is_ok() {
+            fs::remove_file(hardlink_probe).unwrap();
+            let hardlink_manager = PathShimManager::new();
+            let hardlink_dir = hardlink_manager
+                .setup_in(
+                    &source,
+                    &root,
+                    9191,
+                    || Ok([0x88; 16]),
+                    ShimSetupOptions::default(),
+                )
+                .unwrap();
+            {
+                let state = hardlink_manager.state.lock().unwrap();
+                let record = state.as_ref().unwrap();
+                let source_identity = FileHandle::from_path(&source).unwrap();
+                assert_eq!(source_identity, record.node_identity);
+                assert_eq!(
+                    FileHandle::from_path(&record.dir).unwrap(),
+                    record.dir_identity
+                );
+            }
+            hardlink_manager.cleanup();
+            assert!(
+                !Path::new(hardlink_dir.as_str()).exists(),
+                "Windows hardlink cleanup leaked its shim directory"
+            );
+        } else {
+            eprintln!("skipping hardlink publication: test TEMP does not support hardlinks");
+        }
+
+        let copy_manager = PathShimManager::new();
+        let dir = copy_manager
+            .setup_in(
+                &source,
+                &root,
+                9292,
+                || Ok([0x99; 16]),
+                ShimSetupOptions {
+                    force_copy: true,
+                    ..ShimSetupOptions::default()
+                },
+            )
+            .unwrap();
+        {
+            let state = copy_manager.state.lock().unwrap();
+            let record = state.as_ref().unwrap();
+            let source_identity = FileHandle::from_path(&source).unwrap();
+            assert_ne!(source_identity, record.node_identity);
+            assert_eq!(
+                fs::read(&source).unwrap(),
+                fs::read(node_shim_path(&record.dir)).unwrap(),
+                "forced-copy bytes differ from the source"
+            );
+        }
+
+        copy_manager.cleanup();
+        assert!(
+            !Path::new(dir.as_str()).exists(),
+            "Windows copy cleanup leaked its shim directory"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_cached_shim_rejects_directory_and_node_reparse_points() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let root = shim_test_root("windows-reparse");
+        let source = shim_test_binary(&root, "nub-bin", b"current nub bytes");
+
+        let dir_manager = PathShimManager::new();
+        let dir = PathBuf::from(
+            dir_manager
+                .setup_in(
+                    &source,
+                    &root,
+                    9393,
+                    || Ok([0xab; 16]),
+                    ShimSetupOptions::default(),
+                )
+                .unwrap()
+                .as_str(),
+        );
+        let displaced = dir.with_extension("old");
+        match fs::rename(&dir, &displaced) {
+            Ok(()) => {
+                if let Err(error) = symlink_dir(&displaced, &dir) {
+                    if error.raw_os_error() == Some(1314) {
+                        eprintln!(
+                            "skipping Windows directory reparse rejection: symlink privilege is unavailable"
+                        );
+                        dir_manager.cleanup();
+                    } else {
+                        panic!("creating directory reparse point: {error}");
+                    }
+                } else {
+                    let replacement = dir_manager
+                        .setup_in(
+                            &source,
+                            &root,
+                            9393,
+                            || Ok([0xac; 16]),
+                            ShimSetupOptions::default(),
+                        )
+                        .unwrap();
+                    assert_ne!(Path::new(replacement.as_str()), dir);
+                    assert!(Path::new(replacement.as_str()).exists());
+                    dir_manager.cleanup();
+                    assert!(!Path::new(replacement.as_str()).exists());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Windows can block renaming a directory while the cached
+                // directory/node handles are live. That is already fail-closed;
+                // exercise the reparse validator directly so this branch still
+                // covers the fallback boundary.
+                dir_manager.cleanup();
+                let target = root.join("directory-reparse-target");
+                let reparse = root.join("directory-reparse");
+                fs::create_dir(&target).unwrap();
+                if let Err(error) = symlink_dir(&target, &reparse) {
+                    if error.raw_os_error() == Some(1314) {
+                        eprintln!(
+                            "skipping direct Windows directory reparse rejection: symlink privilege is unavailable"
+                        );
+                    } else {
+                        panic!("creating direct directory reparse point: {error}");
+                    }
+                } else {
+                    let error = validate_shim_dir(&reparse, true).unwrap_err();
+                    assert!(
+                        error.to_string().contains("not a real directory"),
+                        "direct directory reparse point was not rejected: {error:#}"
+                    );
+                }
+            }
+            Err(error) => panic!("displacing cached shim directory: {error}"),
+        }
+
+        let node_manager = PathShimManager::new();
+        let dir = node_manager
+            .setup_in(
+                &source,
+                &root,
+                9494,
+                || Ok([0xad; 16]),
+                ShimSetupOptions {
+                    force_copy: true,
+                    ..ShimSetupOptions::default()
+                },
+            )
+            .unwrap();
+        let node = node_shim_path(Path::new(dir.as_str()));
+        fs::rename(&node, node.with_extension("old")).unwrap();
+        if let Err(error) = symlink_file(&source, &node) {
+            if error.raw_os_error() == Some(1314) {
+                eprintln!(
+                    "skipping Windows node reparse rejection: symlink privilege is unavailable"
+                );
+                node_manager.cleanup();
+                fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            panic!("creating file reparse point: {error}");
+        }
+        let replacement = node_manager
+            .setup_in(
+                &source,
+                &root,
+                9494,
+                || Ok([0xae; 16]),
+                ShimSetupOptions::default(),
+            )
+            .unwrap();
+        assert_ne!(Path::new(replacement.as_str()), Path::new(dir.as_str()));
+        assert!(Path::new(replacement.as_str()).exists());
+        node_manager.cleanup();
+        assert!(!Path::new(replacement.as_str()).exists());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2704,30 +6375,98 @@ mod tests {
     #[test]
     fn coverage_exclude_targets_absolute_runtime_dir_only_when_coverage_active() {
         let preload = "/opt/nub/runtime/preload.mjs";
+        let runtime = "--test-coverage-exclude=/opt/nub/runtime/**";
+        let default = format!("--test-coverage-exclude={NODE_DEFAULT_COVERAGE_EXCLUDE}");
+        // 26.7 has Node's own default exclusion; 22.15 has the FLAG but no default.
+        let modern = NodeVersion::new(26, 7, 0);
+        let no_default = NodeVersion::new(22, 15, 0);
 
         // No coverage flag anywhere → no exclude injected.
-        assert!(coverage_exclude_glob(&[], None, Some(preload)).is_none());
+        assert!(coverage_exclude_globs(&modern, &[], None, Some(preload)).is_empty());
 
         // Coverage via argv → exclude keyed to the ABSOLUTE runtime dir (the
-        // preload's parent), with a trailing `/**` — not a broad `**/runtime/**`.
+        // preload's parent), with a trailing `/**` — not a broad `**/runtime/**` —
+        // PLUS Node's default test-file pattern, which the runtime exclude would
+        // otherwise disable.
         let argv = vec![
             "--test".to_string(),
             "--experimental-test-coverage".to_string(),
         ];
         assert_eq!(
-            coverage_exclude_glob(&argv, None, Some(preload)).as_deref(),
-            Some("--test-coverage-exclude=/opt/nub/runtime/**"),
+            coverage_exclude_globs(&modern, &argv, None, Some(preload)),
+            vec![runtime.to_string(), default.clone()],
         );
 
         // Coverage via NODE_OPTIONS is detected the same way.
         assert_eq!(
-            coverage_exclude_glob(&[], Some("--experimental-test-coverage"), Some(preload))
-                .as_deref(),
-            Some("--test-coverage-exclude=/opt/nub/runtime/**"),
+            coverage_exclude_globs(
+                &modern,
+                &[],
+                Some("--experimental-test-coverage"),
+                Some(preload)
+            ),
+            vec![runtime.to_string(), default.clone()],
+        );
+
+        // On a Node with no default exclusion of its own, re-stating the pattern
+        // would EXCLUDE test files stock node reports — the parity break in the
+        // opposite direction. Only the runtime exclude goes out there.
+        assert_eq!(
+            coverage_exclude_globs(&no_default, &argv, None, Some(preload)),
+            vec![runtime.to_string()],
+        );
+
+        // A user exclude turns Node's default off for stock node too, so nub must
+        // not re-add it — on either channel.
+        let mut user_argv = argv.clone();
+        user_argv.push("--test-coverage-exclude=dist/**".to_string());
+        assert_eq!(
+            coverage_exclude_globs(&modern, &user_argv, None, Some(preload)),
+            vec![runtime.to_string()],
+        );
+        assert_eq!(
+            coverage_exclude_globs(
+                &modern,
+                &argv,
+                Some("--test-coverage-exclude=dist/**"),
+                Some(preload)
+            ),
+            vec![runtime.to_string()],
+        );
+
+        // An ancestor nub's NODE_OPTIONS carries the SAME runtime exclude this
+        // process injects, with no matching preload token beside it (re-quoted in
+        // transit, or a different tier's preload). That token is nub's own, not a
+        // user exclude, so the default is still restated; the quoted form
+        // node_options_token emits for a spacey path counts the same.
+        assert_eq!(
+            coverage_exclude_globs(&modern, &argv, Some(runtime), Some(preload)),
+            vec![runtime.to_string(), default.clone()],
+        );
+        let spacey = "/opt/my nub/runtime/preload.mjs";
+        let spacey_runtime = "--test-coverage-exclude=/opt/my nub/runtime/**";
+        let spacey_opts = format!(
+            "--require=x --test-coverage-exclude={}",
+            node_options_token("/opt/my nub/runtime/**")
+        );
+        assert_eq!(
+            coverage_exclude_globs(&modern, &argv, Some(&spacey_opts), Some(spacey)),
+            vec![spacey_runtime.to_string(), default.clone()],
+        );
+        // …and after an intermediate re-emit that quotes the WHOLE token (the
+        // passthrough in split_inherited_preloads, or a tool re-parsing
+        // NODE_OPTIONS), where the quotes move to the front of the token.
+        let requoted = format!(
+            "--require=x {}",
+            node_options_token("--test-coverage-exclude=/opt/my nub/runtime/**")
+        );
+        assert_eq!(
+            coverage_exclude_globs(&modern, &argv, Some(&requoted), Some(spacey)),
+            vec![spacey_runtime.to_string(), default.clone()],
         );
 
         // Coverage active but no resolvable preload → nothing to exclude.
-        assert!(coverage_exclude_glob(&argv, None, None).is_none());
+        assert!(coverage_exclude_globs(&modern, &argv, None, None).is_empty());
     }
 
     #[test]
@@ -2807,13 +6546,171 @@ mod tests {
     }
 
     #[test]
+    fn threadpool_size_is_cores_floored_at_four_and_clamped_to_headroom() {
+        // The rule nodejs/performance#193 proposes: max(4, cores). Pinned off
+        // Windows: the platform wrapper caps there, and this test runs on every OS.
+        let unix = |cores, headroom| threadpool_size_from_on(cores, headroom, false);
+        assert_eq!(unix(1, None), 4);
+        assert_eq!(unix(4, None), 4);
+        assert_eq!(unix(10, None), 10);
+        assert_eq!(unix(64, None), 64);
+        // A detected thread ceiling clamps it — libuv aborts if one pool thread
+        // cannot be created — but never below the default plain Node would ask for.
+        assert_eq!(unix(64, Some(16)), 16);
+        assert_eq!(unix(64, Some(2)), 4);
+        assert_eq!(unix(8, Some(100)), 8);
+        // Windows commits 8 MB per pool thread, so the pool stops at 8 there.
+        assert_eq!(threadpool_size_from_on(64, None, true), 8);
+        assert_eq!(threadpool_size_from_on(6, None, true), 6);
+        assert_eq!(threadpool_size_from_on(64, Some(6), true), 6);
+        // The platform wrapper picks the branch this host is on.
+        assert_eq!(
+            threadpool_size_from(64, None),
+            if cfg!(windows) { 8 } else { 64 }
+        );
+        // A restorable-var slot exists for it, so a compat boundary removes it.
+        assert!(RestorableVar::lookup(THREADPOOL_SIZE_ENV).is_some());
+    }
+
+    #[test]
+    fn compat_presence_marker_distinguishes_empty_from_absent() {
+        let node = RestorableVar::lookup("NODE").expect("NODE is restoration-controlled");
+        assert!(
+            node.was_present(node.bit),
+            "the presence bit keeps an explicitly empty value present"
+        );
+        assert!(
+            !node.was_present(0),
+            "a cleared bit means the variable was absent"
+        );
+    }
+
+    #[test]
+    fn expected_value_presence_marker_keeps_every_string_representable() {
+        assert_eq!(
+            decode_expected_augmentation_value(Some(OsString::from("any value")), None),
+            None,
+            "the companion marker is mandatory for this unreleased wire shape"
+        );
+        assert_eq!(
+            decode_expected_augmentation_value(Some(OsString::new()), Some("1")),
+            Some(Some(OsString::new())),
+            "an explicitly empty expected value is present"
+        );
+        assert_eq!(
+            decode_expected_augmentation_value(Some(OsString::from("ignored")), Some("0")),
+            Some(None),
+            "the companion marker, not the value payload, encodes absence"
+        );
+    }
+
+    #[test]
+    fn fresh_boundary_removes_only_parent_owned_node_options() {
+        let original = OsString::from("--ambient");
+        let expected = OsStr::new("--ambient --require=/nub/preload.cjs");
+        let restore = |current: Option<&OsStr>| {
+            restored_node_options(current, Some(Some(expected)), original.clone(), true)
+        };
+
+        assert_eq!(
+            restore(Some(expected)),
+            Some(Some(original.clone())),
+            "an unchanged parent value restores the pre-augmentation ambient value"
+        );
+        assert_eq!(
+            restore(Some(OsStr::new(
+                "--ambient --require=/nub/preload.cjs --trace-warnings"
+            ))),
+            Some(Some(OsString::from("--ambient --trace-warnings"))),
+            "an appended user value must survive"
+        );
+        assert_eq!(
+            restore(Some(OsStr::new(
+                "--trace-warnings --ambient --require=/nub/preload.cjs"
+            ))),
+            Some(Some(OsString::from("--trace-warnings --ambient"))),
+            "a prepended user value must survive"
+        );
+        assert_eq!(
+            restore(Some(OsStr::new("--max-old-space-size=8192"))),
+            None,
+            "a complete user replacement must survive untouched"
+        );
+    }
+
+    #[test]
+    fn fresh_boundary_tracks_an_expected_absent_value() {
+        assert_eq!(
+            restored_node_options(None, Some(None), OsString::from("--ambient"), true),
+            Some(Some(OsString::from("--ambient"))),
+            "an unchanged absent parent value restores the captured ambient value"
+        );
+        assert_eq!(
+            restored_node_options(
+                Some(OsStr::new("--trace-warnings")),
+                Some(None),
+                OsString::new(),
+                false,
+            ),
+            None,
+            "a value added after an absent parent value must survive"
+        );
+    }
+
+    #[test]
+    fn path_matcher_is_exact() {
+        let shim = std::path::Path::new("/tmp/nub-node-shim-42");
+        let matcher = ShimPathMatcher::new(shim.as_os_str());
+        assert!(matcher.matches(shim));
+        assert!(!matcher.matches(std::path::Path::new("/tmp/nub-node-shim-4")));
+        assert!(!matcher.matches(std::path::Path::new("/usr/bin")));
+    }
+
+    #[test]
+    fn fresh_path_restoration_removes_only_the_parent_shim() {
+        let shim = std::path::Path::new("/tmp/nub-node-shim-42");
+        let inherited_shim = std::path::Path::new("/tmp/nub-node-shim-7");
+        let bin = std::path::Path::new("/project/node_modules/.bin");
+        let addition = std::path::Path::new("/user/addition");
+        let original = env::join_paths([inherited_shim, std::path::Path::new("/usr/bin")]).unwrap();
+        let path = env::join_paths([shim, bin, inherited_shim, addition]).unwrap();
+        let restored = remove_parent_shim_from_path(&path, &original)
+            .expect("the parent shim must be found")
+            .expect("remaining PATH entries are representable");
+        assert_eq!(
+            env::split_paths(&restored).collect::<Vec<_>>(),
+            vec![
+                bin.to_path_buf(),
+                inherited_shim.to_path_buf(),
+                addition.to_path_buf()
+            ]
+        );
+    }
+
+    /// A process spawned during a parent's startup inherits the threadpool mark
+    /// that tells its preload to discard nub's value. A fresh `nub` among them
+    /// must shed the mark, or its own child would keep Node's four. Only a host
+    /// with more than four cores reaches that path, which CI's runners do not.
+    #[test]
+    fn a_fresh_invocation_sheds_the_threadpool_taken_mark() {
+        assert!(augmentation_environment_restoration().contains(&(THREADPOOL_TAKEN_ENV, None)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_matcher_handles_a_quoted_semicolon_entry() {
+        let matcher = ShimPathMatcher::new(OsStr::new(r"C:\nub-node-shim-42"));
+        assert!(matcher.matches(std::path::Path::new(r"C:/nub-node-shim-42")));
+    }
+
+    #[test]
     fn preload_injection_is_require_cjs_on_fast_tier_import_mjs_on_compat() {
         let mjs = "/opt/nub/runtime/preload.mjs";
 
         // Fast tier (>= 22.15): `--require` the sibling CJS preload by raw PATH
         // (require does not accept a file:// URL). This is the channel that keeps
         // Node's synchronous CJS entry path (the R1 fix).
-        let fast = preload_injection_for(mjs, &NodeVersion::new(22, 15, 0), false);
+        let fast = preload_injection_for(mjs, &NodeVersion::new(22, 15, 0), false, false);
         assert_eq!(fast.flag, "--require");
         assert_eq!(fast.value, "/opt/nub/runtime/preload.cjs");
         assert_eq!(
@@ -2821,24 +6718,199 @@ mod tests {
             "--require=/opt/nub/runtime/preload.cjs"
         );
 
+        // On Linux the compat tier carries the threadpool sidecar as its own
+        // `--require` token ahead of the preload; the fast tier never does (its
+        // `--require` preload takes the snapshot itself), and the re-entrancy key
+        // stays the preload's token alone.
+        let compat_linux = preload_injection_for(mjs, &NodeVersion::new(20, 11, 0), false, true);
+        assert_eq!(
+            compat_linux.sidecar.as_deref(),
+            Some("/opt/nub/runtime/threadpool-snapshot.cjs")
+        );
+        assert_eq!(
+            compat_linux.node_options_tokens(),
+            vec![
+                "--require=/opt/nub/runtime/threadpool-snapshot.cjs",
+                "--import=file:///opt/nub/runtime/preload.mjs"
+            ]
+        );
+        assert_eq!(
+            compat_linux.node_options_token(),
+            "--import=file:///opt/nub/runtime/preload.mjs"
+        );
+        let fast_linux = preload_injection_for(mjs, &NodeVersion::new(22, 15, 0), false, true);
+        assert!(fast_linux.sidecar.is_none());
+        assert_eq!(
+            fast_linux.node_options_tokens(),
+            vec![fast_linux.node_options_token()]
+        );
+        assert!(fast.sidecar.is_none(), "no sidecar on the fast tier");
+
         // A clearly-fast version too (24.x).
-        let fast24 = preload_injection_for(mjs, &NodeVersion::new(24, 0, 0), false);
+        let fast24 = preload_injection_for(mjs, &NodeVersion::new(24, 0, 0), false, false);
         assert_eq!(fast24.flag, "--require");
         assert_eq!(fast24.value, "/opt/nub/runtime/preload.cjs");
 
         // Compat tier (< 22.15): `--import` the ESM preload by file:// URL — the
         // async path stays unchanged.
-        let compat = preload_injection_for(mjs, &NodeVersion::new(20, 11, 0), false);
+        let compat = preload_injection_for(mjs, &NodeVersion::new(20, 11, 0), false, false);
         assert_eq!(compat.flag, "--import");
         assert_eq!(compat.value, "file:///opt/nub/runtime/preload.mjs");
+        assert!(compat.sidecar.is_none(), "no sidecar off Linux");
         assert_eq!(
             compat.node_options_token(),
             "--import=file:///opt/nub/runtime/preload.mjs"
         );
 
         // The 22.14.x boundary stays on the compat (import) channel.
-        let boundary = preload_injection_for(mjs, &NodeVersion::new(22, 14, 99), false);
+        let boundary = preload_injection_for(mjs, &NodeVersion::new(22, 14, 99), false, false);
         assert_eq!(boundary.flag, "--import");
+
+        // 23.0–23.4 sorts above 22.15 but predates `registerHooks` on the 23.x line
+        // (which got it at 23.5.0), so it MUST take the compat channel. Routing it to
+        // `--require preload.cjs` crashed every run at startup with
+        // `module_.registerHooks is not a function`.
+        for pre in [
+            NodeVersion::new(23, 0, 0),
+            NodeVersion::new(23, 4, 0),
+            NodeVersion::new(23, 4, 99),
+        ] {
+            let injection = preload_injection_for(mjs, &pre, false, false);
+            assert_eq!(
+                injection.flag, "--import",
+                "Node {pre} has no sync registerHooks and must use the compat preload"
+            );
+            assert_eq!(injection.value, "file:///opt/nub/runtime/preload.mjs");
+        }
+
+        // 23.5.0 is the 23.x line's fast floor — the release that added registerHooks.
+        let fast235 = preload_injection_for(mjs, &NodeVersion::new(23, 5, 0), false, false);
+        assert_eq!(fast235.flag, "--require");
+        assert_eq!(fast235.value, "/opt/nub/runtime/preload.cjs");
+    }
+
+    fn tokens(specs: &[&str], version: &NodeVersion) -> Vec<String> {
+        let owned: Vec<String> = specs.iter().map(|s| (*s).to_string()).collect();
+        user_preload_injections_for(&owned, version, false)
+            .iter()
+            .map(|injection| injection.node_options_token())
+            .collect()
+    }
+
+    /// A lone `.cjs` USER preload rides `--require` only where nothing else pulls in
+    /// the ESM loader. On the compat tier nub's own preload is an `--import`, so the
+    /// user's must be one too: Node runs every `--require` before any `--import`
+    /// regardless of token order (a `--require` would beat nub's hooks into the
+    /// process), and re-runs `--require` preloads inside the `module.register()`
+    /// loader worker the compat tier always spawns (so it would also run twice).
+    #[test]
+    fn lone_cjs_preload_rides_import_on_compat_tier_require_on_fast_tier() {
+        assert_eq!(
+            tokens(&["/proj/pre.cjs"], &NodeVersion::new(22, 15, 0)),
+            ["--require=/proj/pre.cjs"]
+        );
+
+        for version in [
+            NodeVersion::new(22, 14, 99),
+            NodeVersion::new(20, 11, 0),
+            NodeVersion::new(18, 19, 0),
+        ] {
+            assert_eq!(
+                tokens(&["/proj/pre.cjs"], &version),
+                ["--import=file:///proj/pre.cjs"],
+                "Node {version}: a .cjs user preload must not ride --require on the compat tier"
+            );
+        }
+    }
+
+    /// A sibling `--import` entry forces the runtime onto its async loader-worker
+    /// tier even on the fast tier, so a `.cjs` alongside one has the same
+    /// runs-early-and-twice problem and is rerouted too. Rerouting is free here: the
+    /// sibling has already forced eager ESM-loader init, so the R1 entry semantics
+    /// that `--require` protects are gone either way. Declared order is preserved.
+    #[test]
+    fn cjs_preload_is_rerouted_when_a_sibling_entry_forces_the_esm_loader() {
+        assert_eq!(
+            tokens(
+                &["/proj/b.mjs", "/proj/a.cjs"],
+                &NodeVersion::new(22, 15, 0)
+            ),
+            ["--import=file:///proj/b.mjs", "--import=file:///proj/a.cjs"]
+        );
+        // No sibling `--import`: every entry keeps the sync `--require` channel.
+        assert_eq!(
+            tokens(
+                &["/proj/a.cjs", "/proj/c.cjs"],
+                &NodeVersion::new(22, 15, 0)
+            ),
+            ["--require=/proj/a.cjs", "--require=/proj/c.cjs"]
+        );
+    }
+
+    /// An oddly-cased `.CJS` keeps `--require` even where the ESM loader is forced.
+    /// Node's ESM loader would abort the process with ERR_UNKNOWN_FILE_EXTENSION on
+    /// it, whereas `require` loads an unrecognized extension as JS — so rerouting
+    /// would trade a preload-ordering bug for a hard startup crash.
+    #[test]
+    fn oddly_cased_cjs_preload_is_not_rerouted_onto_import() {
+        for version in [NodeVersion::new(20, 11, 0), NodeVersion::new(24, 0, 0)] {
+            assert_eq!(
+                tokens(&["/proj/pre.CJS"], &version),
+                ["--require=/proj/pre.CJS"],
+                "Node {version}: .CJS must stay on --require (the ESM loader has no \
+                 case-insensitive or unknown-extension fallback)"
+            );
+        }
+    }
+
+    /// Non-`.cjs` preloads are `--import` on BOTH tiers, and only a real path gets
+    /// the file:// spelling — a bare specifier stays bare so Node resolves it as an
+    /// ordinary import from the cwd.
+    #[test]
+    fn user_preload_import_form_is_tier_independent_and_spares_bare_specifiers() {
+        for version in [NodeVersion::new(24, 0, 0), NodeVersion::new(20, 11, 0)] {
+            assert_eq!(
+                tokens(&["/proj/pre.mjs"], &version),
+                ["--import=file:///proj/pre.mjs"]
+            );
+            assert_eq!(
+                tokens(&["telemetry-pkg"], &version),
+                ["--import=telemetry-pkg"],
+                "Node {version}: a bare specifier must not be mangled into a file:// URL"
+            );
+        }
+    }
+
+    /// Whether a spec needs the file:// spelling is decided from the `windows`
+    /// parameter, never the host — so both spellings are exercised wherever the
+    /// suite runs. Deciding it with `Path::is_absolute` instead passed everywhere
+    /// locally and failed all three POSIX-fixture cases above on the Windows CI leg,
+    /// where `/proj/pre.cjs` is rooted but not drive-qualified: the injection fell
+    /// through to the bare-specifier branch and emitted `--import=/proj/pre.cjs`.
+    #[test]
+    fn file_url_worthiness_is_decided_by_the_windows_flag_not_the_host() {
+        assert!(is_absolute_path("/proj/pre.cjs", false));
+        assert!(!is_absolute_path("telemetry-pkg", false));
+
+        // Rooted but not drive-qualified — Windows agrees this is not absolute.
+        assert!(!is_absolute_path("/proj/pre.cjs", true));
+        assert!(is_absolute_path(r"C:\proj\pre.cjs", true));
+        assert!(is_absolute_path("C:/proj/pre.cjs", true));
+        assert!(is_absolute_path(r"\\server\share\pre.cjs", true));
+        assert!(is_absolute_path(r"\\?\C:\proj\pre.cjs", true));
+        assert!(!is_absolute_path("telemetry-pkg", true));
+        assert!(!is_absolute_path("C:", true));
+
+        // End to end: a Windows drive path reaches Node as a drive-qualified URL,
+        // not as `file://C:\…` (whose drive would parse as the URL authority).
+        let specs = vec![r"C:\proj\pre.mjs".to_string()];
+        let win = user_preload_injections_for(&specs, &NodeVersion::new(20, 11, 0), true);
+        assert_eq!(
+            win.iter()
+                .map(|injection| injection.node_options_token())
+                .collect::<Vec<_>>(),
+            ["--import=file:///C:/proj/pre.mjs"]
+        );
     }
 
     #[test]
@@ -2880,6 +6952,15 @@ mod tests {
         assert_eq!(strip_verbatim(r"C:\a\b", true), r"C:\a\b"); // no prefix: unchanged
         // Non-Windows host never strips (a unix path could legitimately start oddly).
         assert_eq!(strip_verbatim(r"\\?\C:\a", false), r"\\?\C:\a");
+        // The `Path` form is the same rule for a path headed to Node's argv.
+        assert_eq!(
+            strip_verbatim_path(Path::new(r"\\?\C:\a\b"), true),
+            PathBuf::from(r"C:\a\b")
+        );
+        assert_eq!(
+            strip_verbatim_path(Path::new(r"\\?\C:\a\b"), false),
+            PathBuf::from(r"\\?\C:\a\b")
+        );
     }
 
     #[test]

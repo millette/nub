@@ -250,7 +250,7 @@ pub(crate) fn diag_config_from_flag(cli: &Cli) -> Option<Option<aube_util::diag:
         Some(
             cli.diag_file
                 .clone()
-                .unwrap_or_else(|| PathBuf::from("aube-diag.jsonl")),
+                .unwrap_or_else(|| PathBuf::from(format!("{}-diag.jsonl", aube_util::prog()))),
         )
     } else {
         cli.diag_file.clone()
@@ -430,6 +430,7 @@ pub(crate) fn command_needs_package_manager_guard(command: Option<&Commands>) ->
         None | Some(Commands::Config(_))
             | Some(Commands::Get(_))
             | Some(Commands::Set(_))
+            | Some(Commands::Prefix(_))
             | Some(Commands::Completion(_))
     )
 }
@@ -458,7 +459,8 @@ pub(crate) fn package_manager_guard_mode(command: Option<&Commands>) -> PackageM
 
 pub(crate) fn compute_effective_filter(cli: &Cli) -> aube_workspace::selector::EffectiveFilter {
     let mut filters = cli.filter.clone();
-    if cli.recursive && filters.is_empty() && cli.filter_prod.is_empty() {
+    let recursive = cli.recursive && filters.is_empty() && cli.filter_prod.is_empty();
+    if recursive {
         filters.push("*".to_string());
     }
     aube_workspace::selector::EffectiveFilter {
@@ -466,5 +468,6 @@ pub(crate) fn compute_effective_filter(cli: &Cli) -> aube_workspace::selector::E
         filter_prods: cli.filter_prod.clone(),
         fail_if_no_match: cli.fail_if_no_match,
         include_workspace_root: cli.include_workspace_root || cli.workspace_root,
+        recursive,
     }
 }

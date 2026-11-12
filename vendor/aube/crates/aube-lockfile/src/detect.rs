@@ -20,6 +20,11 @@
 //! | none        | exactly one PM's                   | `Existing(<that kind>)` (precedence)    |
 //! | none        | none                               | `Fresh`                                 |
 //! | none        | two or more PMs'                   | `Err(AmbiguousLockfiles)`               |
+//! | self        | two or more PMs'                   | `Existing(canonical, else precedence)`  |
+//!
+//! The last row is why a declaration is worth setting: only an
+//! *undeclared* project is ambiguous. A declaration — whether it names
+//! a specific manager or the running tool itself — always resolves.
 //!
 //! Two carve-outs keep aube's own canonical flow intact:
 //!
@@ -150,6 +155,41 @@ pub fn declared_package_manager(project_dir: &Path) -> Option<DeclaredPackageMan
     })
 }
 
+/// The version `<project_dir>/package.json` declares for `tool`, with a
+/// Corepack `+sha512` suffix stripped. A `packageManager` pin answers only for
+/// the tool it names. In `devEngines.packageManager` (object or array) the
+/// entries naming `tool` give its version when they all state the same one, so
+/// a multi-tool array, which [`declared_package_manager`] reads as no single
+/// pin, still says which version of the lockfile's tool it accepts, whatever
+/// the entries' order.
+pub fn declared_version_for(project_dir: &Path, tool: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(project_dir.join("package.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let strip = |v: &str| v.split('+').next().unwrap_or_default().to_string();
+    if let Some(spec) = json.get("packageManager").and_then(|v| v.as_str()) {
+        let (name, version) = spec.split_once('@').unwrap_or((spec, ""));
+        if !name.is_empty() {
+            return (name == tool && !version.is_empty()).then(|| strip(version));
+        }
+    }
+    let entries: Vec<&serde_json::Value> = match json.get("devEngines")?.get("packageManager")? {
+        serde_json::Value::Array(entries) => entries.iter().collect(),
+        other => vec![other],
+    };
+    let versions: Vec<Option<&str>> = entries
+        .into_iter()
+        .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some(tool))
+        .map(|e| e.get("version").and_then(|v| v.as_str()))
+        .collect();
+    let first = *versions.first()?;
+    versions
+        .iter()
+        .all(|v| *v == first)
+        .then_some(first)
+        .flatten()
+        .map(strip)
+}
+
 /// The lockfile format a declared package manager's fresh write
 /// targets (and whose filename the contradiction error names). `None`
 /// for names that don't map onto a format aube knows — foreign tools
@@ -172,7 +212,7 @@ fn declared_lockfile_kind(name: &str) -> Option<LockfileKind> {
 /// The PM family a lockfile kind belongs to, for the ambiguity check.
 /// Kinds owned by the same tool (npm's shrinkwrap + package-lock,
 /// yarn classic + berry) never make a project ambiguous together.
-fn family(kind: LockfileKind) -> &'static str {
+pub(crate) fn family(kind: LockfileKind) -> &'static str {
     match kind {
         LockfileKind::Aube => "aube",
         LockfileKind::Pnpm => "pnpm",
@@ -256,9 +296,33 @@ pub fn resolve_project_lockfile_kind(project_dir: &Path) -> Result<ResolvedLockf
             Ok(ResolvedLockfileKind::Fresh) if declared.is_some() => {
                 Ok(ResolvedLockfileKind::DeclaredFresh(LockfileKind::Aube))
             }
-            // Declared `aube` + several foreign lockfiles is still
-            // ambiguous: aube preserves the existing format, and with
-            // two candidates there's no fact of the matter which one.
+            // A self-name declaration is an explicit statement of ownership,
+            // so it settles what filename precedence alone cannot: the
+            // canonical lockfile wins when present, else the
+            // highest-precedence candidate. This is what the module docs have
+            // always promised ("never makes a multi-lockfile project
+            // ambiguous"); the code contradicted them.
+            //
+            // Leaving it ambiguous made the state inescapable in practice:
+            // `install` writes this declaration itself, so once anything drops
+            // a second lockfile beside the canonical one — a hosted builder
+            // running its own install is the common case — every later install
+            // refused, and the suggested remedy (declare a manager) was
+            // already done.
+            Err(Error::AmbiguousLockfiles { found }) if declared.is_some() => {
+                match existing
+                    .iter()
+                    .find(|(_, k)| *k == LockfileKind::Aube)
+                    .or_else(|| existing.first())
+                {
+                    Some((path, kind)) => Ok(ResolvedLockfileKind::Existing(refine_yarn_kind(
+                        path, *kind,
+                    ))),
+                    // Unreachable in practice (an ambiguity implies at least
+                    // two candidates); propagate rather than panic.
+                    None => Err(Error::AmbiguousLockfiles { found }),
+                }
+            }
             other => other,
         },
     }
@@ -446,6 +510,37 @@ mod tests {
             panic!("expected AmbiguousLockfiles, got {err:?}");
         };
         assert_eq!(found, "pnpm-lock.yaml, yarn.lock");
+    }
+
+    #[test]
+    fn a_self_name_declaration_resolves_a_multi_lockfile_project() {
+        // The state a hosted builder manufactures: the canonical lockfile the
+        // project committed, plus one written by the builder's own install.
+        // The declaration says who owns the project, so this must resolve —
+        // the canonical file wins — rather than refuse with advice to declare
+        // a manager that is already declared.
+        let d = dir();
+        manifest_with(&d, r#","packageManager":"aube@1.0.0""#);
+        write(&d, "aube-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(&d, "bun.lock", "{}");
+        assert_eq!(
+            resolve(&d).unwrap(),
+            ResolvedLockfileKind::Existing(LockfileKind::Aube)
+        );
+    }
+
+    #[test]
+    fn a_self_name_declaration_without_the_canonical_file_falls_to_precedence() {
+        // No canonical lockfile among the candidates: the declaration still
+        // resolves ownership, so precedence picks rather than erroring.
+        let d = dir();
+        manifest_with(&d, r#","packageManager":"aube@1.0.0""#);
+        write(&d, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(&d, "yarn.lock", "# yarn lockfile v1\n");
+        assert!(
+            matches!(resolve(&d).unwrap(), ResolvedLockfileKind::Existing(_)),
+            "a declared project must resolve, not refuse"
+        );
     }
 
     // ── carve-outs and refinements ───────────────────────────────────

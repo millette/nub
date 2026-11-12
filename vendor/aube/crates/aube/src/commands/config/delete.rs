@@ -41,34 +41,37 @@ pub fn run(args: DeleteArgs) -> miette::Result<()> {
     // canonical-name catch covers older configs that stored the key
     // under its `meta.name` even when the user typed an alias.
     let config_path = match location {
-        Location::User | Location::Global => aube_config::user_aube_config_path()?,
+        Location::User => aube_config::user_aube_config_path()?,
         Location::Project => {
             aube_config::project_aube_config_path(&crate::dirs::project_root_or_cwd()?)
         }
     };
-    let mut config_edit = aube_config::AubeConfigEdit::load(&config_path)?;
-    let mut sweep: Vec<String> = aliases.clone();
-    if let Some(meta) = meta
-        && !sweep.iter().any(|s| s == meta.name)
-    {
-        sweep.push(meta.name.to_string());
-    }
-    if !sweep.iter().any(|s| s == &args.key) {
-        sweep.push(args.key.clone());
-    }
-    if config_edit.remove_aliases(&sweep) {
-        config_edit.save(&config_path)?;
-        removed_paths.push(config_path.clone());
+    // No branded config file under this profile (e.g. nub) → nothing to sweep
+    // there; the `.npmrc` sweep below still runs.
+    if let Some(config_path) = &config_path {
+        let mut config_edit = aube_config::AubeConfigEdit::load(config_path)?;
+        let mut sweep: Vec<String> = aliases.clone();
+        if let Some(meta) = meta
+            && !sweep.iter().any(|s| s == meta.name)
+        {
+            sweep.push(meta.name.to_string());
+        }
+        if !sweep.iter().any(|s| s == &args.key) {
+            sweep.push(args.key.clone());
+        }
+        if config_edit.remove_aliases(&sweep) {
+            config_edit.save(config_path)?;
+            removed_paths.push(config_path.clone());
+        }
     }
 
-    // `.npmrc`: sweep when the key is npm-shared (the canonical home
-    // for those) or when it's a free-form / unknown key (which may
-    // legitimately live in `.npmrc`). Aube-only settings
-    // (`autoInstallPeers`, `minimumReleaseAge`, …) are intentionally
-    // not swept — `.npmrc` is shared with npm/pnpm/yarn and an
-    // aube-known entry there is typically a hand-edit the user wants
-    // to control.
-    let should_sweep_npmrc = key_is_npm_shared || meta.is_none();
+    // `.npmrc`: sweep when the key is npm-shared (the canonical home),
+    // free-form / unknown, or a layout setting. Embedders can route known
+    // layout settings there even when other known settings live in workspace
+    // YAML, so deletion must follow that write route. Other Aube-only settings
+    // (`autoInstallPeers`, `minimumReleaseAge`, …) remain untouched.
+    let should_sweep_npmrc =
+        key_is_npm_shared || meta.is_none() || meta.is_some_and(|meta| meta.layout);
     let npmrc_path = location.path()?;
     if should_sweep_npmrc && npmrc_path.exists() {
         let mut edit = NpmrcEdit::load(&npmrc_path)?;
@@ -88,18 +91,19 @@ pub fn run(args: DeleteArgs) -> miette::Result<()> {
     }
 
     if removed_paths.is_empty() {
-        // For aube-only settings (not in the npm-shared allowlist) we
-        // intentionally skipped the `.npmrc` sweep — surface a stale
-        // entry there so the user knows what's still shadowing the
-        // delete. npm-shared and free-form keys fall through to the
-        // simpler "not set anywhere" message.
+        // For aube-only settings whose write route does not include `.npmrc`,
+        // surface a stale entry there so the user knows what still shadows the
+        // delete. npm-shared, free-form, and layout keys fall through to the
+        // simpler "not set anywhere" message because their `.npmrc` route was
+        // already swept above.
         if let Some(_meta) = meta
             && !key_is_npm_shared
+            && !should_sweep_npmrc
         {
             return Err(missing_aube_key_error(
                 &args.key,
                 &aliases,
-                &config_path,
+                config_path.as_deref(),
                 location,
             ));
         }
@@ -176,24 +180,28 @@ fn try_delete_aube_map_entry(key: &str, location: Location) -> miette::Result<Op
 fn missing_aube_key_error(
     key: &str,
     aliases: &[String],
-    config_path: &Path,
+    config_path: Option<&Path>,
     location: Location,
 ) -> miette::Report {
+    // `None` (profile with no branded config file, e.g. nub): name the tool's
+    // config surface generically rather than a nonexistent file path.
+    let config_label = config_path.map_or_else(
+        || format!("{} config", aube_util::prog()),
+        |p| p.display().to_string(),
+    );
     if let Ok(npmrc_path) = location.path()
         && npmrc_path.exists()
         && let Ok(edit) = NpmrcEdit::load(&npmrc_path)
         && edit.entries().iter().any(|(k, _)| aliases.contains(k))
     {
         return miette!(
-            "{key} is not set in {} but an entry exists in {}.\n\
+            "{key} is not set in {config_label} but an entry exists in {}.\n\
              aube doesn't modify `.npmrc` for aube-only settings (it's shared with \
              npm/pnpm/yarn) — edit that file directly to remove it, or run \
-             `{} {key} <value>` to override it from {}.",
-            config_path.display(),
+             `{} {key} <value>` to override it from {config_label}.",
             npmrc_path.display(),
             aube_util::cmd("config set"),
-            config_path.display(),
         );
     }
-    miette!("{key} not set in {}", config_path.display())
+    miette!("{key} not set in {config_label}")
 }

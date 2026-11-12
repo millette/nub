@@ -32,7 +32,7 @@ enum Edit {
     Add {
         route_keys: Vec<String>,
         key: String,
-        value: serde_yaml::Value,
+        value: yaml_serde::Value,
     },
 }
 
@@ -77,7 +77,7 @@ pub(super) fn apply_diff(
     // mapping. Sort outer-most first so a parent that only just
     // came into existence is queryable for its children. Within
     // the same depth, preserve insertion order.
-    let mut adds: Vec<(Vec<String>, String, serde_yaml::Value)> = edits
+    let mut adds: Vec<(Vec<String>, String, yaml_serde::Value)> = edits
         .into_iter()
         .filter_map(|e| match e {
             Edit::Add {
@@ -130,22 +130,22 @@ fn diff_into(
             None => out.push(Edit::Add {
                 route_keys: route.to_vec(),
                 key: key.to_string(),
-                value: to_serde_value(path, after_v)?,
+                value: after_v.clone(),
             }),
             Some(before_v) if before_v != after_v => {
                 if let (Some(bm), Some(am)) = (before_v.as_mapping(), after_v.as_mapping()) {
                     let mut sub = route.to_vec();
                     sub.push(key.to_string());
                     diff_into(bm, am, &sub, path, out)?;
-                } else if matches!(after_v.as_mapping(), Some(m) if !m.is_empty()) {
-                    // Type-change to a non-empty sub-mapping (e.g.
-                    // scalar -> nested mapping). yamlpatch's
-                    // Op::Replace serializes the mapping value via
-                    // the same path as Op::Add, which strips nested
-                    // indentation and lands the children at the
-                    // parent's column. Split into Remove + manual
-                    // injection so step 2 can re-emit the children
-                    // with their canonical indent.
+                } else if needs_manual_injection(after_v) {
+                    // Change into a non-empty block mapping or sequence (e.g.
+                    // scalar -> nested mapping, or an appended list item).
+                    // yamlpatch's Op::Replace serializes such values via the
+                    // same path as Op::Add, which strips the block structure
+                    // (mapping children land at the parent's column; a sequence
+                    // renders inline and breaks the document). Split into
+                    // Remove + manual injection so step 2 re-emits the value
+                    // with its canonical block indentation.
                     out.push(Edit::Yp(Patch {
                         route: route_obj.with_key(key.to_string()),
                         operation: Op::Remove,
@@ -153,7 +153,7 @@ fn diff_into(
                     out.push(Edit::Add {
                         route_keys: route.to_vec(),
                         key: key.to_string(),
-                        value: to_serde_value(path, after_v)?,
+                        value: after_v.clone(),
                     });
                 } else {
                     out.push(Edit::Yp(Patch {
@@ -168,6 +168,16 @@ fn diff_into(
     Ok(())
 }
 
+/// Whether `value` must be re-emitted through the manual block injector
+/// rather than a yamlpatch `Op::Add`/`Op::Replace`. True for a non-empty
+/// mapping or a non-empty sequence — both of which yamlpatch renders without
+/// the block indentation the source needs, producing invalid YAML. Empty
+/// containers and scalars round-trip fine through yamlpatch.
+fn needs_manual_injection(value: &Value) -> bool {
+    matches!(value.as_mapping(), Some(m) if !m.is_empty())
+        || matches!(value.as_sequence(), Some(s) if !s.is_empty())
+}
+
 /// Inject a fresh `<key>: <value>` block-style entry into
 /// `source` at the end of the route's mapping. Top-level routes
 /// (empty) append at end-of-file. Nested routes look up the
@@ -177,7 +187,7 @@ fn inject_entry(
     source: &str,
     route_keys: &[String],
     key: &str,
-    value: &serde_yaml::Value,
+    value: &yaml_serde::Value,
     path: &Path,
 ) -> Result<String, crate::Error> {
     if route_keys.is_empty() {
@@ -239,21 +249,21 @@ fn inject_entry(
 /// recursively; non-empty sequence values emit as block
 /// sequences with `- ` items at child indent; everything else
 /// is emitted as a scalar value after the colon.
-fn render_entry(key: &str, value: &serde_yaml::Value, indent: usize) -> String {
+fn render_entry(key: &str, value: &yaml_serde::Value, indent: usize) -> String {
     let pad = " ".repeat(indent);
     match value {
-        serde_yaml::Value::Mapping(m) if !m.is_empty() => {
+        yaml_serde::Value::Mapping(m) if !m.is_empty() => {
             let mut out = format!("{pad}{}:\n", scalar_key_str(key));
             for (k, v) in m {
                 let child_key = match k {
-                    serde_yaml::Value::String(s) => s.clone(),
+                    yaml_serde::Value::String(s) => s.clone(),
                     other => render_scalar(other),
                 };
                 out.push_str(&render_entry(&child_key, v, indent + INDENT_STEP));
             }
             out
         }
-        serde_yaml::Value::Sequence(seq) if !seq.is_empty() => {
+        yaml_serde::Value::Sequence(seq) if !seq.is_empty() => {
             // Block-sequence under a mapping key. Without an
             // explicit arm the catch-all below would feed the
             // sequence through `render_scalar`, which emits a
@@ -264,14 +274,14 @@ fn render_entry(key: &str, value: &serde_yaml::Value, indent: usize) -> String {
             for item in seq {
                 if matches!(
                     item,
-                    serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_)
+                    yaml_serde::Value::Mapping(_) | yaml_serde::Value::Sequence(_)
                 ) {
                     // Nested mapping/sequence as a list item: defer
-                    // to serde_yaml for inner shape, then attach
+                    // to yaml_serde for inner shape, then attach
                     // the dash to the first emitted line and pad
                     // every continuation line so it stays inside
                     // the same item.
-                    let raw = serde_yaml::to_string(item).unwrap_or_default();
+                    let raw = yaml_serde::to_string(item).unwrap_or_default();
                     let mut first = true;
                     for line in raw.lines() {
                         if first {
@@ -298,25 +308,25 @@ fn render_entry(key: &str, value: &serde_yaml::Value, indent: usize) -> String {
     }
 }
 
-/// Re-serialize a single scalar through serde_yaml so YAML
+/// Re-serialize a single scalar through yaml_serde so YAML
 /// quoting (escapes, leading-special-char handling) matches what
 /// the rest of the file already uses. Trailing newlines from the
 /// emitter are stripped — the caller owns its own line break.
-fn render_scalar(value: &serde_yaml::Value) -> String {
-    let raw = serde_yaml::to_string(value).unwrap_or_default();
+fn render_scalar(value: &yaml_serde::Value) -> String {
+    let raw = yaml_serde::to_string(value).unwrap_or_default();
     raw.trim_end().to_string()
 }
 
 /// Render a mapping key for emission, quoting only when the YAML
-/// 1.2 plain-scalar grammar requires it. Defers to serde_yaml's
+/// 1.2 plain-scalar grammar requires it. Defers to yaml_serde's
 /// emitter so the rules stay in lockstep with the rest of the
 /// file: identifiers like `b@2.0.0` and `is-positive@3.1.0`
 /// round-trip unquoted (the `@` is reserved only at the *start*
 /// of a scalar), while keys that lead with a reserved indicator
 /// or contain flow/quote/comment characters get the canonical
-/// quoted form serde_yaml would have produced.
+/// quoted form yaml_serde would have produced.
 fn scalar_key_str(key: &str) -> String {
-    let raw = serde_yaml::to_string(&serde_yaml::Value::String(key.to_string()))
+    let raw = yaml_serde::to_string(&yaml_serde::Value::String(key.to_string()))
         .unwrap_or_else(|_| format!("{key}\n"));
     raw.trim_end().to_string()
 }
@@ -354,19 +364,6 @@ fn key_str<'a>(path: &Path, value: &'a Value) -> Result<&'a str, crate::Error> {
             format!("workspace yaml mapping key must be a string, got {other:?}"),
         )),
     }
-}
-
-/// Bridge `yaml_serde::Value` (our typed parse type) to
-/// `serde_yaml::Value` (the manual injector's render type).
-/// yaml_serde is
-/// the maintained fork of serde_yaml 0.9, so a YAML round-trip is
-/// lossless for every variant we use (scalars, sequences,
-/// mappings, tagged values). Errors on either side propagate
-/// instead of panicking — they're vanishingly rare but a
-/// workspace edit is a poor place to crash the process.
-fn to_serde_value(path: &Path, value: &Value) -> Result<serde_yaml::Value, crate::Error> {
-    let raw = yaml_serde::to_string(value).map_err(|e| yp_err(path, e.to_string()))?;
-    serde_yaml::from_str(&raw).map_err(|e| yp_err(path, e.to_string()))
 }
 
 fn yp_err(path: &Path, msg: String) -> crate::Error {

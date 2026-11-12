@@ -1,25 +1,24 @@
 ---
-title: Package runner
-description: Run a CLI from your project's installed binaries, falling back to a registry fetch when it isn't installed — a drop-in for npx and pnpm dlx, an order of magnitude faster on cold start.
+title: Bin runner
+description: Run a CLI by name — the project's own copy when it is installed, fetched from the registry when it is not, and never fetched silently in CI.
 ---
 
-Run a command-line tool by name with `nubx`: a local bin from `node_modules/.bin` first, a registry fetch when it isn't installed. It's a drop-in for `npx` and `pnpm dlx`/`pnpm exec` — existing invocations carry over, and it accepts pnpm `exec`'s core workspace flags (`-r`, `--filter`, `--parallel`).
+Run a CLI by name, whether or not the project has it installed:
 
 ```bash
-nubx eslint .                          # resolve from node_modules/.bin and run
-nub exec eslint .                      # alias: nub exec === nubx
-nubx --filter @org/api tsc --build     # run a local bin across a filtered workspace
-nub dlx -p cowsay -c 'cowsay hi | tr a-z A-Z'  # one-off tool, no install, shell pipeline
+nubx eslint . --fix        # installed — runs the local copy
+nubx vitest run --coverage
+nubx cowsay "hi"           # not installed — offers to fetch it
 ```
 
-For a locally-resolved bin, `nubx` does the `node_modules/.bin` walk-up in Rust and exec's the resolved binary directly, so the wrapper overhead that `npx` and `pnpm exec` pay on every call — a full Node bootstrap — approximately disappears: 19× lighter than `npx` on a native CLI like `esbuild` (and roughly 17× lighter than `pnpm exec`). The tool that actually runs is identical to what `npx` would run; only the wrapper gets out of the way.
+Resolution is local first. Nub walks `node_modules/.bin` from the current directory up to the workspace root and runs the match directly, with no network and no Node process in the wrapper. Only a local miss reaches the registry.
 
 <Bench
   label="dispatch a locally-installed CLI · 50 runs"
   accent="sky"
   max={201}
   rows={[
-    { cmd: 'nubx', ms: 11.6, us: true, label: 'tie with bun x' },
+    { cmd: 'nub exec', ms: 11.6, us: true, label: 'tie with bun x' },
     { cmd: 'bun x', ms: 10.6 },
     { cmd: 'pnpm exec', ms: 175, ratio: 15 },
     { cmd: 'npm exec', ms: 201, ratio: 17 },
@@ -27,108 +26,112 @@ For a locally-resolved bin, `nubx` does the `node_modules/.bin` walk-up in Rust 
   source="https://github.com/nubjs/nub/tree/main/tests/bench/bin-runner"
 />
 
-This page is task-oriented. For the bigger picture see the [Introduction](/docs); for running files and scripts see [running files](/docs/runtime) and [running scripts](/docs/run).
+In a Yarn Plug'n'Play project, bins resolve through `pnpapi`, as with `yarn exec`. See [module resolution](/docs/runtime/resolution#yarn-plugnplay).
 
-## Run a local CLI
+## Arguments
 
-Point `nubx` at the bin name and let it resolve from `node_modules/.bin`. No `node` bootstrap in the wrapper, so resolution returns in single-digit milliseconds.
-
-```bash
-nubx eslint .
-nubx prisma generate
-nubx tsc
-```
-
-## Pass arguments
-
-Everything after the bin name goes straight to the underlying tool, untouched. There is no `--` separator to remember — `nubx` doesn't interpret your tool's flags.
+Everything after the tool name goes to the tool. No `--` separator is needed.
 
 ```bash
 nubx eslint . --fix --max-warnings 0
-nubx tsc --noEmit
-nubx prisma migrate dev --name init
-nubx vitest run --coverage
 ```
 
-## --node
+## Registry fetches
 
-Pass `--node` to run the tool with runtime augmentation disabled — see [the runtime overview](/docs/runtime#--node) for the full contract.
-
-```bash
-nubx --node prisma generate
-nub exec --node tsc --noEmit
-```
-
-What still happens under `--node`: the workspace-aware `node_modules/.bin` walk-up, the registry DLX fallback, and `nubx`'s own CLI machinery. Only the runtime augmentation is disabled. Reach for it when a tool's shebang chain needs byte-exact plain Node, when bisecting a Nub-vs-Node issue, or when CI wants exact Node runtime behavior with `nubx`'s resolution.
-
-## Download and execute
-
-When a bin isn't on the `node_modules/.bin` chain, `nubx` falls back to a registry fetch — it resolves the package, installs it into a throwaway project, and runs it, then drops the scratch dir. This is the same local-first-then-DLX model as `npx` and `pnpm dlx`; Nub is a complete package manager, so it does the fetch itself rather than shelling out to a foreign PM. Following `pnpm dlx` semantics, there is no interactive confirm-prompt — it just fetches and runs.
+Unlike `npx`, `nubx` asks before it downloads. The first fetch of a tool prompts, runs the tool once you agree, and remembers the answer:
 
 ```console
 $ nubx cowsay "Hello"
-dependencies:
-+ cowsay@1.6.0
-
- _______
-< Hello >
- -------
-        \   ^__^
-         \  (oo)\_______
-            (__)\       )\/\
-                ||----w |
-                ||     ||
+The cowsay bin is not installed locally.
+Install and run from the remote registry?
+  ● Yes
+  ○ No
+  ○ Never (don't ask me again)
 ```
 
-This fallback is unique to the `nubx` (and `nub exec`-as-`nubx`) entry point. Plain `nub exec` is no-network: a missing bin there prints an install suggestion and exits 127 instead of reaching the registry.
+A pinned version (`nubx cowsay@1.5.0`) is remembered indefinitely. A floating one (`nubx cowsay`, which tracks `latest`) asks again after a day, so a tool that has published new code asks again before running it.
 
-## Version specifiers
-
-A version specifier like `nubx cowsay@1.5.0` goes straight through the DLX fetch path: `nubx` resolves and runs that exact version from the registry, no local install required.
+Outside a terminal there is no one to ask, so the fetch fails. That covers CI and any run where stdin is not a terminal:
 
 ```console
-$ nubx cowsay@1.5.0 "pinned"
-dependencies:
-+ cowsay@1.5.0  latest 1.6.0
-
- ________
-< pinned >
- --------
-        \   ^__^
-         \  (oo)\_______
-            (__)\       )\/\
-                ||----w |
-                ||     ||
+$ nubx cowsay "hi"          # in CI
+nubx: refusing to download cowsay in CI.
+  A CI job should declare the tool as a dependency, or pass -y to fetch it.
 ```
 
-## Supply-chain cooling window
+A fetched package goes through Nub's install resolver, so the [cooling window](/docs/install#cooling-window) applies and lifecycle scripts are skipped.
 
-The DLX fetch runs through Nub's normal install resolver, so the same `minimumReleaseAge` cooling window that protects `nub install` also protects `nubx` — a fetched tool's resolved version must be older than the window before it's used. The default is **24 hours**, the same as `install`; set `minimumReleaseAge=0` to disable it.
+### `-y`
 
-```console
-# .npmrc: minimumReleaseAge tightened past every release, minimumReleaseAgeStrict=true
-$ nubx cowsay "hi"
-ERR_NUB_NO_MATURE_MATCHING_VERSION
-  × dlx install failed
-  ╰─▶ no version of cowsay matching latest is older than … minute(s) (minimumReleaseAgeStrict=true)
-  help: blocked by age gate: 1.6.0
+The `-y` flag (`--yes`) consents up front. It skips the first-run prompt and lets a fetch through in CI.
+
+```bash
+nubx -y cowsay "hi"
 ```
 
-The window is resolved from the same `.npmrc` scopes that `npx` reads: the built-in default, your user-scope `~/.npmrc` (and `NPM_CONFIG_MINIMUM_RELEASE_AGE`), and a **project-local `.npmrc`** in the directory you run `nubx` from. So a per-project override applies to a `nubx` fetch even though the tool installs into a throwaway scratch project — alongside the project's registry, scoped registries, and auth, matching `npx`. By default the resolver falls back to the next-oldest satisfying version; `minimumReleaseAgeStrict=true` fails instead. See [the default-trust floor](/docs/install#default-trust-floor) for the full posture.
+### `exec.implicitDlx`
 
-## Yarn Plug'n'Play
+Answering **Never** records `exec.implicitDlx` in the global settings file, `~/.config/nub/nub.jsonc`. From then on a local miss stops instead of offering a download. Explicit fetches, through [`nub dlx`](#nub-dlx) or `nubx -y`, still run.
 
-Tools that only walk `node_modules/.bin/` — `npx`, `pnpm exec`, `bunx` — miss Yarn Berry's PnP bins. `nubx` resolves them: when the `.bin` walk-up misses in a PnP tree, it falls through to a PnP-aware runner that finds and executes the bin. See [module resolution](/docs/runtime/resolution#yarn-plugnplay) for how the shared PnP machinery works.
+Restore the prompt:
 
-## Flag differences
+```bash
+nub config set exec.implicitDlx prompt
+```
 
-- **`-c`/`--shell-mode`** — the shell-string form lives on `nub dlx -c` (shown above); `nub exec`/`nubx` run a resolved bin directly.
-- **Recursive scope** — `nub exec` covers `-r`, `--filter`, and `--parallel`; the richer recursive flags (`--resume-from`, `--reporter`, `--stream`) live on `nub run`.
+The [`dlx`](/docs/config#dlx) block in the global `nub.jsonc` sets the same policy:
+
+```jsonc title="~/.config/nub/nub.jsonc"
+{
+  // ...
+  "dlx": {
+    // no implicit nubx registry fetch; an explicit nub dlx still runs
+    "consent": "never"
+  }
+}
+```
+
+## `--node`
+
+The `--node` flag runs the tool with runtime augmentation off; see [the runtime overview](/docs/runtime#--node) for the full contract. Resolution and the registry fetch still run.
+
+```bash
+nubx --node prisma generate
+```
+
+## `nub exec`
+
+The local half of `nubx` on its own: the same `node_modules/.bin` walk, and never the registry. When nothing matches, it prints an install hint and exits 127.
+
+```bash
+nub exec eslint . --fix
+nub exec --node tsc --noEmit   # augmentation off
+```
+
+It takes the same workspace flags as `nub run`, such as [`--filter`](/docs/run#--filter), `-r`, and `--parallel`.
+
+## `nub dlx`
+
+Fetch a package from the registry and run its bin. Typing the command is the consent, so `nub dlx` never prompts and runs in CI.
+
+```bash
+nub dlx create-vite my-app
+nub x create-vite my-app                       # short alias, as bunx
+nub dlx -p @angular/cli ng new my-app          # bin name differs
+nub dlx -p cowsay -c 'cowsay hi | tr a-z A-Z'  # one-liner, bin on PATH
+nub dlx --node prisma generate                 # augmentation off
+```
+
+An unversioned name that is already installed in the project runs the local copy. A versioned spec such as `cowsay@1.5.0`, or `-p`, always fetches. The flags mirror `pnpm dlx`; see the [full docs](https://pnpm.io/cli/dlx) on pnpm.io.
+
+A fetch shares the persistent cache with `nubx` and gets the same safeguards as an install:
+
+- **Lifecycle scripts are skipped.** Approve one with `--allow-build=<pkg>`, the same allowlist [`nub install`](/docs/install) uses.
+- **The cooling window applies.** A resolved version must be older than `minimumReleaseAge` (default 24 hours). When the latest release is inside the window, Nub runs the newest release that clears it and says so. See [the cooling window](/docs/install#cooling-window).
 
 ## Related
 
-- [Running files](/docs/runtime) — `nub index.ts`, TypeScript-first execution.
-- [Running scripts](/docs/run) — `nub run`, the workspace-aware script runner that shares the `.bin` resolution chain.
-- [Watch mode](/docs/watch) — `nub watch`, restart on change.
-- [Module resolution](/docs/runtime/resolution) — the TypeScript-aware resolver, and how Nub runs a Yarn PnP project.
-- [FAQ](/docs/faq) — short answers, including the `--node` flag.
+- [Script runner](/docs/run) — `nub run`, the workspace-aware `package.json` script runner.
+- [Running files](/docs/runtime) — TypeScript-first file execution.
+- [Watch mode](/docs/watch) — restart on change.
+- [Module resolution](/docs/runtime/resolution) — the resolver, including Yarn Plug'n'Play.

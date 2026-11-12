@@ -1,8 +1,9 @@
 use super::dep_path::{
-    dep_path_tail, parse_dep_path, peerless_dep_path, rewrite_peer_suffix, version_to_dep_path,
+    dep_path_tail, parse_dep_path, peerless_dep_path, rewrite_peer_suffix, strip_patch_hash_suffix,
+    version_to_dep_path,
 };
 use super::format::reformat_for_pnpm_parity;
-use crate::{DepType, Error, LocalSource, LockfileGraph};
+use crate::{DepType, Error, LocalSource, LockfileGraph, link_from_importer};
 use aube_manifest::PackageJson;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -29,25 +30,89 @@ enum WritablePatchedDependency {
 }
 
 /// Stamp pnpm's `(patch_hash=<hash>)` marker onto a dep-path tail or
-/// snapshots key, in the position pnpm uses: immediately after the
-/// version, before any peer-context suffix
-/// (`6.1.0(patch_hash=…)(react@18.2.0)`). Idempotent — a tail parsed
-/// from a lockfile that already carries the marker passes through
-/// unchanged.
-fn with_patch_hash(tail: &str, hash: &str) -> String {
-    if tail.contains("(patch_hash=") {
-        return tail.to_string();
-    }
-    let insert_at = tail.find('(').unwrap_or(tail.len());
+/// snapshots key. pnpm places the patch identity immediately after the
+/// version, before any peer-context suffix:
+/// `1.0.0(patch_hash=<sha256>)(react@19.0.0)`. Any marker already on
+/// the value is stripped first, so a re-emit replaces a stale hash
+/// rather than preserving it, and `None` clears the marker for a
+/// package that is no longer patched.
+fn with_patch_hash(value: &str, hash: Option<&str>) -> String {
+    let bare = strip_patch_hash_suffix(value);
+    let Some(hash) = hash else {
+        return bare;
+    };
+    let suffix_at = bare.find('(').unwrap_or(bare.len());
     format!(
         "{}(patch_hash={hash}){}",
-        &tail[..insert_at],
-        &tail[insert_at..]
+        &bare[..suffix_at],
+        &bare[suffix_at..]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_patch_hash;
+
+    #[test]
+    fn replaces_every_stale_patch_hash_suffix() {
+        let value = "1.0.0(patch_hash=old)(react@19)(patch_hash=duplicate)";
+        assert_eq!(
+            with_patch_hash(value, Some("current")),
+            "1.0.0(patch_hash=current)(react@19)"
+        );
+    }
 }
 
 /// Write a LockfileGraph as pnpm-lock.yaml v9 format.
 pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Result<(), Error> {
+    let Built { lockfile, .. } = build(path, graph, manifest)?;
+    let yaml = yaml_serde::to_string(&lockfile).map_err(|e| Error::parse(path, e.to_string()))?;
+    let mut yaml = reformat_for_pnpm_parity(&yaml);
+    // The env document (pnpm 11+'s package-manager pin) belongs to the
+    // package-manager sync, not to this writer: carry the one on disk
+    // across, as pnpm's `save_value_to_path` does.
+    if let Some(env) = super::env::preserved_env_document(path) {
+        yaml = super::env::compose_with_env_document(&env, &yaml);
+    }
+    // Atomic via tempfile + persist. Crash, Ctrl+C, or AV
+    // quarantine during the write used to leave the user with a
+    // truncated pnpm-lock.yaml on disk, next install failed to
+    // parse and the user thought their lockfile was gone. See
+    // atomic_write_lockfile for full rationale.
+    crate::atomic_write_lockfile(path, yaml.as_bytes())?;
+    Ok(())
+}
+
+/// Project a `LockfileGraph` onto pnpm's v9 lockfile schema without
+/// serializing it. Split out of [`write`] so the pnpmfile hook view
+/// ([`super::hook_view`]) hands hooks the exact same projection the
+/// writer puts on disk — dep-path translation, patch-hash suffixes,
+/// alias recovery and all — instead of a second, drifting one.
+/// `path` decides `pnpm-lock.yaml`-only behavior (native alias
+/// encoding) and roots the workspace-member manifest reads.
+/// [`build`]'s output: the projection, plus the key correspondence a
+/// pnpmfile hook round-trip needs.
+pub(super) struct Built {
+    pub lockfile: WritablePnpmLockfile,
+    /// `snapshots:` key -> the graph `dep_path` it was derived from.
+    ///
+    /// The two spellings diverge for anything that is not a plain
+    /// registry dep: pnpm keys on the resolved specifier
+    /// (`is-obj@https://codeload…/tar.gz/<sha>`) while the graph keys on
+    /// an FS-safe hashed dep_path (`is-obj@url+f5ca9b17a622e185`). A
+    /// hook is handed the pnpm spelling, so an edit it makes to
+    /// `packages[<pnpm key>]` cannot be applied back to the graph
+    /// without this map. Derived in the snapshot loop below, where both
+    /// spellings are in hand, rather than re-computed by a second copy
+    /// of the key rules that could drift from it.
+    pub snapshot_keys: BTreeMap<String, String>,
+}
+
+pub(super) fn build(
+    path: &Path,
+    graph: &LockfileGraph,
+    manifest: &PackageJson,
+) -> Result<Built, Error> {
     let native_pnpm_aliases = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -91,19 +156,60 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
     // without a recorded hash (bun.lock conversions, pnpm v8 lockfiles)
     // get no suffix, matching the hash-less bare-path block we emit
     // for them.
-    let patched_by_dep_path: BTreeMap<&str, &str> = graph
-        .packages
-        .iter()
-        .filter(|(_, pkg)| pkg.local_source.is_none())
-        .filter_map(|(dep_path, pkg)| {
-            let selector = format!("{}@{}", pkg.name, pkg.version);
-            graph
-                .patched_dependency_hashes
-                .get(&selector)
-                .filter(|_| graph.patched_dependencies.contains_key(&selector))
-                .map(|hash| (dep_path.as_str(), hash.as_str()))
-        })
+    // The declared patch keys may be exact, a range, `*`, or a bare
+    // name; resolve each REGISTRY package's concrete `name@version` to
+    // the patch that applies (pnpm's `getPatchInfo`) so the suffix lands
+    // on the right resolved version. Groups build from the DEDUPED union
+    // of both selector maps — a key present in both would otherwise
+    // double-push into a range group and manufacture a false conflict.
+    // A recorded hash alone is enough to stamp: a graph parsed from a
+    // pnpm lockfile carries hashes with no paths (the reader drops
+    // them), and withholding the suffix on that re-emit would rewrite
+    // every patched package's identity. For all-exact keys the resolved
+    // source key equals `name@version`, so this is byte-identical to the
+    // pre-resolution lookup.
+    let patch_selectors: std::collections::BTreeSet<&str> = graph
+        .patched_dependency_hashes
+        .keys()
+        .chain(graph.patched_dependencies.keys())
+        .map(String::as_str)
         .collect();
+    let patch_groups = crate::patch_groups::PatchGroups::build(patch_selectors.into_iter())
+        .map_err(|e| Error::PatchNonSemverRange(e.message()))?;
+    let mut patched_by_dep_path: BTreeMap<&str, &str> = BTreeMap::new();
+    for pkg in graph.packages.values() {
+        if pkg.local_source.is_some() {
+            continue;
+        }
+        // Resolve exactly the way `patch_groups::resolve_patched_by_version`
+        // does — that is the single rule the linker, graph hash, and drift
+        // check key off, and a suffix the linker won't honor is a lockfile
+        // that lies about what landed in node_modules.
+        let source_key =
+            patch_groups
+                .resolve_package(pkg)
+                .map_err(|c| Error::PatchKeyConflict {
+                    message: c.message(),
+                    hint: c.hint(),
+                })?;
+        if let Some(source_key) = source_key
+            && let Some(hash) = graph.patched_dependency_hashes.get(source_key)
+        {
+            patched_by_dep_path.insert(pkg.dep_path.as_str(), hash.as_str());
+        }
+    }
+    // Every dep-path-shaped reference to a package flows through here, so
+    // a `(patch_hash=…)` parsed off the previous lockfile is replaced with
+    // the current hash — or dropped once the patch is gone.
+    let decorate_patch_hash = |value: &str, pkg: Option<&crate::LockedPackage>| -> String {
+        match pkg {
+            Some(pkg) => with_patch_hash(
+                value,
+                patched_by_dep_path.get(pkg.dep_path.as_str()).copied(),
+            ),
+            None => value.to_string(),
+        }
+    };
     // Translate a *flat* peer reference from aube's internal FS-safe
     // hashed dep_path (`request@url+<hash>` / `request@git+<hash>`) to the
     // resolved spec pnpm writes inside a peer suffix
@@ -123,6 +229,22 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             }
             _ => None,
         }
+    };
+    // A package's key carries its peers, and pnpm spells them after the specifier:
+    // `file:vendor/a(react@18.2.0)`. `link:` has none.
+    let local_spelling = |local: &LocalSource, key: &str| match local {
+        LocalSource::Directory(_)
+        | LocalSource::Tarball(_)
+        | LocalSource::Git(_)
+        | LocalSource::RemoteTarball(_) => {
+            let peers = key.find('(').map_or("", |i| &key[i..]);
+            format!(
+                "{}{}",
+                local.pnpm_specifier(),
+                rewrite_peer_suffix(peers, &peer_suffix_to_spec)
+            )
+        }
+        _ => local.pnpm_specifier(),
     };
     let mut importers = BTreeMap::new();
     let exclude_links = graph.settings.exclude_links_from_lockfile;
@@ -213,7 +335,7 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             // Local deps render with the canonical `file:<path>` /
             // `link:<path>` specifier, not the FS-safe encoded form
             // that lives in `dep_path`.
-            let version = if let Some(local) = graph
+            let mut version = if let Some(local) = graph
                 .packages
                 .get(&dep.dep_path)
                 .and_then(|p| p.local_source.as_ref())
@@ -230,7 +352,7 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                             link_from_importer(importer_path, &local.path_posix())
                         )
                     }
-                    _ => local.specifier(),
+                    _ => local_spelling(local, &dep.dep_path),
                 }
             } else if let Some(member_dir) = workspace_link_dir {
                 format!("link:{}", link_from_importer(importer_path, member_dir))
@@ -249,10 +371,11 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                     &peer_suffix_to_spec,
                 )
             };
-            let version = match patched_by_dep_path.get(dep.dep_path.as_str()) {
-                Some(hash) => with_patch_hash(&version, hash),
-                None => version,
-            };
+            let target = graph
+                .packages
+                .get(&dep.dep_path)
+                .or_else(|| graph.packages.get(&peerless_dep_path(&dep.name, &version)));
+            version = decorate_patch_hash(&version, target);
 
             let spec = WritableDepSpec {
                 specifier: specifier.to_string(),
@@ -358,7 +481,7 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             .is_some_and(|url| parse_dep_path(&pkg.dep_path).is_some_and(|(_, v)| v == *url));
         let canonical = match pkg.local_source.as_ref() {
             Some(LocalSource::Link(_)) | Some(LocalSource::Exec(_)) => continue,
-            Some(local) => format!("{}@{}", pkg.name, local.specifier()),
+            Some(local) => format!("{}@{}", pkg.name, local.pnpm_specifier()),
             None => {
                 if native_pnpm_aliases && let Some(real_name) = pkg.alias_of.as_deref() {
                     version_to_dep_path(real_name, &pkg.version)
@@ -386,24 +509,27 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             let deps = pkg.peer_dependencies_with_meta_defaults();
             if deps.is_empty() { None } else { Some(deps) }
         };
-        let peer_meta = if pkg.peer_dependencies_meta.is_empty() {
+        // Only `optional: true` peers are recorded. pnpm's resolver
+        // drops a non-optional `peerDependenciesMeta` entry outright
+        // (`peerDependenciesWithoutOwn` skips `peerMeta.optional !== true`),
+        // so its lockfile type is `{ optional: true }` and every entry
+        // carries the field. pnpm 12's reader models that as a required
+        // `bool` and fails the whole file with ERR_PNPM_BROKEN_LOCKFILE
+        // on an empty mapping, which is what emitting the non-optional
+        // entries with the false flag skipped used to produce (real case:
+        // vitest declaring `vite: { optional: false }`).
+        let peer_meta: BTreeMap<String, WritablePeerDepMeta> = pkg
+            .peer_dependencies_meta
+            .iter()
+            .filter(|(_, v)| v.optional)
+            .map(|(k, _)| (k.clone(), WritablePeerDepMeta { optional: true }))
+            .collect();
+        let peer_meta = if peer_meta.is_empty() {
             None
         } else {
-            Some(
-                pkg.peer_dependencies_meta
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            WritablePeerDepMeta {
-                                optional: v.optional,
-                            },
-                        )
-                    })
-                    .collect(),
-            )
+            Some(peer_meta)
         };
-        // Always render the path through `path_posix()` so the
+        // Always render the path through `LocalSource::pnpm_path` so the
         // lockfile uses forward slashes regardless of the host OS —
         // a lockfile written on Windows must resolve identically on
         // Unix and vice versa. `Path::display()` honors the host
@@ -411,6 +537,15 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
         let is_jsr_registry_pkg = pkg.registry_name().starts_with("@jsr/");
         let preserve_tarball_url = graph.settings.lockfile_include_tarball_url
             || is_jsr_registry_pkg
+            // A pnpm `namedRegistries` package resolved to a non-default host:
+            // the derivable `/-/…tgz` shape would reconstruct against the wrong
+            // (default) registry, so the URL must be persisted verbatim.
+            || pkg.force_tarball_url
+            || pkg
+                .extra_meta
+                .get(crate::EXTRA_PRESERVE_TARBALL_URL)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
             || registry_tarball_url_is_not_derivable(
                 pkg.registry_name(),
                 &pkg.version,
@@ -424,7 +559,7 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             Some(local @ LocalSource::Directory(_)) => Some(WritableResolution {
                 integrity: None,
                 git_hosted: false,
-                directory: Some(local.path_posix()),
+                directory: Some(local.pnpm_path()),
                 tarball: None,
                 commit: None,
                 repo: None,
@@ -436,7 +571,7 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 integrity: None,
                 git_hosted: false,
                 directory: None,
-                tarball: Some(format!("file:{}", local.path_posix())),
+                tarball: Some(format!("file:{}", local.pnpm_path())),
                 commit: None,
                 repo: None,
                 type_: None,
@@ -447,7 +582,7 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
             Some(local @ LocalSource::Portal(_)) => Some(WritableResolution {
                 integrity: None,
                 git_hosted: false,
-                directory: Some(local.path_posix()),
+                directory: Some(local.pnpm_path()),
                 tarball: None,
                 commit: None,
                 repo: None,
@@ -675,39 +810,39 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                     .packages
                     .get(&dp)
                     .or_else(|| graph.packages.get(&peerless_dep_path(&name, &value)));
-                if let Some(target) = target
+                let rewritten = if let Some(target) = target
                     && let Some(ref local) = target.local_source
-                    && !matches!(local, LocalSource::Link(_))
                 {
-                    (name, local.specifier())
+                    // A `link:` path is relative to the lockfile directory on every
+                    // parent, where pnpm links it from. It has no `packages:` entry.
+                    local_spelling(local, &value)
                 } else if native_pnpm_aliases
                     && let Some(target) = target
                     && let Some(real_name) = target.alias_of.as_deref()
                 {
-                    (name, format!("{real_name}@{value}"))
-                } else if let Some(hash) = patched_by_dep_path.get(dp.as_str()) {
-                    // A dependent of a patched package references the
-                    // suffixed dep path, same as the snapshots key.
-                    (name, with_patch_hash(&value, hash))
+                    format!("{real_name}@{value}")
                 } else {
                     // Registry dep whose value may carry a
                     // `(git/tarball@hash)` peer suffix — render the suffix
                     // as the resolved spec (`1.1.4(request@https://…)`).
-                    (name, rewrite_peer_suffix(&value, &peer_suffix_to_spec))
-                }
+                    rewrite_peer_suffix(&value, &peer_suffix_to_spec)
+                };
+                let rewritten = decorate_patch_hash(&rewritten, target);
+                (name, rewritten)
             })
             .collect()
     };
     let mut snapshots = BTreeMap::new();
+    let mut snapshot_keys = BTreeMap::new();
     for (dep_path, pkg) in &graph.packages {
         // `link:` deps are omitted from snapshots (pnpm parity). `exec:`
         // is omitted for the same reason it is omitted from packages:
         // pnpm has no resolution shape for generated packages.
         // Other local deps use the canonical specifier key so pnpm's
         // parser lines them up with the packages entry above.
-        let key = match pkg.local_source.as_ref() {
+        let mut key = match pkg.local_source.as_ref() {
             Some(LocalSource::Link(_)) | Some(LocalSource::Exec(_)) => continue,
-            Some(local) => format!("{}@{}", pkg.name, local.specifier()),
+            Some(local) => format!("{}@{}", pkg.name, local_spelling(local, dep_path)),
             None => {
                 if native_pnpm_aliases && let Some(real_name) = pkg.alias_of.as_deref() {
                     format!("{real_name}@{}", dep_path_tail(dep_path, &pkg.name))
@@ -719,10 +854,8 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                 }
             }
         };
-        let key = match patched_by_dep_path.get(dep_path.as_str()) {
-            Some(hash) => with_patch_hash(&key, hash),
-            None => key,
-        };
+        key = decorate_patch_hash(&key, Some(pkg));
+        snapshot_keys.insert(key.clone(), dep_path.clone());
         let pkg_deps = rewrite_local_deps(pkg.dependencies.clone());
         let pkg_opt_deps = rewrite_local_deps(pkg.optional_dependencies.clone());
         snapshots.insert(
@@ -863,9 +996,9 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
                                         path: path.clone(),
                                     }
                                 }
-                                (Some(hash), None) => WritablePatchedDependency::HashOnly {
-                                    hash: hash.clone(),
-                                },
+                                (Some(hash), None) => {
+                                    WritablePatchedDependency::HashOnly { hash: hash.clone() }
+                                }
                                 (None, Some(path)) => {
                                     WritablePatchedDependency::PathOnly(path.clone())
                                 }
@@ -887,47 +1020,10 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
         snapshots,
     };
 
-    let yaml = yaml_serde::to_string(&lockfile).map_err(|e| Error::parse(path, e.to_string()))?;
-    let yaml = reformat_for_pnpm_parity(&yaml);
-    // Atomic via tempfile + persist. Crash, Ctrl+C, or AV
-    // quarantine during the write used to leave the user with a
-    // truncated pnpm-lock.yaml on disk, next install failed to
-    // parse and the user thought their lockfile was gone. See
-    // atomic_write_lockfile for full rationale.
-    crate::atomic_write_lockfile(path, yaml.as_bytes())?;
-    Ok(())
-}
-
-/// Render a project-root-relative directory as a `link:` target
-/// relative to the consuming importer, the way pnpm writes importer
-/// `version:` values (`packages/app` → `packages/core` renders as
-/// `../core`; the root importer keeps `packages/core` as-is). Pure
-/// lexical computation over `/`-separated components — both inputs are
-/// normalized root-relative paths, so no filesystem access is needed.
-fn link_from_importer(importer_path: &str, target_posix: &str) -> String {
-    if importer_path == "." {
-        return target_posix.to_string();
-    }
-    let from: Vec<&str> = importer_path
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect();
-    let to: Vec<&str> = target_posix
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect();
-    let common = from
-        .iter()
-        .zip(to.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let mut parts: Vec<&str> = vec![".."; from.len() - common];
-    parts.extend(&to[common..]);
-    if parts.is_empty() {
-        ".".to_string()
-    } else {
-        parts.join("/")
-    }
+    Ok(Built {
+        lockfile,
+        snapshot_keys,
+    })
 }
 
 fn registry_tarball_url_is_not_derivable(
@@ -1002,7 +1098,7 @@ fn pruned_time_entries(
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WritablePnpmLockfile {
+pub(super) struct WritablePnpmLockfile {
     lockfile_version: String,
     settings: WritableSettings,
     /// pnpm v9 emits a top-level `catalogs:` map immediately after
@@ -1049,6 +1145,8 @@ struct WritablePnpmLockfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     time: Option<BTreeMap<String, String>>,
     importers: BTreeMap<String, WritableImporter>,
+    /// pnpm leaves `packages:` and `snapshots:` out when they are empty.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     packages: BTreeMap<String, WritablePackageInfo>,
     /// pnpm v9 emits a top-level `ignoredOptionalDependencies:` array
     /// after `packages:` and before `snapshots:` when the root
@@ -1057,6 +1155,7 @@ struct WritablePnpmLockfile {
     /// identical to pnpm's output.
     #[serde(skip_serializing_if = "Option::is_none")]
     ignored_optional_dependencies: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     snapshots: BTreeMap<String, WritableSnapshot>,
 }
 
@@ -1184,11 +1283,9 @@ struct WritableRuntimeTarget {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WritablePeerDepMeta {
-    // pnpm v9 omits `optional: false` entirely; only the truthy form
-    // shows up in real-world lockfiles. Skip the default so we stay
-    // byte-identical for the rare case where a packument explicitly
-    // marks a peer as non-optional.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    // Always `true` — the writer filters non-optional peers out of the
+    // map rather than emitting them with the field skipped, because an
+    // empty mapping is not a valid `peerDependenciesMeta` value.
     optional: bool,
 }
 

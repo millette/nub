@@ -1,7 +1,7 @@
-use super::bin_linking::{link_bin_entries, link_bins, link_bins_for_dep};
+use super::bin_linking::{LinkAllBinsInput, ManagedBinLinks, link_all_bins};
 use super::sweep::invalidate_changed_aube_entries;
 use super::{InstallPhaseTimings, lifecycle::resolve_link_strategy};
-use super::{bin_linking, delta};
+use super::{delta, gvs};
 use crate::commands::inject;
 use crate::state;
 use miette::{Context, IntoDiagnostic, miette};
@@ -43,6 +43,10 @@ pub(super) fn resolve_node_linker(
 
 pub(super) struct LinkPhaseInput<'a> {
     pub(super) cwd: &'a std::path::Path,
+    /// Whether to record this project in the store registry once the link
+    /// succeeds. False for the `dlx` scratch project, which is deleted on
+    /// exit — see `InstallOptions::register_in_store`.
+    pub(super) register_in_store: bool,
     pub(super) settings_ctx: &'a aube_settings::ResolveCtx<'a>,
     pub(super) store: &'a aube_store::Store,
     pub(super) graph_for_link: &'a aube_lockfile::LockfileGraph,
@@ -51,6 +55,9 @@ pub(super) struct LinkPhaseInput<'a> {
     pub(super) manifests: &'a [(String, aube_manifest::PackageJson)],
     pub(super) manifest: &'a aube_manifest::PackageJson,
     pub(super) build_policy: &'a aube_scripts::BuildPolicy,
+    /// Mirrors the lifecycle phase's floor gate so the engine fold covers every
+    /// package that can build. See [`super::build_may_key_engine`].
+    pub(super) default_trust_enabled: bool,
     pub(super) node_version: Option<&'a str>,
     pub(super) prewarm_graph_hashes:
         Option<&'a std::sync::Arc<aube_lockfile::graph_hash::GraphHashes>>,
@@ -60,6 +67,14 @@ pub(super) struct LinkPhaseInput<'a> {
     pub(super) link_concurrency_setting: Option<usize>,
     pub(super) use_global_virtual_store_override: Option<bool>,
     pub(super) planned_gvs: bool,
+    /// Pre-folded materialization computed once in the command layer under the
+    /// `gvs_over_default_hoist` embedder profile. When present, `run_link_phase`
+    /// hands the linker `use_global_virtual_store` + `hoist` (build-hidden-tree)
+    /// from it directly, so the linker's own `use_global_virtual_store && hoist`
+    /// fallback (which bakes in the stock coupling) is never reached. `None` on
+    /// standalone aube's default path, where the linker re-derives from the raw
+    /// override + resolved hoist, byte-for-byte unchanged.
+    pub(super) gvs_hoist_decision: Option<super::gvs::Materialization>,
     pub(super) has_workspace: bool,
     pub(super) dep_selection_filtered: bool,
     pub(super) workspace_filter_empty: bool,
@@ -81,11 +96,47 @@ pub(super) struct LinkPhaseOutput {
     pub(super) current_leaf_hashes: Option<BTreeMap<String, String>>,
     pub(super) current_subtree_hashes: Option<BTreeMap<String, String>>,
     pub(super) patch_hashes: BTreeMap<String, String>,
+    pub(super) managed_bin_links: ManagedBinLinks,
+}
+
+/// Dep paths whose hoisted placement can be left in place rather than wiped
+/// and refilled. See the call site for why each condition is load-bearing.
+///
+/// Returns empty on any doubt — a missing state file, a layout switch, an
+/// interrupted previous link — which degrades exactly to the unconditional
+/// wipe this replaces.
+fn reusable_hoisted_dep_paths(
+    cwd: &std::path::Path,
+    graph: &aube_lockfile::LockfileGraph,
+    patch_hashes: &BTreeMap<String, String>,
+) -> std::collections::HashSet<String> {
+    use crate::state::InstallLayoutMode;
+
+    if !crate::state::link_completed_cleanly(cwd) {
+        tracing::debug!("hoisted: previous link did not complete; refusing to reuse placements");
+        return Default::default();
+    }
+    if !matches!(
+        crate::state::read_state_layout_linker(cwd),
+        Some(InstallLayoutMode::Hoisted)
+    ) {
+        return Default::default();
+    }
+    let Some(prior) = crate::state::read_state_package_content_hashes(cwd) else {
+        return Default::default();
+    };
+    let (current, _) = super::delta::compute_leaf_and_subtree_hashes(graph, patch_hashes, cwd);
+    current
+        .into_iter()
+        .filter(|(dep_path, hash)| prior.get(dep_path) == Some(hash))
+        .map(|(dep_path, _)| dep_path)
+        .collect()
 }
 
 pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPhaseOutput> {
     let LinkPhaseInput {
         cwd,
+        register_in_store,
         settings_ctx,
         store,
         graph_for_link,
@@ -94,6 +145,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         manifests,
         manifest,
         build_policy,
+        default_trust_enabled,
         node_version,
         prewarm_graph_hashes,
         aube_dir,
@@ -102,6 +154,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         link_concurrency_setting,
         use_global_virtual_store_override,
         planned_gvs,
+        gvs_hoist_decision,
         has_workspace,
         dep_selection_filtered,
         workspace_filter_empty,
@@ -119,6 +172,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
     // diagnostic). Settings-file values flow through the generated typed
     // accessor, which collapses unknown values to `None` so they behave
     // like an absent setting.
+    super::control::check_cancelled()?;
     let strategy = resolve_link_strategy(cwd, settings_ctx, planned_gvs)?;
     if let Some(p) = prog_ref {
         p.set_phase("linking");
@@ -127,7 +181,22 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
 
     let shamefully_hoist = aube_settings::resolved::shamefully_hoist(settings_ctx);
     let public_hoist_pattern = aube_settings::resolved::public_hoist_pattern(settings_ctx);
-    let hoist = aube_settings::resolved::hoist(settings_ctx);
+    // Under the `gvs_over_default_hoist` profile the command layer pre-folded the
+    // (effective GVS, hidden-tree) decision: `hoist` becomes "build the hidden
+    // tree" and the GVS override becomes the effective mode, so the linker's own
+    // `use_global_virtual_store && hoist` fallback is never reached. Standalone
+    // aube (`None`) resolves hoist and keeps the raw override — the linker
+    // re-derives, byte-for-byte unchanged.
+    let (hoist, use_global_virtual_store_override) = match gvs_hoist_decision {
+        Some(materialization) => (
+            materialization.build_hidden_tree(),
+            Some(materialization.uses_shared_store()),
+        ),
+        None => (
+            aube_settings::resolved::hoist(settings_ctx),
+            use_global_virtual_store_override,
+        ),
+    };
     let hoist_pattern = aube_settings::resolved::hoist_pattern(settings_ctx);
     let hoist_workspace_packages = aube_settings::resolved::hoist_workspace_packages(settings_ctx);
     let hoisting_limits = crate::commands::settings_hoisting_limits_to_linker(
@@ -137,6 +206,22 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
     let virtual_store_only = aube_settings::resolved::virtual_store_only(settings_ctx);
     let node_linker = resolve_node_linker(settings_ctx)?;
     tracing::debug!("node-linker: {:?}", node_linker);
+    // Per-package disk-materialize: subpath adapters that must be real
+    // project-local dirs even under GVS so their realpath stays inside the
+    // project (see `Linker::with_disk_materialize`). Empty on standalone aube
+    // (settings default `[]`); nub seeds the curated list as an embedder
+    // default. Consulted by the linker only in the GVS pass.
+    let disk_materialize_packages =
+        aube_settings::resolved::disk_materialize_packages(settings_ctx);
+    // Embedder-pluggable expansion (selective-subtree materialization): a host
+    // (nub) installs a hook that expands the flat seed into a graph-aware plan,
+    // growing each seed to its ancestor-closure so a transitively-consumed package
+    // materializes with its importers (no store-resident-consumer split).
+    // Undeclared imports an ejected package makes are then resolved by the linker's
+    // collective project-local hidden hoist tree over the ejected set. Standalone
+    // aube installs no hook, so the plan is the seed verbatim — byte-for-byte the
+    // prior behavior.
+    let dm_plan = aube_linker::expand_disk_materialize(graph_for_link, &disk_materialize_packages);
 
     let mut linker = aube_linker::Linker::new(store, strategy)
         .with_shamefully_hoist(shamefully_hoist)
@@ -151,9 +236,37 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         .with_link_concurrency(link_concurrency_setting)
         .with_virtual_store_only(virtual_store_only)
         .with_modules_dir_name(modules_dir_name.to_string())
-        .with_aube_dir_override(aube_dir.to_path_buf());
+        .with_aube_dir_override(aube_dir.to_path_buf())
+        // Lets the linker's on-demand `load_index` fallback content-address
+        // a no-integrity package's index (matching the warm classifier)
+        // instead of keying by the bare `None` selector — see the field
+        // docs on `aube_linker::Linker`. Projected from the global URL-keyed
+        // bindings here (the linker has no registry client), so the linker
+        // crate keeps its existing `name@version` lookup untouched.
+        .with_no_integrity_read_keys(crate::state::read_no_integrity_index_for(
+            cwd,
+            graph_for_link.packages.values(),
+        ))
+        .with_disk_materialize(&dm_plan.names);
+    if planned_gvs && node_linker == aube_linker::NodeLinker::Isolated {
+        linker = linker
+            .with_project_local_dep_paths(gvs::legacy_vite_project_local_closure(graph_for_link));
+    }
     if let Some(enabled) = use_global_virtual_store_override {
         linker = linker.with_use_global_virtual_store(enabled);
+    }
+    // Feed the progress UI its live file-linking counter so the linking
+    // phase surfaces a ticking file count. Gated on the embedder opting
+    // into the redesigned progress UX (nub), OR on Events mode, whose
+    // `InstallProgressSnapshot.files_linked` is otherwise pinned at zero for
+    // a host that consumes events without the TTY UX. Standalone aube sets
+    // neither on its default path, so its link pass never touches the
+    // counter (byte-identical).
+    if let Some(p) = prog_ref
+        && (aube_util::embedder().tty_progress
+            || super::control::current().output_mode() == super::control::InstallOutputMode::Events)
+    {
+        linker = linker.with_link_progress(p.link_progress_counter());
     }
 
     // Patches for delta-fingerprint folding and linker injection.
@@ -161,7 +274,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
     // the `changed` bucket and side-effects skip can't trust a stale
     // marker.
     let (patches_for_linker, patch_hashes) =
-        crate::patches::load_patches_for_linker(cwd, &graph_for_link.patched_dependencies)?;
+        crate::patches::load_patches_for_linker(cwd, graph_for_link)?;
 
     // Compute leaf + subtree hashes together when both are needed.
     // Linker invalidation reads `current_subtree_hashes`; the late
@@ -178,13 +291,19 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
     } else {
         (None, None)
     };
-    if !linker.uses_global_virtual_store()
-        && let Some(current_subtree_hashes) = current_subtree_hashes.as_ref()
+    if let Some(current_subtree_hashes) = current_subtree_hashes.as_ref()
         && let Some(prior_subtrees) = state::read_state_subtree_hashes(cwd)
     {
         let touched = delta::changed_subtree_roots(&prior_subtrees, current_subtree_hashes);
-        let invalidated =
-            invalidate_changed_aube_entries(aube_dir, &touched, virtual_store_dir_max_length);
+        // Under the shared store a changed package moves to a new store path, and its
+        // link is re-pointed. Only an entry materialized in the project (ejected, or
+        // `file:`) keeps its path, and its dependency links with it.
+        let invalidated = invalidate_changed_aube_entries(
+            aube_dir,
+            &touched,
+            virtual_store_dir_max_length,
+            linker.uses_global_virtual_store(),
+        );
         if invalidated > 0 {
             tracing::debug!("delta: invalidated {invalidated} changed .aube entry/entries");
         }
@@ -257,12 +376,15 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
 
         // Reuse the prewarm task's `compute_graph_hashes` output when
         // the link-phase graph matches what the prewarm hashed. The
-        // prewarm hashed the unfiltered post-resolve graph; if no
-        // dep-selection or workspace filter applied, `graph_for_link`
-        // == that graph by node count + key set, so the cached
-        // hashes are byte-identical to a fresh compute. Falling
-        // through to a fresh compute keeps the contract simple
-        // whenever the graphs diverge.
+        // prewarm host-filters its graph clone with the SAME
+        // `filter_graph` inputs this branch applied (see
+        // `run_gvs_prewarm_materializer` / `prewarm_host_filter_inputs`),
+        // so absent a dep-selection or workspace filter `graph_for_link`
+        // == the prewarm's graph by node count + key set and the cached
+        // hashes are byte-identical to a fresh compute. Falling through
+        // to a fresh compute keeps the contract simple whenever the
+        // graphs diverge (e.g. a dep/workspace filter narrowed this
+        // branch's graph but not the prewarm's).
         //
         // The prewarm runs concurrently with fetch and so can't see the
         // not-yet-imported source-dep trees; when any globally-shared
@@ -282,14 +404,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         } else {
             let engine = node_version.map(aube_lockfile::graph_hash::engine_name_default);
             let allow = |pkg: &aube_lockfile::LockedPackage| {
-                matches!(
-                    build_policy.decide_package(
-                        pkg.registry_name(),
-                        &pkg.version,
-                        pkg.source_approval_key().as_deref(),
-                    ),
-                    aube_scripts::AllowDecision::Allow
-                )
+                super::build_may_key_engine(build_policy, pkg, default_trust_enabled)
             };
             aube_lockfile::graph_hash::compute_graph_hashes_full(
                 graph_for_link,
@@ -304,24 +419,114 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
     if !patches_for_linker.is_empty() {
         linker = linker.with_patches(patches_for_linker);
     }
+
+    // Hoisted relinks used to wipe and refill EVERY placed package, which
+    // deletes whatever a postinstall left behind (`build/Release/*.node`, a
+    // downloaded binary) because the refill restores published tarball
+    // contents and nothing else. Vouch for the packages that provably do not
+    // need touching so the linker can leave them alone, matching what npm and
+    // pnpm already do.
+    //
+    // Three conditions, and all three are needed:
+    //   * the last link ran to COMPLETION — the install state is written at
+    //     the end of a successful install but survives a later one that died
+    //     partway, so state alone would happily vouch for a half-written tree;
+    //   * the last install used the SAME layout, since an isolated tree's
+    //     directories are not where the hoisted pass expects them;
+    //   * the package's content fingerprint is UNCHANGED, so the bytes a
+    //     refill would write are the bytes already there.
+    // Any doubt and the dep path is simply left out, which is exactly today's
+    // wipe-and-refill.
+    //
+    // Only computed for hoisted, so the isolated default pays nothing.
+    if matches!(node_linker, aube_linker::NodeLinker::Hoisted) {
+        let reusable = reusable_hoisted_dep_paths(cwd, graph_for_link, &patch_hashes);
+        tracing::debug!(
+            "hoisted: reusing {} of {} placements (rest wiped + refilled)",
+            reusable.len(),
+            graph_for_link.packages.len()
+        );
+        linker = linker.with_reusable_hoisted(reusable);
+    }
+
+    // From here until the install finishes, the tree on disk is not
+    // trustworthy. Cleared in `finalize`.
+    crate::state::mark_link_in_progress(cwd);
+
+    // The sweep lock is already held for this whole install — taken in
+    // `run_inner` before the fetch phase, which publishes store entries of
+    // its own through the prewarm materializer.
+
+    // Registered BEFORE the link so a concurrent GVS prune cannot sweep the
+    // shared entries this link is about to point at; rolled back below if the
+    // link fails.
+    if linker.uses_global_virtual_store() {
+        super::super::gvs_registry::register_project(&store.virtual_store_dir(), cwd, aube_dir)
+            .wrap_err("failed to register project with global virtual store")?;
+    }
+
     let stats = if has_workspace {
         linker
             .link_workspace(cwd, graph_for_link, package_indices, ws_dirs)
-            .into_diagnostic()
-            .wrap_err("failed to link workspace node_modules")?
+            .map_err(|error| (error, "failed to link workspace node_modules"))
     } else {
         linker
             .link_all(cwd, graph_for_link, package_indices)
-            .into_diagnostic()
-            .wrap_err("failed to link node_modules")?
+            .map_err(|error| (error, "failed to link node_modules"))
     };
+    let stats = match stats {
+        Ok(stats) => stats,
+        Err((error, context)) => {
+            if linker.uses_global_virtual_store()
+                && let Err(cleanup_error) = super::super::gvs_registry::unregister_if_unreferenced(
+                    &store.virtual_store_dir(),
+                    cwd,
+                    aube_dir,
+                )
+            {
+                tracing::debug!("failed to clean up GVS project registration: {cleanup_error}");
+            }
+            return Err(error).into_diagnostic().wrap_err(context);
+        }
+    };
+    if linker.uses_global_virtual_store() {
+        super::super::gvs_registry::register_project(&store.virtual_store_dir(), cwd, aube_dir)
+            .wrap_err("failed to record project entries in the global virtual store")?;
+    }
+
+    // Every linker mode registers, not just the shared store: the
+    // extracted-tree tier under the store is keyed the same way whether or
+    // not the graph hash was applied, so a project-local install still owns
+    // tree entries that only its own `.aube/` names can protect, and
+    // `store prune` marks live entries by walking the registered projects.
+    // Recorded after the link SUCCEEDED (a project whose link had not run
+    // would arm the sweep with a project that marks nothing); best-effort —
+    // a registry write must never fail an install.
+    if register_in_store
+        && !linker.uses_global_virtual_store()
+        && let Err(e) =
+            super::super::gvs_registry::register_project(&store.virtual_store_dir(), cwd, aube_dir)
+    {
+        tracing::debug!("could not register project against the store: {e}");
+    }
 
     tracing::debug!(
-        "phase:link {:.1?} ({} files)",
+        "phase:link {:.1?} ({} files){}",
         phase_start.elapsed(),
-        stats.files_linked
+        stats.files_linked,
+        super::phase_no_work_marker(stats.files_linked == 0)
     );
     phase_timings.record("link", phase_start.elapsed());
+
+    // Keep the exact hoisted placement map in a sidecar even for filtered
+    // installs, which intentionally do not replace the main freshness state.
+    // Replanning the full graph later can associate a root-level package with
+    // the wrong conflicting version.
+    if !virtual_store_only {
+        state::write_hoisted_placements(cwd, stats.hoisted_placements.as_ref())
+            .into_diagnostic()
+            .wrap_err("failed to record hoisted package placements")?;
+    }
 
     // Apply `dependenciesMeta.<name>.injected` overrides. Only runs in
     // workspace + isolated mode: hoisted layouts don't have a
@@ -355,171 +560,31 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         phase_timings.record("inject", inject_start.elapsed());
     }
 
-    // 7. Link .bin entries (root + each workspace package).
-    //    Use graph_for_link so dev-only bins aren't linked under --prod.
-    //    In hoisted mode, the placement map returned from linking
-    //    tells bin-resolution where each dep ended up on disk
-    //    instead of assuming the `.aube/<dep_path>` convention.
-    //    Skipped under `virtualStoreOnly` — the top-level
-    //    `node_modules/.bin` directory is not meant to exist in that
-    //    mode.
-    let placements_ref = stats.hoisted_placements.as_ref();
+    // 7. Link .bin entries before dependency lifecycle scripts so builds can
+    //    invoke their own dependencies. Approved builds get a refresh pass in
+    //    finalize because a lifecycle may replace its bin target.
     let phase_start = std::time::Instant::now();
-    // `extendNodePath` controls whether shim scripts export `NODE_PATH`.
-    // `preferSymlinkedExecutables` only matters on POSIX: `Some(true)`
-    // keeps the symlink layout, `Some(false)` swaps in a shell shim so
-    // `extendNodePath` can actually take effect (bare symlinks can't set
-    // env vars). When the user leaves it unset, default to shim under the
-    // isolated linker (NODE_PATH matters there so transitives hoisted to
-    // `.aube/node_modules/` resolve from a shimmed bin) and symlink under
-    // hoisted (every dep is already on the root `node_modules/` walk-up
-    // path, so NODE_PATH is unnecessary). Mirrors pnpm's effective
-    // default. Windows always writes cmd/ps1/sh wrappers regardless,
-    // since real symlinks there need Developer Mode.
-    let extend_node_path = aube_settings::resolved::extend_node_path(settings_ctx);
-    let isolated = !matches!(node_linker, aube_linker::NodeLinker::Hoisted);
-    let prefer_symlinked_executables =
-        aube_settings::resolved::prefer_symlinked_executables(settings_ctx)
-            .or(isolated.then_some(false));
-    // Only the isolated layout has a hidden modules dir worth exposing
-    // via NODE_PATH — under `node-linker=hoisted` every dep is already
-    // on the top-level `node_modules/` walk-up path, so appending
-    // `.aube/node_modules/` would just stuff a non-existent entry into
-    // every shim. `add.rs` (global install, hoisted-shaped) passes
-    // `None` for the same reason.
-    let hidden_modules_dir = aube_dir.join("node_modules");
-    let shim_opts = aube_linker::BinShimOptions {
-        extend_node_path,
-        prefer_symlinked_executables,
-        hidden_modules_dir: isolated.then_some(hidden_modules_dir.as_path()),
-    };
-    if !virtual_store_only {
-        let mut pkg_json_cache = bin_linking::PkgJsonCache::new();
-        let mut ws_pkg_json_cache = bin_linking::WsPkgJsonCache::new();
-        let ws_dirs_for_bins = has_workspace.then_some(ws_dirs);
-        link_bins(
-            cwd,
-            modules_dir_name,
-            aube_dir,
-            graph_for_link,
-            virtual_store_dir_max_length,
-            placements_ref,
-            shim_opts,
-            &mut pkg_json_cache,
-            ws_dirs_for_bins,
-            &mut ws_pkg_json_cache,
-        )?;
-        // Root importer's own `bin` (discussion #228). Runs after
-        // `link_bins` so a self-bin overrides a same-named dep bin.
-        // Self-bin targets are files in the importer's own tree — often
-        // build outputs that don't exist at install time, or are
-        // later restored from an `actions/upload-artifact` round-trip
-        // that strips the POSIX exec bit. A POSIX shim (shell script
-        // that invokes `node`) is itself `+x` and does not rely on
-        // the target's exec bit, so `aube run` works in both flows.
-        if let Some(bin) = manifest.extra.get("bin") {
-            let root_bin_dir = cwd.join(modules_dir_name).join(".bin");
-            let self_shim_opts = aube_linker::BinShimOptions {
-                prefer_symlinked_executables: Some(false),
-                ..shim_opts
-            };
-            link_bin_entries(
-                &root_bin_dir,
-                cwd,
-                manifest.name.as_deref(),
-                bin,
-                self_shim_opts,
-            )?;
-        }
-        if has_workspace {
-            for (importer_path, deps) in &graph_for_link.importers {
-                if importer_path == "." {
-                    continue;
-                }
-                // pnpm v9 emits nested peer-context importer entries
-                // (e.g. `a/node_modules/@scope/b`). Those paths are
-                // reached through the workspace-to-workspace symlink
-                // chain, not distinct directories to receive their own
-                // `.bin`. Walking them here duplicates work on the
-                // physical workspace and, at monorepo depth, pushes the
-                // kernel's per-lookup symlink budget over SYMLOOP_MAX.
-                if !aube_linker::is_physical_importer(importer_path) {
-                    continue;
-                }
-                let pkg_dir = cwd.join(importer_path);
-                let bin_dir = pkg_dir.join(modules_dir_name).join(".bin");
-                std::fs::create_dir_all(&bin_dir).into_diagnostic()?;
-                for dep in deps {
-                    if let Some(ws_dir) = ws_dirs.get(&dep.name) {
-                        bin_linking::link_bins_for_workspace_dep(
-                            &mut ws_pkg_json_cache,
-                            &bin_dir,
-                            ws_dir,
-                            &dep.name,
-                            shim_opts,
-                        )?;
-                    } else {
-                        link_bins_for_dep(
-                            &mut pkg_json_cache,
-                            aube_dir,
-                            &bin_dir,
-                            graph_for_link,
-                            &dep.dep_path,
-                            &dep.name,
-                            virtual_store_dir_max_length,
-                            placements_ref,
-                            shim_opts,
-                        )?;
-                    }
-                }
-                // Workspace member's own `bin` (discussion #228). `manifests`
-                // was parsed once upstream and keys by importer relpath.
-                // See the root self-bin call site for why this forces a
-                // POSIX shim instead of a symlink.
-                if let Some((_, member_manifest)) =
-                    manifests.iter().find(|(p, _)| p == importer_path)
-                    && let Some(bin) = member_manifest.extra.get("bin")
-                {
-                    let self_shim_opts = aube_linker::BinShimOptions {
-                        prefer_symlinked_executables: Some(false),
-                        ..shim_opts
-                    };
-                    link_bin_entries(
-                        &bin_dir,
-                        &pkg_dir,
-                        member_manifest.name.as_deref(),
-                        bin,
-                        self_shim_opts,
-                    )?;
-                }
-            }
-        }
-        // Gate matches the lifecycle phase's (`finalize.rs`) via the
-        // shared `dep_build_scripts_may_run` predicate, threaded through
-        // `maybe_link_dep_bins` (single, testable home for the decision):
-        // the `defaultTrust` floor can authorize a package's build
-        // scripts with no explicit allow rule, and those scripts call
-        // binaries declared in the package's own `dependencies` — which
-        // must be shimmed into the dep's `.bin` and put on PATH. Gating
-        // only on `has_any_allow_rule()` skipped this whole pass on a
-        // pure trust-floor install, so a postinstall calling a
-        // dep-provided CLI (e.g. lmdb's
-        // `node-gyp-build-optional-packages`) failed with exit 127 even
-        // though the script itself ran.
-        bin_linking::maybe_link_dep_bins(
-            ignore_scripts,
-            build_policy.has_any_allow_rule(),
-            floor_may_allow_any,
-            aube_dir,
-            graph_for_link,
-            virtual_store_dir_max_length,
-            placements_ref,
-            shim_opts,
-            &mut pkg_json_cache,
-        )?;
-        tracing::debug!("phase:link_bins {:.1?}", phase_start.elapsed());
-        phase_timings.record("link_bins", phase_start.elapsed());
-    }
+    let managed_bin_links = link_all_bins(LinkAllBinsInput {
+        project_dir: cwd,
+        settings_ctx,
+        modules_dir_name,
+        aube_dir,
+        graph: graph_for_link,
+        virtual_store_dir_max_length,
+        placements: stats.hoisted_placements.as_ref(),
+        ws_dirs,
+        manifests,
+        manifest,
+        node_linker,
+        has_workspace,
+        virtual_store_only,
+        ignore_scripts,
+        has_any_allow_rule: build_policy.has_any_allow_rule(),
+        floor_may_allow_any,
+        preserved: None,
+    })?;
+    tracing::debug!("phase:link_bins {:.1?}", phase_start.elapsed());
+    phase_timings.record("link_bins", phase_start.elapsed());
     Ok(LinkPhaseOutput {
         stats,
         node_linker,
@@ -527,5 +592,6 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         current_leaf_hashes,
         current_subtree_hashes,
         patch_hashes,
+        managed_bin_links,
     })
 }

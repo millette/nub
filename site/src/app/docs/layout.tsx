@@ -5,11 +5,16 @@ import { baseOptions } from '@/lib/layout.shared';
 import { source } from '@/lib/source';
 
 /* Pages that map to a concrete command get a subtle, right-aligned mono chip
-   in the sidebar — descriptive label on the left, the command on the right. */
+   in the sidebar — descriptive label on the left, the command on the right.
+   The config page carries its filename in the same slot: it is equally a thing
+   you type, and it reads as a sibling of the commands rather than an odd one
+   out with a bare name. */
 const COMMAND_BY_URL: Record<string, string> = {
+  '/docs/config': 'nub.jsonc',
   '/docs/runtime': 'nub <file>',
   '/docs/run': 'nub run',
   '/docs/nubx': 'nubx',
+  '/docs/standalone': 'nubr',
   '/docs/install': 'nub install',
   '/docs/node': 'nub node',
   '/docs/pm': 'nub pm',
@@ -20,7 +25,11 @@ function LabelWithChip({ label, command }: { label: ReactNode; command: string }
   return (
     <span className="flex w-full items-center justify-between gap-2">
       <span>{label}</span>
-      <code className="shrink-0 whitespace-nowrap rounded border border-fd-border/50 bg-fd-muted px-1 py-px font-mono text-[0.58rem] leading-tight font-normal text-fd-muted-foreground in-data-[active=true]:border-fd-primary/30 in-data-[active=true]:bg-fd-primary/10 in-data-[active=true]:text-fd-primary">
+      {/* `nav-chip` opts out of the global inline-code rules in global.css,
+          which would otherwise flatten the active state: `border: none` there
+          zeroes the computed border-width whatever width utility is set, and
+          the dark-mode background override outranks a single bg utility. */}
+      <code className="nav-chip shrink-0 whitespace-nowrap rounded border border-fd-border/50 bg-fd-muted px-1 py-px font-mono text-[0.58rem] leading-tight font-normal text-fd-muted-foreground in-data-[active=true]:border-fd-primary/40 in-data-[active=true]:bg-fd-primary/10 in-data-[active=true]:text-fd-primary">
         {command}
       </code>
     </span>
@@ -29,14 +38,15 @@ function LabelWithChip({ label, command }: { label: ReactNode; command: string }
 
 function styleNode(node: TreeNode): TreeNode {
   if (node.type === 'folder') {
-    // The folder header renders a clickable link to its index page; give it the
-    // same command chip that index page would get. When the folder has no
-    // `index` (a meta whose `pages` lists "index" explicitly rather than "..."),
-    // the index instead appears as a regular child page — find it so the chip
-    // still attaches, and drop that duplicate child below so the header isn't
-    // stuttered by an identical row beneath it.
+    // The folder header renders a clickable link to its index page. When the
+    // folder has no `index` (a meta whose `pages` lists "index" explicitly
+    // rather than "..."), the index instead appears as a regular child page —
+    // find it by its source file, promote it to the header, and drop that
+    // duplicate child so the folder name isn't repeated beneath itself. A
+    // command chip is added below when the promoted page maps to a command.
     const indexChild = node.children.find(
-      (c): c is Extract<TreeNode, { type: 'page' }> => c.type === 'page' && c.url in COMMAND_BY_URL,
+      (c): c is Extract<TreeNode, { type: 'page' }> =>
+        c.type === 'page' && /(^|\/)index\.mdx?$/.test(c.$ref ?? ''),
     );
     const folderUrl = node.index?.url ?? indexChild?.url;
     const isDuplicateIndex = (c: TreeNode) =>
@@ -75,8 +85,9 @@ function styleNode(node: TreeNode): TreeNode {
 }
 
 export default function Layout({ children }: { children: ReactNode }) {
-  // Keep the nav title + GitHub link, but drop the "Docs"/"Blog" nav links
-  // from the docs sidebar — they only belong in the top home nav.
+  // Drop the "Docs"/"Blog" nav links AND the GitHub pill from the docs sidebar —
+  // the pill lives in the home nav, and the docs surface its own "Leave a star"
+  // nudge in the TOC footer, so a sidebar pill here would be redundant.
   const { links, ...base } = baseOptions();
 
   const tree: TreeRoot = {

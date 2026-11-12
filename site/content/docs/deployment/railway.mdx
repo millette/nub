@@ -1,0 +1,80 @@
+---
+title: Railway
+description: Deploy a Nub web service from a Dockerfile. Railway builds the official Nub image, supplies PORT, and creates a public domain.
+---
+
+Railway [detects a root `Dockerfile`](https://docs.railway.com/builds/dockerfiles) and builds it instead of choosing a language buildpack. The official Nub image runs the same Node and Nub in the build and in the service.
+
+## Dockerfile
+
+```dockerfile title="Dockerfile"
+FROM ghcr.io/nubjs/nub:{{NUB_VERSION}}
+
+COPY --chown=node:node package.json package-lock.json ./
+RUN nub ci
+
+COPY --chown=node:node . .
+CMD ["nub", "run", "start"]
+```
+
+Change `package-lock.json` to the lockfile the project already uses.
+
+## HTTP endpoint
+
+Railway supplies `PORT`. The start script's server must listen on `0.0.0.0` at that port, because a server on localhost is unreachable from Railway's proxy:
+
+```ts title="server.ts"
+import { createServer } from "node:http";
+
+const port = Number(process.env.PORT || 8080);
+
+createServer((request, response) => {
+  response.writeHead(200, { "content-type": "application/json" });
+  response.end(JSON.stringify({ alive: true, runtime: "nub-on-node" }));
+}).listen(port, "0.0.0.0");
+```
+
+## Deploy
+
+Deploy from the dashboard or with the Railway CLI. Both build the `Dockerfile` at the repository root.
+
+### Dashboard
+
+1. Create a project from the GitHub repository.
+2. Select the service and confirm the build log contains `Using detected Dockerfile!`.
+3. Open **Settings → Networking** and select **Generate Domain**.
+
+Railway redeploys on every push to the connected branch. A service has no public domain until one is generated.
+
+### CLI
+
+Install and authenticate the [Railway CLI](https://docs.railway.com/cli), then upload the local source:
+
+```bash
+railway login
+railway init --name nub-app
+railway add --service nub-app
+railway up --service nub-app --ci
+DOMAIN=$(railway domain --service nub-app --json \
+  | jq -r '.domain // .domains[0]')
+curl --fail "$DOMAIN/alive"
+# {"alive":true,"runtime":"nub-on-node"}
+```
+
+The `railway domain` command creates a free `*.up.railway.app` domain when the service has none, and prints the URL.
+
+## Health checks
+
+Add a health-check path, such as `/alive`, in the service settings.
+
+<Callout>
+Read the [full docs](https://docs.railway.com/deployments/healthchecks) on docs.railway.com.
+</Callout>
+
+## Prebuilt images
+
+Railway can run an application image that [GitHub Actions](/docs/deployment#github-actions-and-registries) published. Point the service at that image instead of the repository to build once in CI rather than again on Railway.
+
+<Callout>
+Read the [full docs](https://docs.railway.com/services#deploying-a-public-docker-image) on docs.railway.com.
+</Callout>

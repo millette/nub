@@ -1,35 +1,21 @@
 ---
 title: Script runner
-description: A drop-in for pnpm run and npm run — every flag carries over with the same spelling and semantics, 24× faster on the cold path, with the full workspace and lifecycle-hook surface preserved.
+description: A drop-in for pnpm run and npm run, with pnpm's workspace flags and npm's lifecycle hooks.
 ---
 
-`nub run` is a drop-in for `pnpm run` and `npm run` — every flag carries over with the same spelling and semantics, down to the recursive and workspace-filter ones a real monorepo leans on. Existing invocations work unchanged:
-
-```bash
-nub run -r --resume-from @scope/pkg build      # resume an interrupted recursive run mid-graph
-nub run -r --reporter=ndjson build             # machine-readable per-package results for CI
-nub run -r --stream --reporter-hide-prefix build
-nub run -r --workspace-concurrency 4 build
-nub run -r --if-present test                   # skip members without the script
-```
-
-It reads your `package.json` directly — 24× faster on the cold path — and package management stays with whatever you already use (`pnpm`, `npm`, `yarn`, `bun`). This page is a cookbook: each section is a task with the exact command to run.
-
-A few flags behave differently. The `--report-summary` flag streams results live via `--reporter=ndjson` instead of writing a static file. The `--if-present` flag is workspace-scoped: it skips members missing the script during a recursive run. The legacy npm knobs `--scripts-prepend-node-path`, `--unsafe-perm`, and `--npm-path` are not needed and not accepted.
-
-## `nub run <script>`
-
-Pass the script name after `run`. The name must match a key in your `package.json`'s `"scripts"` field.
+Pass a script name from `package.json` to run it:
 
 ```bash
 nub run build
-nub run dev
-nub run test
+nub run test --watch            # trailing arguments go to the script
+nub run -r build                # every workspace package
+nub run --filter @org/api dev   # one workspace package
+nub run                         # no name: list the scripts
 ```
 
-Running a script is always `nub run <script>` — barewords like `nub dev` do not fall through to scripts. (If you type `nub build` and `build` is a real script, Nub's error tells you to type `nub run build`.) See [Running files](/docs/runtime) for how `nub <file>` works.
+The runner takes pnpm's `run` flags with the same spelling and semantics. Package management stays with whatever the project already uses, whether that is pnpm, npm, Yarn, or Bun.
 
-Dispatch is handled in Rust with no Node bootstrap in the wrapper, so the runner adds only a few milliseconds before your script's first byte — faster than Node's own `node --run`:
+Dispatch happens in Rust with no Node bootstrap, so the runner adds a few milliseconds before the script's first byte:
 
 <Bench
   label="script dispatch · warm · 50 runs"
@@ -44,59 +30,31 @@ Dispatch is handled in Rust with no Node bootstrap in the wrapper, so the runner
   source="https://github.com/nubjs/nub/tree/main/tests/bench/script-runner"
 />
 
-## Run several scripts at once
+Scripts always run through `nub run`. A bare `nub build` does not fall through to a script; it fails with a hint to run `nub run build`. See [Running files](/docs/runtime) for what `nub <file>` does.
 
-A `/regex/` selector in place of a script name runs every script whose name matches, mirroring `pnpm run`. This is the in-package equivalent of `npm-run-all`'s `run-p` — without the extra dependency or the per-task PM re-spawn, since Nub spawns each script body directly.
+On Unix, a script attached to the terminal gets the terminal's foreground process group, so interactive tools can read input and receive Ctrl-C directly. Nub restores the terminal when the script exits.
 
-```bash
-nub run "/^build:/"     # runs build:js, build:css, build:types — concurrently
-```
+## Argument forwarding
 
-Matching scripts run concurrently by default, capped at `min(4, CPU count)`, with each line prefixed by its script name. To run them one at a time instead (the `run-s` behavior), cap the concurrency at one:
-
-```bash
-nub run --workspace-concurrency 1 "/^build:/"   # one at a time, in package.json order
-```
-
-The selector must be a slash-delimited regular expression literal (`/^build:/`); a plain `build:*` is treated as a literal script name, not a glob. Regex flags are not supported. An exact script name (no slashes) always runs that single script unchanged.
-
-Coming from `npm-run-all` / `npm-run-all2`:
-
-| npm-run-all | Nub |
-|---|---|
-| `run-p build:js build:css` | `nub run "/^build:(js\|css)$/"` |
-| `run-p "build:*"` | `nub run "/^build:/"` |
-| `run-s "build:*"` | `nub run --workspace-concurrency 1 "/^build:/"` |
-
-Selecting an *arbitrary, unrelated* set of scripts (for example `build`, `lint`, `test` together, which share no name pattern) is not yet supported — track [#102](https://github.com/nubjs/nub/issues/102).
-
-## Forward arguments
-
-Trailing arguments after the script name are passed straight through to the script. You do not need the `--` separator that `npm run` requires.
+Arguments after the script name go to the script. The `--` separator that `npm run` requires is optional.
 
 ```bash
 nub run test --watch          # forwards --watch to the test script
-nub run build --target=esnext # forwards --target=esnext
+nub run test -- --watch       # same result
 ```
 
-This matches `bun run`. The explicit separator still works for muscle memory:
+Nub's own flags go before the script name:
 
 ```bash
-nub run test -- --watch       # identical result; the -- is optional
-```
-
-A flag before the script name (`nub run --filter core test`) is Nub's; a flag after the script name (`nub run test --filter`) is the script's. So Nub-side flags always go before `<script>`:
-
-```bash
-nub run --silent build        # --silent is Nub's (suppresses the preamble)
-nub run build --silent        # --silent is forwarded to the build script
+nub run --silent build        # Nub's --silent: no preamble
+nub run build --silent        # forwarded to the build script
 ```
 
 ## Lifecycle hooks
 
-Nub runs `pre<script>` and `post<script>` hooks automatically, matching `npm run` semantics. Given these scripts:
+Nub runs `pre<script>` and `post<script>` hooks automatically, matching `npm run`:
 
-```json
+```json title="package.json"
 {
   "scripts": {
     "prebuild": "rimraf dist",
@@ -106,23 +64,183 @@ Nub runs `pre<script>` and `post<script>` hooks automatically, matching `npm run
 }
 ```
 
-a single `nub run build` runs all three in order:
-
 ```bash
-nub run build                 # runs prebuild, then build, then postbuild
+nub run build                   # prebuild, then build, then postbuild
+nub run --ignore-scripts build  # build only
 ```
 
-To skip the `pre` / `post` hooks (CI, or a security-conscious run), pass `--ignore-scripts`.
+## Multiple scripts
+
+A `/regex/` in place of a script name runs every script whose name matches, as `pnpm run` does. Matching scripts run concurrently, up to `min(4, CPU count)` at a time, with each line prefixed by its script name.
 
 ```bash
-nub run --ignore-scripts build
+# build:js, build:css, … concurrently
+nub run "/^build:/"
+# one at a time, in package.json order
+nub run --workspace-concurrency 1 "/^build:/"
 ```
 
-## The `npm_*` environment
+The selector must be a slash-delimited regular expression. A plain `build:*` is a literal script name, not a glob.
 
-Nub populates the child process with the full npm-compatible environment, so scripts and tooling that read `npm_*` variables behave exactly as they do under `npm run`. Locally installed CLIs are on `PATH` via the `node_modules/.bin` chain, so you can call them by bare name.
+Equivalents for `npm-run-all` / `npm-run-all2`:
 
-```json
+| npm-run-all | Nub |
+|---|---|
+| `run-p build:js build:css` | `nub run "/^build:(js\|css)$/"` |
+| `run-p "build:*"` | `nub run "/^build:/"` |
+| `run-s "build:*"` | `nub run --workspace-concurrency 1 "/^build:/"` |
+
+<Callout>
+Read the [full docs](https://pnpm.io/cli/run#running-multiple-scripts) for pnpm's regex selector on pnpm.io.
+</Callout>
+
+## Workspaces
+
+Nub reads the workspace from the `"workspaces"` field in `package.json` (npm, Yarn, Bun) or from `pnpm-workspace.yaml` (pnpm). It walks up from the current directory to find the root, so these commands work anywhere inside the monorepo.
+
+### `-r, --recursive`
+
+Run the script in every workspace package. Packages run in topological order: a package's dependencies run before it does.
+
+```bash
+nub run -r build              # every workspace package
+nub run --recursive test      # long form
+nub run --workspaces lint     # npm-style alias
+nub run -r --if-present test  # skip members without the script
+```
+
+### `--filter`
+
+The `--filter` flag (or `-F`) takes pnpm's filter grammar. Select by exact name, scope glob, name wildcard, or path glob:
+
+```bash
+nub run --filter @org/api dev          # one package by name
+nub run --filter "@org/*" build        # every package in a scope
+nub run --filter "*-utils" test        # name wildcard
+nub run --filter "./packages/*" lint   # path glob
+nub run --filter '!@org/legacy' build  # exclude a package
+nub run --filter @org/api --filter @org/web build  # union of both
+```
+
+A path selector is a glob over package directories, resolved from the current directory: `./packages/*` selects every package directly under `packages`, `./packages/**` every package at any depth below it, and `./packages` only a package whose directory is `packages` itself.
+
+The `...` forms walk the dependency graph:
+
+```bash
+nub run --filter "@org/web..." build   # @org/web + its dependencies
+nub run --filter "...@org/web" build   # @org/web + its dependents
+nub run --filter "@org/web^..." build  # @org/web's dependencies only
+nub run --filter "...^@org/web" build  # @org/web's dependents only
+```
+
+A `[ref]` selects packages changed since a git ref, the common CI pattern for testing only what moved:
+
+```bash
+nub run --filter "[main]" test           # changed since main
+nub run --filter "[HEAD~1]" build        # changed since HEAD~1
+# changed packages and their dependents
+nub run --filter "...[origin/main]" test
+```
+
+<Callout>
+Read the [full docs](https://pnpm.io/filtering) for the filter grammar on pnpm.io.
+</Callout>
+
+### `-w, --workspace-root`
+
+The `-w` flag targets only the root package, wherever you run it from. It is pnpm's boolean root selector, not npm's member selector.
+
+```bash
+nub run -w lint                          # "lint" at the workspace root
+nub run -r --include-workspace-root lint # all members plus the root
+# npm-style member selection; repeatable
+nub run --workspace @org/api build
+```
+
+### `--parallel`, `--sequential`
+
+A workspace run executes up to `min(4, CPU count)` packages at a time, in topological order. These flags change that:
+
+```bash
+nub run -r --workspace-concurrency 8 build   # cap at 8 concurrent scripts
+nub run -r --parallel dev                    # all at once, no order or cap
+nub run -r --sequential migrate              # one at a time, no order
+```
+
+Use `--parallel` for long-running dev servers and `--sequential` for scripts that must not overlap.
+
+### `--no-bail`
+
+A workspace run stops at the first package that fails. The `--no-bail` flag runs every package and reports failures at the end.
+
+```bash
+nub run -r --no-bail test
+```
+
+### `--resume-from`
+
+Restart a failed topological run from one package, skipping its topological predecessors:
+
+```bash
+nub run -r --resume-from @org/api build
+```
+
+## Output
+
+These flags control how a workspace run lays out each package's output.
+
+### `--stream`, `--aggregate-output`
+
+On a terminal, Nub streams interleaved output and prefixes each line with the package directory and script name (`packages/api build: <line>`), as `pnpm -r` does. In CI or when output is piped, it buffers each package's output and flushes it when the package finishes.
+
+```bash
+nub run -r --stream build            # force interleaved live output
+nub run -r --aggregate-output build  # force per-package buffering
+```
+
+### `--reporter`
+
+The `ndjson` reporter prints one JSON event per line, for CI. Nub has no `--report-summary`; use `--reporter ndjson` for machine-readable per-package results.
+
+```bash
+nub run -r --reporter ndjson build
+```
+
+The `--reporter-hide-prefix` flag drops the per-line label, so a CI annotation matcher reads the script's own `error: file:line` output. Nub's own framing lines keep their label.
+
+```bash
+nub run -r --stream --reporter-hide-prefix build
+```
+
+### `--silent`
+
+The `--silent` flag (or `-s`) drops Nub's `$ <command>` preamble. The script's own output is unchanged.
+
+```bash
+nub run --silent build
+```
+
+### `--color`
+
+Prefixed output is piped, so most tools switch their own color off. With `--color`, scripts keep their colors:
+
+```bash
+nub run -r --parallel --color=always dev  # scripts keep their colors
+nub run -r --no-color build               # plain text from Nub and scripts
+```
+
+Nub passes the choice to scripts as `FORCE_COLOR`: `1` for `--color=always` and `0` for `--no-color`, matching pnpm. Without the flag, the usual environment variables decide:
+
+```bash
+NO_COLOR=1 nub run -r build      # off, whatever the terminal says
+FORCE_COLOR=1 nub run -r build   # on, even when the output is piped
+```
+
+## Environment
+
+Scripts get the npm-compatible environment, so tools that read `npm_*` variables behave as they do under `npm run`. The `node_modules/.bin` chain is on `PATH`, so installed CLIs run by bare name.
+
+```json title="package.json"
 {
   "scripts": {
     "build": "tsc && echo \"built $npm_package_name@$npm_package_version\""
@@ -130,11 +248,7 @@ Nub populates the child process with the full npm-compatible environment, so scr
 }
 ```
 
-```bash
-nub run build                 # tsc resolves from node_modules/.bin; npm_* vars are set
-```
-
-The injected set includes:
+The injected set:
 
 ```bash
 npm_lifecycle_event
@@ -146,151 +260,116 @@ npm_config_user_agent
 npm_package_name
 npm_package_version
 npm_package_json
-npm_package_config_*       # per-package config keys from package.json#config
+npm_package_config_*       # per-package keys from package.json#config
 npm_config_registry        # the resolved registry from the .npmrc chain
 npm_config_node_gyp        # path to a runnable node-gyp, for native builds
 INIT_CWD                   # the directory you invoked `nub run` from
 ```
 
-Inside a script, spawning `node` (by shebang or `child_process.spawn("node", …)`) re-enters Nub through the PATH shim, so child processes stay transpiled and augmented — see [`--node`](#--node) below.
+<Callout>
+Read the [full docs](https://docs.npmjs.com/cli/v11/using-npm/scripts#environment) for npm's script environment on docs.npmjs.com.
+</Callout>
 
-## `--script-shell`
+## The script shell
 
-If your `.npmrc` sets `script-shell`, Nub uses it to invoke script bodies. The rest of `.npmrc` (registry, auth, `node-linker`, `hoist-pattern`) is package-manager territory and is not read here.
+Nub runs every script body through a POSIX `sh`, so one script behaves the same on macOS, Linux, and Windows. Operators such as `&&`, pipes, `$(…)`, `${PORT:-3000}`, and inline `NODE_ENV=production` assignments work everywhere.
 
-```ini
-# .npmrc
+On macOS and Linux the shell is the system `/bin/sh`. Windows has no POSIX shell, so Nub ships busybox next to its binary and uses it instead of `cmd.exe`. Dependency install scripts run through the same shell during `nub install`. Environment variables reach the script and every program it starts as Windows set them, so a path such as `$USERPROFILE` keeps its backslashes.
+
+The shell is POSIX `sh`, not bash. Bash-only syntax such as `[[ … ]]`, arrays, and `${VAR^^}` is not guaranteed. That is the same contract `npm` gives, whose `sh -c` is dash on Debian and Ubuntu.
+
+To pin a different shell, set `script-shell` in `.npmrc`, or pass `--script-shell` for one run:
+
+```ini title=".npmrc"
 script-shell = /bin/bash
 ```
-
-You can also override the shell per invocation:
 
 ```bash
 nub run --script-shell /bin/bash build
 ```
 
-## `-r, --recursive`
+<Callout>
+Read the [full docs](https://pnpm.io/settings/other#scriptshell) for pnpm's `scriptShell` setting on pnpm.io.
+</Callout>
 
-In a monorepo, `-r` (or `--recursive`) runs the script in every workspace package. Nub reads workspace topology from `package.json`'s `"workspaces"` field (npm / Yarn / Bun) or `pnpm-workspace.yaml` (pnpm).
+## Dependency freshness
 
-```bash
-nub run -r build              # run "build" in every workspace package
-nub run --recursive test      # --recursive is the long form
-nub run --workspaces lint     # --workspaces is the npm-style alias for -r
+Before a script runs, Nub checks `node_modules` against `package.json`. A missing dependency, or one installed outside its declared range, prints a warning and the script still runs:
+
+```
+nub: dependencies may be out of date (`chalk` is not installed).
+Run `nub install`.
 ```
 
-Packages run in topological order by default: a package's dependencies build before it does. Workspace discovery walks up from your current directory to find the workspace root, so these commands work from anywhere inside the monorepo.
+The check reads a tree from any installer, and it also runs before `nub <file>`, `nub exec`, and `nubx`. Nub does not install anything here; run `nub install` when the warning appears.
 
-## `--filter`
+Set the policy with `verify-deps-before-run` in `.npmrc`:
 
-The `--filter` flag (or `-F`) takes pnpm's filter grammar verbatim. Select by exact name, scope glob, name wildcard, or path glob.
-
-```bash
-nub run --filter @org/api dev          # one package by name
-nub run --filter "@org/*" build        # every package in a scope
-nub run --filter "*-utils" test        # name wildcard
-nub run --filter "./packages/*" lint   # path glob
-nub run --filter '!@org/legacy' build  # exclude a package
+```ini title=".npmrc"
+verify-deps-before-run = warn
 ```
 
-Multiple `--filter` flags compose as a union of the matched sets:
+| Value | Behavior |
+| --- | --- |
+| `warn` | Warn, then run. The default. |
+| `error` | Print the message and refuse to run. |
+| `off` | Skip the check. |
 
-```bash
-nub run --filter @org/api --filter @org/web build
+The pnpm values `install` and `prompt` act as `warn`. A project [`nub.jsonc`](/docs/config) sets the same policy under [`verifyDeps`](/docs/config#verifydeps), where `off` is spelled `false`:
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "verifyDeps": "error"  // stop rather than run against a stale tree
+}
 ```
 
-**`--filter "@org/web..."` — graph selectors:** the dependency-graph filter forms walk the workspace package graph. Use the `...` syntax to pull in related packages.
+To override the files:
 
 ```bash
-nub run --filter "@org/web..." build   # @org/web AND its dependencies (downstream)
-nub run --filter "...@org/web" build   # @org/web AND everything that depends on it (upstream)
-nub run --filter "@org/web^..." build  # @org/web's dependencies only
-nub run --filter "...^@org/web" build  # @org/web's dependents only
+NUB_VERIFY_DEPS=off nub run build   # for this shell
+nub run --no-check build            # for one run; --no-install is an alias
 ```
 
-These are exactly the forms `pnpm --filter` supports, so existing monorepo muscle memory carries over directly.
+A tree Nub installed under a different Node major is reinstalled before the run, because native addons are built per Node major. The `off` policy disables this too.
 
-**`--filter "[ref]"` — changed since:** the `[ref]` filter form selects packages with changes since a git ref — the common CI pattern for testing only what moved.
-
-```bash
-nub run --filter "[main]" test         # packages changed since main
-nub run --filter "[HEAD~1]" build      # packages changed since the last commit
-nub run --filter "...[origin/main]" test  # changed packages AND their dependents
+```
+nub: dependencies were installed for Node 22, this run uses Node 26.
+Reinstalling — native addons are built per Node major.
 ```
 
-## `--parallel`, `--sequential`
+<Callout>
+Read the [full docs](https://pnpm.io/settings/build#verifydepsbeforerun) for pnpm's `verifyDepsBeforeRun` setting on pnpm.io.
+</Callout>
 
-Across a workspace, Nub runs packages concurrently up to a cap (CPU count by default) while respecting topological order. Tune or override that.
+## Undeclared dependencies
 
-```bash
-nub run -r --workspace-concurrency 4 build   # cap at 4 concurrent scripts
-nub run -r --parallel dev                     # all at once, no topo ordering or cap
-nub run -r --sequential migrate               # one at a time, ignore topology
+Nub warns about a phantom dependency: a package your source imports without declaring it, which resolves only because a transitive dependency was hoisted into `node_modules`. It works under a flat npm or Yarn install and breaks under an isolated one.
+
+```
+nub: src/index.ts imports `ansi-styles`, which isn't in package.json.
+Run `nub add ansi-styles` (WARN_PHANTOM_DEP).
 ```
 
-Use `--parallel` for long-running dev servers where there is nothing to order, and `--sequential` for scripts that must not overlap.
+The warning never changes the exit code. Turn it off with `phantom-check` in `.npmrc`, or with `NUB_PHANTOM_CHECK=off` for one shell:
 
-## `--no-bail`
-
-By default a workspace run bails on the first package that fails (`--bail`). To run every package regardless and report failures at the end, use `--no-bail`.
-
-```bash
-nub run -r test               # default: stop at the first failing package
-nub run -r --no-bail test     # run every package, report failures at the end
-```
-
-## `--resume-from`
-
-When a long topological run dies partway through, `--resume-from` skips the topological predecessors of a package so you restart where it broke instead of from the top.
-
-```bash
-nub run -r --resume-from @org/api build
-```
-
-## `-w, --workspace-root`
-
-The `-w` flag (pnpm's `--workspace-root`) targets only the root project, regardless of where you invoke it from. To run recursively across members and also include the root package, use the npm-style `--include-workspace-root`.
-
-```bash
-nub run -w lint                          # run "lint" at the workspace root only
-nub run -r --include-workspace-root lint # all members PLUS the root
-```
-
-Note that `-w` is pnpm's boolean root selector, not npm's member selector. To select a member the npm way, use the long `--workspace <name>` (repeatable) or `--filter <name>`.
-
-```bash
-nub run --workspace @org/api --workspace @org/web build
-```
-
-## `--stream`, `--aggregate-output`
-
-On a TTY, Nub streams interleaved, per-package-prefixed output (`<pkg> | <line>`, matching `pnpm -r`). On CI / non-TTY it buffers per package and flushes on finish. Override either default explicitly.
-
-```bash
-nub run -r --stream build            # force interleaved live output
-nub run -r --aggregate-output build  # force per-package buffering
-nub run -r --reporter ndjson build   # one JSON event per line, for CI parsing
-```
-
-And `--silent` (or `-s`) suppresses Nub's `$ <command>` preamble (it does not suppress the script's own stdout):
-
-```bash
-nub run --silent build
+```ini title=".npmrc"
+phantom-check = off
 ```
 
 ## `--node`
 
-By default, the `nub` executable is aliased as `node` for the duration of a `nub run` call, so any subprocess that spawns `node` (a script shebang, `child_process.spawn("node", …)`) gets Nub's augmentation too. Pass `--node` to turn that off for one invocation — see [the runtime overview](/docs/runtime#--node) for the full contract.
+During a `nub run`, `node` resolves to Nub, so a subprocess that spawns `node` gets Nub's augmentation too. That covers a `#!/usr/bin/env node` shebang and `child_process.spawn("node", …)`. The `--node` flag turns augmentation off for one invocation; see [the runtime overview](/docs/runtime#--node) for the full contract.
 
 ```bash
 nub run --node test
 ```
 
-What still happens under `--node`: script lookup, workspace walk-up, `--filter` evaluation, `npm_*` env injection, `node_modules/.bin` on `PATH`, and the `pre` / `post` lifecycle hooks. Reach for it when a script's `#!/usr/bin/env node` shebang chain expects plain Node, when bisecting a Nub bug, or when CI wants byte-exact Node runtime behavior with Nub's workspace selection.
+Script lookup, workspace selection, `npm_*` variables, `node_modules/.bin` on `PATH`, and lifecycle hooks still apply. Use it when a script expects plain Node, or to rule Nub out when bisecting a bug.
 
 ## Related
 
+- [Bin runner](/docs/nubx) — `nubx`, a local CLI or a fetched one, resolved in that order; `nub exec` and `nub dlx` for each half on its own.
 - [Running files](/docs/runtime) — `nub <file>` for TypeScript and JavaScript execution.
-- [nubx](/docs/nubx) — run locally installed CLIs from `node_modules/.bin`.
 - [Watch mode](/docs/watch) — restart on file changes.
 - [FAQ](/docs/faq) — monorepo, package-manager, and `--node` questions answered briefly.

@@ -3,6 +3,7 @@ use crate::config::{FetchPolicy, NpmConfig};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+mod access;
 mod body;
 mod cache;
 mod dist_tags;
@@ -13,6 +14,7 @@ mod npm_verbs;
 mod packument;
 mod parse;
 mod request;
+mod retry_policy;
 mod tarball;
 
 #[cfg(test)]
@@ -24,9 +26,11 @@ mod slow_tarball_tests;
 
 pub use cache::CachedPackumentLookup;
 use dist_tags::*;
+pub use endpoints::PackageSearchResult;
+pub(crate) use http::probe_client_builder;
 use http::*;
 pub use npm_verbs::{Owner, TokenInfo};
-use parse::parse_full_response;
+use parse::{parse_full_response, parse_full_response_seed};
 
 /// Accept header for packument requests. `vnd.npm.install-v1+json` is the
 /// abbreviated (corgi) format npmjs emits for installs; the `application/json`
@@ -92,4 +96,15 @@ pub struct RegistryClient {
     config: NpmConfig,
     network_mode: NetworkMode,
     fetch_policy: FetchPolicy,
+    /// pnpm `namedRegistries` routing: package name → the aliased registry
+    /// URL its `<alias>:<spec>` resolved to. Consulted FIRST by
+    /// [`RegistryClient::registry_url_for`] so a named-registry package fetches
+    /// (and caches) against its aliased host instead of the default registry.
+    /// Populated by the resolver's `preprocess_task` as it rewrites each
+    /// `<alias>:` spec. Interior-mutable + request-scoped; empty under any
+    /// non-pnpm posture, which makes `registry_url_for` behave exactly as
+    /// before (falls straight through to `config.registry_for`). `RwLock`
+    /// rather than `Mutex` because the map is read on every fetch but written
+    /// only once per named-registry spec.
+    named_routes: std::sync::RwLock<BTreeMap<String, String>>,
 }

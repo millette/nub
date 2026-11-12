@@ -1,5 +1,5 @@
 //! Lockfile alignment for `nub pm use` — step 3 of the identity-setting verb
-//! (spec: wiki/commands/pm/identity-policy.md §`nub pm use`). The from-state
+//! (spec: `identity-policy` (no such document) §`nub pm use`). The from-state
 //! is the lockfile(s) on disk (artifacts carry resolution state); the
 //! to-state is the target PM's format. Planning is pure — no writes, no
 //! network — so `use` can refuse BEFORE touching the manifest or registry;
@@ -18,10 +18,17 @@ use anyhow::{Context, Result, bail};
 use aube_lockfile::LockfileKind;
 
 /// Nub's own lockfile name under nub identity (the two-mode model): the
-/// engine's canonical-lockfile slot under a generic, deliberately unbranded
-/// filename — bytes stay pnpm-lock v9 compatible. Registered with the engine
-/// via `aube_lockfile::set_aube_lock_base_filename` in the brand preflight.
-pub(crate) const NUB_LOCKFILE: &str = "lock.yaml";
+/// engine's canonical-lockfile slot under nub's own basename — `nub.lock`,
+/// whose format-agnostic `.lock` extension survives a future serialization
+/// change. Bytes stay pnpm-lock v9 compatible. Carried on the NUB embedder
+/// profile's `lockfile_basename`.
+pub(crate) const NUB_LOCKFILE: &str = "nub.lock";
+
+/// Nub's PRIOR canonical lockfile name, still recognized on read during the
+/// rename transition (carried on the NUB profile's `lockfile_legacy_basenames`)
+/// and migrated to [`NUB_LOCKFILE`] on the next mutating PM op. Same pnpm-lock
+/// v9 bytes — the rename is byte-identical. Sunset at the next major.
+pub(crate) const NUB_LEGACY_LOCKFILE: &str = "lock.yaml";
 
 /// The known lockfile artifacts, in the engine's candidate precedence order
 /// *within* each family (npm-shrinkwrap.json outranks package-lock.json as a
@@ -32,6 +39,8 @@ pub(crate) const NUB_LOCKFILE: &str = "lock.yaml";
 /// nor removes it).
 const LOCKFILES: &[(&str, &str)] = &[
     (NUB_LOCKFILE, "nub"),
+    // Legacy nub name (pre-rename), still nub's artifact for alignment.
+    (NUB_LEGACY_LOCKFILE, "nub"),
     ("pnpm-lock.yaml", "pnpm"),
     ("bun.lock", "bun"),
     ("bun.lockb", "bun"),
@@ -71,8 +80,8 @@ pub(crate) enum AlignPlan {
         from_kind: LockfileKind,
         remove: Vec<PathBuf>,
     },
-    /// The pnpm ↔ nub pair: same bytes (lock.yaml IS pnpm-v9 format under a
-    /// generic name), different filename — a rename, never a parse/rewrite,
+    /// The pnpm ↔ nub pair: same bytes (`nub.lock` IS pnpm-v9 format under
+    /// a generic name), different filename — a rename, never a parse/rewrite,
     /// so the file stays byte-identical and the real PM's `--frozen-lockfile`
     /// acceptance is preserved exactly.
     Rename { from: PathBuf, remove: Vec<PathBuf> },
@@ -247,7 +256,7 @@ pub(crate) fn refuse_unconvertible(root: &Path, target: &str, plan: &AlignPlan) 
 /// yarn.lock, mirroring the engine's `refine_yarn_kind`).
 fn source_kind(path: &Path) -> LockfileKind {
     match path.file_name().and_then(|n| n.to_str()) {
-        Some(NUB_LOCKFILE) => LockfileKind::Aube,
+        Some(NUB_LOCKFILE) | Some(NUB_LEGACY_LOCKFILE) => LockfileKind::Aube,
         Some("pnpm-lock.yaml") => LockfileKind::Pnpm,
         Some("bun.lock") => LockfileKind::Bun,
         Some("npm-shrinkwrap.json") => LockfileKind::NpmShrinkwrap,
@@ -287,7 +296,9 @@ fn parse_source_graph(
 ) -> Result<aube_lockfile::LockfileGraph> {
     match from_kind {
         LockfileKind::Pnpm | LockfileKind::Aube => aube_lockfile::pnpm::parse(from),
-        LockfileKind::Npm | LockfileKind::NpmShrinkwrap => aube_lockfile::npm::parse(from),
+        LockfileKind::Npm | LockfileKind::NpmShrinkwrap => {
+            aube_lockfile::npm::parse(from, manifest)
+        }
         LockfileKind::Yarn | LockfileKind::YarnBerry => aube_lockfile::yarn::parse(from, manifest),
         LockfileKind::Bun => aube_lockfile::bun::parse(from),
     }
@@ -314,7 +325,19 @@ pub(crate) fn convert_lockfile(
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("reading package.json for the lockfile conversion")?;
     let graph = parse_source_graph(from, from_kind, &manifest)?;
-    let written = aube_lockfile::write_lockfile_as(root, &graph, &manifest, target_kind(target))
+    let to_kind = target_kind(target);
+    // A pnpm-format lockfile is read back as already peer-resolved, so an npm
+    // or bun source (no peer contexts recorded) gets the pass `nub import`
+    // runs; without it the written snapshots lack peer suffixes and the edges
+    // of resolved optional peers.
+    let graph = if matches!(to_kind, LockfileKind::Pnpm | LockfileKind::Aube) {
+        aube_resolver::peer_pass_for_import(graph, from_kind)
+            .map_err(|e| anyhow::anyhow!("{}", super::present::rewrite(&e.to_string())))
+            .context("resolving peers for the lockfile conversion")?
+    } else {
+        graph
+    };
+    let written = aube_lockfile::write_lockfile_as(root, &graph, &manifest, to_kind)
         .map_err(|e| anyhow::anyhow!("{}", super::present::rewrite(&e.to_string())))
         .with_context(|| format!("writing {}", lockfile_name(target)))?;
     Ok(written)
@@ -495,14 +518,14 @@ mod tests {
             }
         );
 
-        // lock.yaml under `use nub` is already nub's artifact: kept.
+        // nub.lock under `use nub` is already nub's artifact: kept.
         let dir = root("keep-nub", &[(NUB_LOCKFILE, "lockfileVersion: '9.0'\n")]);
         assert!(matches!(
             plan_alignment(&dir, "nub").unwrap(),
             AlignPlan::Keep { .. }
         ));
 
-        // lock.yaml → npm is a real format change: converted, not renamed.
+        // nub.lock → npm is a real format change: converted, not renamed.
         let dir = root("nub-to-npm", &[(NUB_LOCKFILE, "lockfileVersion: '9.0'\n")]);
         assert!(matches!(
             plan_alignment(&dir, "npm").unwrap(),
@@ -512,7 +535,7 @@ mod tests {
             }
         ));
 
-        // lock.yaml + a foreign family with neither being the target:
+        // nub.lock + a foreign family with neither being the target:
         // ambiguity, loud, naming both files.
         let dir = root(
             "nub-ambig",
@@ -524,7 +547,7 @@ mod tests {
         let err = plan_alignment(&dir, "bun").unwrap_err().to_string();
         assert!(
             err.contains(NUB_LOCKFILE) && err.contains("package-lock.json"),
-            "ambiguity must name lock.yaml and package-lock.json, got: {err}"
+            "ambiguity must name nub.lock and package-lock.json, got: {err}"
         );
     }
 
@@ -579,6 +602,49 @@ mod tests {
         assert!(
             body.contains("sha512-8ND1j3y9"),
             "the integrity must survive the conversion:\n{body}"
+        );
+    }
+
+    #[test]
+    fn converting_a_bun_lockfile_to_pnpm_resolves_its_peers() {
+        // bun.lock records no peer contexts or peer edges, so the pnpm
+        // snapshot must come from the same peer pass `nub import` runs: the
+        // optional peer the root provides is suffixed and linked.
+        let sri = format!("sha512-{}==", "A".repeat(86));
+        let dir = root(
+            "convert-bun-peers",
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"app","version":"1.0.0","dependencies":{"consumer":"1.0.0","provider":"1.0.0"}}"#,
+                ),
+                (
+                    "bun.lock",
+                    &format!(
+                        r#"{{
+  "lockfileVersion": 1,
+  "workspaces": {{
+    "": {{ "name": "app", "dependencies": {{ "consumer": "1.0.0", "provider": "1.0.0" }} }}
+  }},
+  "packages": {{
+    "consumer": ["consumer@1.0.0", "", {{ "peerDependencies": {{ "provider": "^1.0.0" }}, "optionalPeers": ["provider"] }}, "{sri}"],
+    "provider": ["provider@1.0.0", "", {{}}, "{sri}"]
+  }}
+}}
+"#
+                    ),
+                ),
+            ],
+        );
+        let written =
+            convert_lockfile(&dir, &dir.join("bun.lock"), LockfileKind::Bun, "pnpm").unwrap();
+        let graph = aube_lockfile::pnpm::parse(&written).unwrap();
+        let consumer = &graph.packages["consumer@1.0.0(provider@1.0.0)"];
+        assert_eq!(
+            consumer.dependencies.get("provider").map(String::as_str),
+            Some("1.0.0"),
+            "the converted snapshot must link the resolved optional peer: {:?}",
+            graph.packages.keys().collect::<Vec<_>>()
         );
     }
 

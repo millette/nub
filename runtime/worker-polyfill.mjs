@@ -26,10 +26,10 @@
 // loaded only via the compat-tier entries OFF any user chain) the createRequire
 // THREADED IN through `setBootstrapCreateRequire` below.
 //
-// BRAND BOUNDARY — the floor's `createRequire` is threaded through MODULE SCOPE, never
-// parked on `globalThis` (a `globalThis.__nub*` sentinel is the same brand leak as a
-// NUB_* env var — enumerable in user code AND worker realms — so it is forbidden). On
-// the floor this module is loaded ONLY via the compat-tier main-thread preload
+// Keep the floor's `createRequire` in module scope rather than adding mutable
+// cross-realm state to `globalThis`. Internal `__nub*` sentinels and NUB_* plumbing
+// are permitted by the brand boundary, but neither is needed for this same-module
+// handoff. On the floor this module is loaded ONLY via the compat-tier main-thread preload
 // (preload.mjs), which imports floor-builtin first, then — AFTER importing this module
 // — calls `setBootstrapCreateRequire(createRequire)` and `installWorkerPolyfill()`. So
 // the install work is deferred (this module does NOT auto-run on the floor): its body
@@ -38,8 +38,53 @@
 // — see the auto-install at the bottom — so the existing side-effect-`require` call
 // sites (preload.cjs, polyfills.cjs) are unchanged.
 let _bootstrapCreateRequire = null;
+// Compiled global Workers must carry their fixed-root bootstrap exactly once.
+let _compiledBootstrapRequireArg = null;
+
+// The compile bootstrap's parser, verbatim (compile-bootstrap.cjs carries why).
+function withoutRefusedExecArgv(execArgv, error) {
+  if (error?.code !== "ERR_WORKER_INVALID_EXEC_ARGV") return null;
+  const report = String(error.message);
+  const start = report.indexOf(": ");
+  if (start === -1) return null;
+  let cursor = start + 2;
+  const kept = [];
+  const refused = [];
+  for (let i = 0; i < execArgv.length; i++) {
+    const arg = execArgv[i];
+    const end = cursor + arg.length;
+    if (
+      arg !== "" &&
+      report.startsWith(arg, cursor) &&
+      (end === report.length || report.startsWith(", ", end))
+    ) {
+      refused.push(arg);
+      cursor = end === report.length ? end : end + 2;
+      const next = execArgv[i + 1];
+      if (!arg.includes("=") && next !== undefined && !next.startsWith("-")) {
+        refused.push(next);
+        i++;
+      }
+    } else {
+      kept.push(arg);
+    }
+  }
+  return cursor === report.length && refused.length > 0 ? { kept, refused } : null;
+}
+// The blob-URL registry, supplied by an importer that already holds it. Set only
+// by the compile preamble: a compiled bundle has no sibling files to
+// `createRequire` (see the load below), and it is the ONE importer for which the
+// shared-instance argument does not apply, because nothing else in a compiled
+// artifact ever reaches worker-blob-url.cjs.
+let _blobUrlModule = null;
 export function setBootstrapCreateRequire(fn) {
   _bootstrapCreateRequire = fn;
+}
+export function setCompiledBootstrapRequireArg(requireArg) {
+  _compiledBootstrapRequireArg = requireArg;
+}
+export function setBlobUrlModule(mod) {
+  _blobUrlModule = mod;
 }
 function __getBuiltin(id) {
   if (typeof process.getBuiltinModule === "function") return process.getBuiltinModule(id);
@@ -52,7 +97,7 @@ function __getBuiltin(id) {
 // that throws. Resolve the constructor lazily and memoize on first use: use the
 // native global when present, otherwise a minimal Event subclass carrying the
 // standard ErrorEvent fields (message/error/filename/lineno/colno).
-// See wiki/research/worker-polyfill.md.
+// See internal/research/worker-polyfill.md.
 //
 // LAZY (not resolved at module load) on purpose: reading `globalThis.ErrorEvent`
 // at top level trips Node's lazy `ErrorEvent` getter, which eagerly realizes
@@ -90,12 +135,14 @@ export function installWorkerPolyfill() {
   // blob: worker source registry, shared with the eager main-thread preload that
   // wraps URL.createObjectURL (worker-blob-url.cjs). Loaded via createRequire so
   // both this lazily-loaded ESM module and the eager CJS preload reference the SAME
-  // module instance (Node dedupes by resolved path) — i.e. the SAME blobUrlSources.
-  const { blobUrlSources, installBlobUrlSupport } = (
-    typeof process.getBuiltinModule === "function"
-      ? __getBuiltin("node:module").createRequire(import.meta.url)
-      : _bootstrapCreateRequire(import.meta.url)
-  )("./worker-blob-url.cjs");
+  // module instance (Node dedupes by resolved path) — i.e. the SAME registry.
+  const { blobUrlSource, installBlobUrlSupport } =
+    _blobUrlModule ??
+    (
+      typeof process.getBuiltinModule === "function"
+        ? __getBuiltin("node:module").createRequire(import.meta.url)
+        : _bootstrapCreateRequire(import.meta.url)
+    )("./worker-blob-url.cjs");
 
   // Resolve a worker-error stack frame to {filename,lineno,colno} so the
   // ErrorEvent carries real source location, per WHATWG §10.2.6 (the spec
@@ -133,52 +180,80 @@ export function installWorkerPolyfill() {
   class Worker extends EventTarget {
     #worker;
     #name;
+    // Live registry of 'error' listeners, so an UNHANDLED worker 'error' can be
+    // made fatal to match the oracle (node:worker_threads is an EventEmitter;
+    // EventTarget exposes no listener count). Keyed listener → set of capture
+    // flags, mirroring EventTarget's `(type, callback, capture)` listener identity
+    // — `(fn, capture)` and `(fn, bubble)` are TWO distinct registrations, so the
+    // registry must distinguish them or a capture-only remove could empty it while
+    // a live bubble listener remains (a false fatality). The onerror setter routes
+    // through addEventListener below, so it is tracked here automatically.
+    #errorListeners = new Map();
 
     constructor(url, options = {}) {
       super();
+
+      // ADDITIVE node-mirroring (NOT a spec mechanism): `new Worker(code,
+      // { eval: true })` runs the first arg as raw source, mirroring
+      // node:worker_threads. Gated STRICTLY on `options.eval === true` — never
+      // content-sniffed — so the spec URL path below is untouched for every web
+      // caller. execArgv (carrying nub's preload) is forwarded for eval workers
+      // too, so an eval worker inherits nub's augmentation like any other.
+      const isEval = options.eval === true;
 
       // The WHATWG Worker constructor accepts a script URL. Per §10.2.6.3 the
       // standard inline mechanisms are `blob:` and `data:` URLs (there is no
       // inline-source-string form in the spec). We map each to a Node spawn:
       //   - file path / file: URL  → spawn the file (transpiled by nub's preload)
       //   - data: URL              → Node runs it directly (worker_threads v14.9)
-      //   - blob: URL              → resolve the Blob via node:buffer, spawn its
-      //                              source with eval:true (Node can't open blob:)
+      //   - blob: URL              → snapshot the Blob's source, spawn it as a
+      //                              data: URL (Node can't open blob:)
       let spawnTarget;
 
-      const asUrlString =
-        url instanceof URL ? url.href : typeof url === "string" ? url : null;
-      if (asUrlString === null) {
-        throw new TypeError("Worker constructor: url must be a string or URL");
-      }
-
-      if (asUrlString.startsWith("blob:")) {
-        // A `blob:` worker (WHATWG inline mechanism). Node cannot open a blob:
-        // URL as a worker entry, and the Blob's bytes are only readable
-        // ASYNCHRONOUSLY (Blob.text/arrayBuffer) while this constructor is sync.
-        // We close that gap by snapshotting the source SYNCHRONOUSLY at
-        // `URL.createObjectURL(blob)` time (see installBlobUrlSupport) into a
-        // module-scope registry keyed by URL, then spawn the source as a `data:`
-        // URL. We use data: (NOT eval:true) deliberately: the `--import` preload
-        // that installs nub's worker-side scope (self/postMessage) does NOT run in
-        // an eval:true worker on the compat-tier FLOOR (Node 18.19 — verified), so
-        // an eval-based blob worker has no `self` there; a data: URL worker is a
-        // real module load and DOES receive the preload on every supported tier.
-        const source = blobUrlSources.get(asUrlString);
-        if (source === undefined) {
+      if (isEval) {
+        if (typeof url !== "string") {
           throw new TypeError(
-            `Worker constructor: blob URL '${asUrlString}' is not a known object URL`
+            "Worker constructor: with { eval: true }, the source must be a string"
           );
         }
-        spawnTarget = new URL(
-          "data:text/javascript;base64," + Buffer.from(source, "utf8").toString("base64")
-        );
-      } else if (asUrlString.startsWith("data:")) {
-        spawnTarget = new URL(asUrlString);
-      } else if (asUrlString.startsWith("file://")) {
-        spawnTarget = fileURLToPath(asUrlString);
+        spawnTarget = url;
       } else {
-        spawnTarget = asUrlString;
+
+        const asUrlString =
+          url instanceof URL ? url.href : typeof url === "string" ? url : null;
+        if (asUrlString === null) {
+          throw new TypeError("Worker constructor: url must be a string or URL");
+        }
+
+        if (asUrlString.startsWith("blob:")) {
+          // A `blob:` worker (WHATWG inline mechanism). Node cannot open a blob:
+          // URL as a worker entry, and the Blob's bytes are only readable
+          // ASYNCHRONOUSLY (Blob.text/arrayBuffer) while this constructor is sync.
+          // We close that gap by capturing the Blob SYNCHRONOUSLY at
+          // `URL.createObjectURL(blob)` time (see installBlobUrlSupport) into a
+          // module-scope registry keyed by URL, then spawn the source as a `data:`
+          // URL — a real module load (a proper worker entry that receives nub's
+          // preload, so `self`/`postMessage` are present) on every supported tier.
+          // The UTF-8 decode happens HERE rather than at createObjectURL time, so
+          // the object URLs that never become a Worker — nearly all of them — pay
+          // nothing for this feature.
+          const source = blobUrlSource(asUrlString);
+          if (source === undefined) {
+            throw new TypeError(
+              `Worker constructor: blob URL '${asUrlString}' is not a known object URL`
+            );
+          }
+          spawnTarget = new URL(
+            "data:text/javascript;base64," + Buffer.from(source, "utf8").toString("base64")
+          );
+        } else if (asUrlString.startsWith("data:")) {
+          spawnTarget = new URL(asUrlString);
+        } else if (asUrlString.startsWith("file://")) {
+          spawnTarget = fileURLToPath(asUrlString);
+        } else {
+          spawnTarget = asUrlString;
+        }
+
       }
 
       this.#name = typeof options.name === "string" ? options.name : "";
@@ -206,15 +281,23 @@ export function installWorkerPolyfill() {
       // worker inherits nub's transpile augmentation), but if the user supplied
       // their own execArgv, MERGE rather than clobber — parent flags first, user
       // flags appended so the user's win on conflict.
-      const execArgv = stripHarmony(
-        Array.isArray(options.execArgv)
-          ? [...process.execArgv, ...options.execArgv]
-          : process.execArgv
-      );
+      const combinedExecArgv = Array.isArray(options.execArgv)
+        ? [...process.execArgv, ...options.execArgv]
+        : process.execArgv;
+      // Public execArgv truthfully retains the launcher's bootstrap token. Move
+      // every exact duplicate to one index-zero copy while retaining every other
+      // token's byte content and relative order.
+      const normalizedExecArgv = _compiledBootstrapRequireArg
+        ? [
+            _compiledBootstrapRequireArg,
+            ...combinedExecArgv.filter(arg => arg !== _compiledBootstrapRequireArg),
+          ]
+        : combinedExecArgv;
+      const execArgv = stripHarmony(normalizedExecArgv);
 
       const nodeOptions = {
         ...options,
-        eval: false,
+        eval: isEval,
         execArgv,
       };
       // Thread the worker type AND name to the worker via internal env vars
@@ -239,7 +322,25 @@ export function installWorkerPolyfill() {
       }
       if (this.#name) nodeOptions.name = this.#name;
 
-      this.#worker = new NodeWorker(spawnTarget, nodeOptions);
+      // Node accepts a per-process flag such as `--max-old-space-size` only by
+      // inheritance, and refuses it in an explicit list, naming each. A worker
+      // that inherits drops it silently, so drop the ones that came from this
+      // process and retry; one the caller passed still throws, as Node's does.
+      // Node stops reading flags at a stray value, so a retry can surface more.
+      // Only the flags Node named count against the caller: a dropped separate value
+      // never starts with `-`, and may equal one of the caller's own values.
+      const given = Array.isArray(options.execArgv) ? options.execArgv : [];
+      const callerPassed = arg => arg.startsWith("-") && given.includes(arg);
+      for (;;) {
+        try {
+          this.#worker = new NodeWorker(spawnTarget, nodeOptions);
+          break;
+        } catch (error) {
+          const retry = withoutRefusedExecArgv(nodeOptions.execArgv, error);
+          if (retry === null || retry.refused.some(callerPassed)) throw error;
+          nodeOptions.execArgv = retry.kept;
+        }
+      }
 
       this.#worker.on("message", (data) => {
         this.dispatchEvent(new MessageEvent("message", { data }));
@@ -263,24 +364,122 @@ export function installWorkerPolyfill() {
             colno,
           })
         );
+        // ORACLE CONFORMANCE: node:worker_threads re-throws an 'error' that has
+        // NO listener (the EventEmitter unhandled-'error' convention) → it surfaces
+        // as an uncaughtException on the main thread, exit code 1, stack printed.
+        // nub's wrapper owns the node-side 'error' listener, so that throw never
+        // fires natively; we reproduce its fatality when the browser-shape Worker
+        // has no 'error'/onerror listener. Without this an EventTarget silently
+        // drops the unlistened event and a failed worker load exits 0 (the bug).
+        // process.nextTick (not a sync throw inside this emit callback) mirrors
+        // Node's surfacing path exactly: a fresh tick → uncaughtException, so a
+        // user process.on('uncaughtException') still intercepts it as on Node.
+        //
+        // DUAL-CHANNEL FATALITY INVARIANT: an 'error' is "handled" if the user
+        // registered a listener on EITHER channel — the web one (addEventListener
+        // /onerror, tracked in #errorListeners) OR the node one (.on('error'),
+        // which delegates straight onto this underlying worker). The wrapper owns
+        // exactly ONE persistent node-side 'error' listener (this very one), so a
+        // node-channel listenerCount > 1 means the user added their own; counting
+        // only the web channel would wrongly throw a fatal at a user handling via
+        // .on('error'), or swallow one they aren't handling. Both channels MUST be
+        // counted here.
+        if (
+          this.#errorListeners.size === 0 &&
+          this.#worker.listenerCount("error") <= 1
+        ) {
+          process.nextTick(() => {
+            throw err;
+          });
+        }
       });
-      // No `exit` event: WHATWG Workers have no exit event (it is a
-      // node:worker_threads concept, not part of the web Worker surface).
+
+      // ADDITIVE node lifecycle events, dispatched as plain EventTarget `Event`s
+      // on the parent handle. `exit` carries the worker's exit code as a property
+      // (the raw-arg `.on('exit', code)` form rides the node channel via the
+      // delegation methods below). NavigatorOnLine's web `online` targets the
+      // worker GLOBAL (`self`), not this parent handle — disjoint objects, no
+      // collision. The raw-arg `.on('online'|'exit')` node form is available via
+      // delegation; these are the web-shape Event mirrors.
+      this.#worker.on("online", () => {
+        this.dispatchEvent(new Event("online"));
+      });
+      this.#worker.on("exit", (code) => {
+        const ev = new Event("exit");
+        ev.code = code;
+        this.dispatchEvent(ev);
+      });
     }
 
     get name() {
       return this.#name;
     }
 
+    // Track 'error' listeners (for the unhandled-'error' fatality above) without
+    // changing EventTarget semantics — super does the real registration; we only
+    // record/forget the (listener, capture) identity. The registry mirrors
+    // EventTarget's identity-based dedup INCLUDING the capture flag, so a
+    // capture-only remove can never empty it while a live bubble listener remains.
+    // The only un-mirrored case is {once}/{signal} auto-removal (EventTarget drops
+    // those without routing through this override) — a stale entry there errs
+    // toward DELIVERY (swallow), never toward a false fatality.
+    addEventListener(type, listener, options) {
+      super.addEventListener(type, listener, options);
+      if (
+        type === "error" &&
+        (typeof listener === "function" ||
+          (listener != null && typeof listener.handleEvent === "function"))
+      ) {
+        const capture =
+          options === true ||
+          (typeof options === "object" && options !== null && !!options.capture);
+        let caps = this.#errorListeners.get(listener);
+        if (!caps) this.#errorListeners.set(listener, (caps = new Set()));
+        caps.add(capture);
+      }
+    }
+
+    removeEventListener(type, listener, options) {
+      super.removeEventListener(type, listener, options);
+      if (type === "error") {
+        const capture =
+          options === true ||
+          (typeof options === "object" && options !== null && !!options.capture);
+        const caps = this.#errorListeners.get(listener);
+        if (caps) {
+          caps.delete(capture);
+          if (caps.size === 0) this.#errorListeners.delete(listener);
+        }
+      }
+    }
+
     postMessage(data, transfer) {
       this.#worker.postMessage(data, transfer);
     }
 
-    // WHATWG terminate() returns void. Node's returns a Promise; we discard it so
-    // the surface matches the spec (the underlying termination still proceeds).
+    // WHATWG terminate() returns void; node:worker_threads returns a
+    // `Promise<exitCode>`. We RETURN that promise — void→value widening, additive
+    // and unobservable to spec code that ignores the return.
     terminate() {
-      this.#worker.terminate();
+      return this.#worker.terminate();
     }
+
+    // ADDITIVE EventEmitter surface, delegated to the underlying real
+    // node:worker_threads.Worker (Node's ACTUAL EventEmitter, not a reimpl). The
+    // node channel delivers what node delivers — `.on('message')` the RAW value,
+    // `.on('error')` a BARE Error, `.on('exit', code)`/`.on('online')` the raw
+    // args — disjoint from the web channel (addEventListener/onmessage/onerror →
+    // MessageEvent/ErrorEvent), which stays primary and unchanged. Chainable
+    // methods return THIS wrapper (not the inner worker) so chaining stays on the
+    // web-shape object; .emit returns the EventEmitter boolean. The unhandled-
+    // 'error' fatality (constructor) counts node-channel listeners via
+    // listenerCount, so a `.on('error')` here correctly suppresses the fatal.
+    on(type, listener) { this.#worker.on(type, listener); return this; }
+    once(type, listener) { this.#worker.once(type, listener); return this; }
+    off(type, listener) { this.#worker.off(type, listener); return this; }
+    addListener(type, listener) { this.#worker.addListener(type, listener); return this; }
+    removeListener(type, listener) { this.#worker.removeListener(type, listener); return this; }
+    emit(type, ...args) { return this.#worker.emit(type, ...args); }
 
     #onmessageHandler = null;
     get onmessage() { return this.#onmessageHandler; }
@@ -329,8 +528,12 @@ export function installWorkerPolyfill() {
 // events. Node's worker global is not an EventTarget and exposes none of these
 // (verified), so the polyfill provides the whole surface. Without the inbound
 // wiring, `self.onmessage` / `self.addEventListener("message", …)` never fire
-// and a parent→worker round-trip hangs — see wiki/research/worker-polyfill.md.
-if (!isMainThread && parentPort) {
+// and a parent→worker round-trip hangs — see internal/research/worker-polyfill.md.
+// Native Web Workers already own their scope. Ordinary worker_threads still
+// need this shim, even when the native Worker constructor is enabled.
+const nativeWorkerScope = typeof DedicatedWorkerGlobalScope === "function" &&
+  globalThis instanceof DedicatedWorkerGlobalScope;
+if (!isMainThread && parentPort && !nativeWorkerScope) {
   const scope = globalThis;
   // All of nub's worker-scope global injections below (self, addEventListener,
   // removeEventListener, dispatchEvent, postMessage, close) are defined
@@ -424,19 +627,33 @@ if (!isMainThread && parentPort) {
     });
   }
 
-  // `message`/`messageerror` are DELEGATED straight onto the native `parentPort`
-  // (a real Node MessagePort) so Node's own C++ event-loop ref-counting governs
-  // worker lifetime: a worker that never listens leaves parentPort with no
-  // listeners → Node unrefs it → the worker exits naturally (matching
-  // `node:worker_threads` and Bun); a worker listening via `self.onmessage` /
-  // `addEventListener("message", …)` refs it → stays alive. Node reflects
-  // `{once}`/`{signal}`/last-listener removal in the loop ref-count in C++,
-  // which no userland counter can observe. (Earlier this block eagerly held a
-  // `parentPort.on("message")` forwarder, which kept EVERY worker's event loop
-  // alive → pure `parentPort` workers that should exit hung forever. See
-  // wiki/research/worker-polyfill.md §4.) All OTHER event types go to a private
-  // EventTarget (additive; no globalThis prototype re-parenting — `event.target`
-  // is that private target, the documented minor divergence).
+  // `message`/`messageerror` are DELEGATED onto the native `parentPort` (a real
+  // Node MessagePort) so Node's own C++ event-loop ref-counting governs worker
+  // lifetime: a worker that never listens leaves parentPort with no listeners →
+  // Node unrefs it → the worker exits naturally (matching `node:worker_threads`
+  // and Bun); a worker listening via `self.onmessage` / `addEventListener` refs
+  // it → stays alive. (Earlier this block eagerly held a `parentPort.on("message")`
+  // forwarder that kept EVERY worker's loop alive → pure `parentPort` workers that
+  // should exit hung forever. See internal/research/worker-polyfill.md §4.)
+  //
+  // DISPATCH THROUGH A REAL EventTarget (`inbound`), not a hand-invoked callback:
+  // an inbound event MUST have `event.target === self` and `event.currentTarget
+  // === self` per WHATWG DedicatedWorkerGlobalScope (browsers + Deno agree) — the
+  // old path `cb.call(scope, new MessageEvent(...))` never went through dispatch,
+  // so both stayed null. We can't make globalThis a genuine EventTarget without
+  // prototype re-parenting (a plain object has no [[EventTargetData]] slot, so a
+  // native dispatch keyed on it is impossible), so we dispatch on a private
+  // EventTarget and SHADOW `target`/`currentTarget` = self as own data properties
+  // on the event (they override Event.prototype's accessors; native dispatch still
+  // drives ordering / stopImmediatePropagation over the ONE shared event object).
+  //
+  // REF-COUNTING is preserved by mediating every add/remove and implementing
+  // `{once}`/`{signal}` OURSELVES (not via native EventTarget options), so every
+  // removal — including once-fire and signal-abort — routes through our count and
+  // attaches/detaches the SINGLE parentPort forwarder per type exactly on the
+  // 0↔1 boundary. All OTHER (custom) event types still go to a separate private
+  // EventTarget (`other`); a user-dispatched event's `target` is that private
+  // target — the documented minor divergence, unchanged here.
   const other = new EventTarget();
   const otherAdd =
     typeof scope.addEventListener === "function"
@@ -452,35 +669,66 @@ if (!isMainThread && parentPort) {
       : other.dispatchEvent.bind(other);
 
   const DELEGATED = new Set(["message", "messageerror"]);
-  // user listener → its parentPort wrapper (per delegated event), so
-  // removeEventListener detaches the exact wrapper Node registered.
-  const wrappers = { message: new Map(), messageerror: new Map() };
+  const inbound = new EventTarget();
+  // Per delegated type: the single parentPort forwarder + a live listener count,
+  // so parentPort holds a listener iff ≥1 user listener exists (worker lifetime).
+  const portState = {
+    message: { count: 0, forwarder: null },
+    messageerror: { count: 0, forwarder: null },
+  };
+  // user listener → the wrapper actually registered on `inbound`, so remove
+  // detaches the exact one and dedup of identical (type, listener) holds.
+  const registered = { message: new Map(), messageerror: new Map() };
+
+  function forward(evt, data) {
+    const ev = new MessageEvent(evt, { data });
+    // Shadow the inherited accessors so worker code observes the spec-required
+    // DedicatedWorkerGlobalScope as target/currentTarget instead of `inbound`.
+    Object.defineProperty(ev, "target", { value: scope, configurable: true });
+    Object.defineProperty(ev, "currentTarget", { value: scope, configurable: true });
+    inbound.dispatchEvent(ev);
+  }
+  function attachPort(evt) {
+    const st = portState[evt];
+    if (st.count++ === 0) {
+      st.forwarder = (data) => forward(evt, data);
+      parentPort.on(evt, st.forwarder);
+    }
+  }
+  function detachPort(evt) {
+    const st = portState[evt];
+    if (--st.count === 0 && st.forwarder) {
+      parentPort.off(evt, st.forwarder);
+      st.forwarder = null;
+    }
+  }
 
   function addDelegated(evt, listener, opts) {
+    // Normalize to the function to invoke, binding a handleEvent object so its
+    // `this` is the object (spec) while a bare function gets `this` = self below.
     const cb =
       typeof listener === "function"
         ? listener
         : listener && typeof listener.handleEvent === "function"
-          ? (e) => listener.handleEvent(e)
+          ? listener.handleEvent.bind(listener)
           : null;
     if (!cb) return;
-    const map = wrappers[evt];
+    const map = registered[evt];
     if (map.has(listener)) return; // EventTarget dedups identical (type, listener)
     const o = opts && typeof opts === "object" ? opts : {};
     if (o.signal && o.signal.aborted) return;
-    const fire = (data) => cb.call(scope, new MessageEvent(evt, { data }));
-    let wrapper;
-    if (o.once) {
-      wrapper = (data) => {
-        map.delete(listener);
-        fire(data);
-      };
-      parentPort.once(evt, wrapper);
-    } else {
-      wrapper = fire;
-      parentPort.on(evt, wrapper);
-    }
+    // `once`/`signal` are OURS (not native options) so removal stays observable to
+    // the ref-count. The once wrapper removes itself BEFORE invoking — safe mid
+    // dispatch (removing an EventTarget listener while dispatching is spec-legal).
+    const wrapper = o.once
+      ? (ev) => {
+          removeDelegated(evt, listener);
+          cb.call(scope, ev);
+        }
+      : (ev) => cb.call(scope, ev);
     map.set(listener, wrapper);
+    inbound.addEventListener(evt, wrapper);
+    attachPort(evt);
     if (o.signal) {
       o.signal.addEventListener("abort", () => removeDelegated(evt, listener), {
         once: true,
@@ -488,11 +736,11 @@ if (!isMainThread && parentPort) {
     }
   }
   function removeDelegated(evt, listener) {
-    const wrapper = wrappers[evt].get(listener);
-    if (wrapper) {
-      parentPort.off(evt, wrapper);
-      wrappers[evt].delete(listener);
-    }
+    const wrapper = registered[evt].get(listener);
+    if (!wrapper) return;
+    registered[evt].delete(listener);
+    inbound.removeEventListener(evt, wrapper);
+    detachPort(evt);
   }
 
   defineGlobal("addEventListener", (type, listener, opts) =>
@@ -538,4 +786,16 @@ if (!isMainThread && parentPort) {
 // on-`require` contract the fast-tier call sites (preload.cjs, polyfills.cjs) rely on.
 // On the FLOOR (getBuiltinModule absent) this is skipped; the compat main-thread
 // preload calls setBootstrapCreateRequire(...) + installWorkerPolyfill() explicitly.
-if (typeof process.getBuiltinModule === "function") installWorkerPolyfill();
+//
+// Skipped inside a COMPILED artifact for the same reason as the floor: its preamble
+// hands this module the blob-URL registry through `setBlobUrlModule` — a compiled
+// bundle has no sibling file to `createRequire` — and a setter cannot run before an
+// auto-install at module eval. So the compile preamble owns the call, exactly as the
+// compat preload does. The bootstrap record is published before any ESM in the
+// process runs, which makes it a sound signal at module-eval time.
+if (
+  typeof process.getBuiltinModule === "function" &&
+  process[Symbol.for("nub.compile.bootstrap")] === undefined
+) {
+  installWorkerPolyfill();
+}

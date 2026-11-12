@@ -10,10 +10,18 @@
 ---------------------------------------------------------------------------- */
 
 @theme {
-  --font-display: var(--font-newsreader), ui-serif, Georgia, serif;
-  --font-serif: var(--font-newsreader), ui-serif, Georgia, serif;
-  --font-sans: var(--font-newsreader), ui-serif, Georgia, serif;
-  --font-mono: var(--font-plex-mono), ui-monospace, SFMono-Regular, monospace;
+  /* Site face: Encode Sans across body AND headings, replacing the Newsreader
+     serif (2026-06-27). Newsreader's small x-height made lowercase read too
+     small at a given point size; Encode Sans's larger x-height reads sturdier
+     and sits at the same optical size as the mono. This @theme block is the SOLE
+     switch point — everything resolves through these three vars. TO REVERT to
+     Newsreader, set all three back to
+     `var(--font-newsreader), ui-serif, Georgia, serif` (it stays registered in
+     layout.tsx for exactly that). */
+  --font-display: var(--font-encode), ui-sans-serif, system-ui, sans-serif;
+  --font-serif: var(--font-encode), ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-encode), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
 
   /* color pops — used sparingly against the ink ground. These are the DARK-mode
      values (bright, tuned to read against the near-black ground). Light mode
@@ -132,10 +140,15 @@
    the cream page — but on these always-dark surfaces those darkened accents
    lose contrast (green/blue/pink drop to ~3.1–3.7:1). Restore the bright
    dark-mode accent values inside these panels so accent text + bench bars clear
-   AA against the dark ground regardless of the page theme. */
+   AA against the dark ground regardless of the page theme.
+
+   `.ansi-player-overlay` is the play control of `<AnsiPlayer>`. It paints ON the
+   dark panel but is a SIBLING of the figure rather than a descendant, so it does
+   not inherit the restore from the selector beside it. */
 .nub-code-panel,
 .prose figure.shiki,
-.blog-prose figure.shiki {
+.blog-prose figure.shiki,
+.ansi-player-overlay {
   --color-ember: #ff5d3b;
   --color-acid: #4fe173;
   --color-sky: #7bb0ff;
@@ -189,6 +202,22 @@
   color: var(--nub-code-foreground);
 }
 
+/* Docs fenced code: nudge 13px → 12.5px so an 80-column line (the enforced lint
+   budget, scripts/lint-code-line-length.mjs) fits the 720px column even on
+   ~1280px laptops, where the layout narrows the article before the 720 cap
+   binds. Scoped to #nd-page (docs/guides); the homepage/blog panels keep size. */
+#nd-page figure.shiki pre {
+  font-size: 0.75rem;
+}
+
+/* Docs prose leading: Encode Sans's tall x-height makes the default 1.75 (28px at
+   16px) read dense — lines crowd together. Open body paragraphs + list items to
+   1.9. Scoped to #nd-page so the blog/homepage prose keep their own rhythm. */
+#nd-page .prose p,
+#nd-page .prose li {
+  line-height: 1.9;
+}
+
 .prose figure.shiki button,
 .blog-prose figure.shiki button {
   color: var(--nub-code-muted);
@@ -197,6 +226,32 @@
 .prose figure.shiki button:hover,
 .blog-prose figure.shiki button:hover {
   color: var(--nub-code-foreground);
+}
+
+/* ```diff fences. The `nub:diff` transformer strips the leading +/- marker and
+   tags each changed line `data-diff="add|remove"`; here we paint a subtle,
+   GitHub-style line highlight — a light green/red wash plus a solid left accent
+   bar — and neutralize shiki's bright green/red diff text to the normal code
+   foreground so the BACKGROUND (not a marker column or loud text) carries the
+   add/remove signal. The line is a flex child that stretches to the code's full
+   width, so the wash is full-bleed across the scroll extent. */
+.prose figure.shiki .line[data-diff],
+.blog-prose figure.shiki .line[data-diff] {
+  color: var(--nub-code-foreground);
+}
+.prose figure.shiki .line[data-diff] span,
+.blog-prose figure.shiki .line[data-diff] span {
+  color: var(--nub-code-foreground);
+}
+.prose figure.shiki .line[data-diff='add'],
+.blog-prose figure.shiki .line[data-diff='add'] {
+  background: rgba(63, 185, 110, 0.14);
+  box-shadow: inset 2px 0 0 rgba(63, 185, 110, 0.65);
+}
+.prose figure.shiki .line[data-diff='remove'],
+.blog-prose figure.shiki .line[data-diff='remove'] {
+  background: rgba(240, 98, 98, 0.13);
+  box-shadow: inset 2px 0 0 rgba(240, 98, 98, 0.6);
 }
 
 html {
@@ -214,6 +269,17 @@ body {
 h1, h2, h3, h4, .font-display {
   font-family: var(--font-display);
   letter-spacing: -0.015em;
+}
+
+/* Docs h3: fumadocs ships 32px above against the h2's 48px. On a reference
+   page where consecutive h3s are each a field with its own example, that
+   leaves a heading nearly as close to the block it follows as to the content
+   it introduces, so the sections stop reading as separate. 40px sits midway
+   to the h2 and keeps the hierarchy legible.
+   Scoped by SOURCE ORDER, not specificity: `.blog-prose h3` below matches the
+   same elements at equal specificity, so the blog keeps its editorial scale. */
+.prose h3 {
+  margin-top: 2.5rem;
 }
 
 /* Blog articles: fumadocs' prose scale is tuned for docs density; on the
@@ -238,16 +304,93 @@ h1, h2, h3, h4, .font-display {
   margin-top: 2.25rem;
 }
 
+/* Fumadocs renders an accordion's trigger as an <h3>, so the heading rules above
+   land INSIDE the card: the top margin drew a 44px empty band above the title,
+   and the editorial scale set that title larger than the prose it hides. The
+   component's own `not-prose` cannot stop either — both are plain descendant
+   selectors, not Tailwind typography, and an attribute selector is what outranks
+   them. The panel is then inset to the trigger's text (12px padding + 16px
+   chevron + 8px gap) so the two share a left edge, and given a bottom padding
+   that matches the top of the card rather than fumadocs' 8px. */
+.prose h3[data-accordion-value],
+.blog-prose h3[data-accordion-value] {
+  margin-top: 0;
+  font-size: 1rem;
+  line-height: 1.5;
+}
+.prose h3[data-accordion-value] + div > div,
+.blog-prose h3[data-accordion-value] + div > div {
+  padding-left: 2.25rem;
+  padding-bottom: 0.875rem;
+}
+
 /* Tables: auto layout hands the first column most of the row when later
    columns wrap. Shrink the first two columns to their content (width:1% +
-   nowrap) so the prose-length last column gets the remaining space. */
+   nowrap) so the prose-length last column gets the remaining space.
+
+   `.tool-matrix` (the N-tool capability matrix) is the one table shaped the
+   other way round — prose in the FIRST column, glyphs in the rest — so it sizes
+   its own columns with a <colgroup> and opts out here.
+
+   `.extensions-table` (the paginated package-extensions list) opts out for a
+   different reason: it is the only PAGINATED table here, and content-sized
+   columns are measured per rendered page, so the package column jumped width
+   whenever a page happened to contain a long scoped name. It pins its columns
+   with a <colgroup>, which needs the `white-space` here off as well — under a
+   fixed layout nowrap does not widen the column, it spills the name into the
+   next one. */
 .blog-prose table {
   width: 100%;
 }
-.blog-prose th:not(:last-child),
-.blog-prose td:not(:last-child) {
-  width: 1%;
-  white-space: nowrap;
+/* Below the `sm` breakpoint the nowrap columns alone can exceed the viewport
+   (three fixed columns plus a prose column), and a plain markdown table has no
+   scroll container — so let every column wrap there instead. */
+@media (min-width: 640px) {
+  .blog-prose table:not(.tool-matrix):not(.extensions-table) th:not(:last-child),
+  .blog-prose table:not(.tool-matrix):not(.extensions-table) td:not(:last-child) {
+    width: 1%;
+    white-space: nowrap;
+  }
+}
+
+/* Docs tables keep their auto layout, but a first-column code token (a command,
+   a field, a value) stays on one line: a chip broken at its space reads as two. */
+@media (min-width: 640px) {
+  .prose table:not(.tool-matrix):not(.extensions-table) td:first-child code {
+    white-space: nowrap;
+  }
+}
+
+/* The extensions table's rows scroll inside a fixed-height pane, so its column
+   headings stick to the top of that pane instead of scrolling out of reach. The
+   tint is composited onto the page background rather than left translucent —
+   `bg-fd-muted/40` alone would show the rows sliding under it — and the header's
+   bottom rule rides along as an inset shadow, because the border lives on the
+   <tr>, which does not stick.
+
+   The `overflow` reset is what makes the sticking work at all: the prose styles
+   give every table in an article `overflow: hidden` (measured — a bare <table>
+   dropped into the article computes it too), which makes the TABLE the nearest
+   scrollport and leaves a sticky cell with nothing to stick to. The pane owns
+   the scrolling and the rounded frame here, so the table needs neither. */
+.extensions-table {
+  overflow: visible;
+}
+.extensions-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background-color: color-mix(in srgb, var(--color-fd-muted) 40%, var(--color-fd-background));
+  box-shadow: inset 0 -1px 0 var(--color-fd-border);
+}
+
+/* The matrix's "us" column. One variable so the tint is a single knob: the
+   default is a faint lift of the foreground, neutral in both themes. */
+.tool-matrix {
+  --tm-us-bg: color-mix(in srgb, var(--color-fd-foreground) 5%, transparent);
+}
+.tool-matrix .tm-us {
+  background-color: var(--tm-us-bg);
 }
 
 /* Blockquotes as editorial asides — a hairline ember rule on a faint card,
@@ -345,21 +488,82 @@ pre .line[data-output] span {
   color: var(--nub-code-muted) !important;
 }
 
-/* IBM Plex Mono against the Newsreader serif body. Prose is dominated by
-   lowercase, so the perceived size of an inline-code token is governed by its
-   x-height, not its cap-height — and Plex Mono's x-height runs tall. At the old
-   0.9em the mono x-height measured 7.43px against the serif's 7.05px (ratio
-   1.054), so every code token read visibly *larger* and heavier than the words
-   around it. 0.84em brings the mono x-height to 6.94px (ratio 0.984) — a hair
-   below the serif lowercase, which optically balances the token against Plex
-   Mono's heavier stroke so it sits *in* the sentence rather than bulging out of
-   it. The slight negative tracking further trims the chunky feel. em-relative
-   so it tracks the surrounding size in headings, tables, and body alike. Code
-   blocks (`pre code`) are excluded and unchanged. */
-:not(pre) > code {
-  font-size: 0.84em;
-  letter-spacing: -0.01em;
+/* ```ansi fences — see `src/lib/shiki-ansi.ts`, which tags the block `data-ansi`.
+
+   In dual-theme mode shiki emits every token attribute as a CSS variable and
+   leaves the mapping to the consumer. fumadocs maps `--shiki-{light,dark}` onto
+   `color` and `--shiki-{light,dark}-font-style` onto `font-style`, and stops
+   there — so background color, bold, underline and strikethrough are all
+   dropped. A highlighted language never uses them; ANSI output uses them
+   constantly (`\e[1m` bold, `\e[41m` and `\e[7m` for a FAIL badge), and an
+   inverse-video token with no background renders as invisible text. These rules
+   restore the missing four, mirroring fumadocs' own light/dark split so the pair
+   still works if the two themes ever stop being the same one.
+
+   The variables are set only on tokens that carry the attribute, so an unset
+   variable makes the declaration invalid-at-computed-value-time and the property
+   falls back to its initial value — which is exactly the desired no-op. Except
+   for the background pair: shiki writes the THEME background onto the `pre`'s
+   own style as those same variable names, and custom properties inherit, so
+   every token would otherwise paint vesper's #101010 over the panel's #0b0a08.
+   Resetting them on the `code` element cuts that inheritance without touching a
+   token that sets its own. */
+code[data-ansi] {
+  --shiki-light-bg: initial;
+  --shiki-dark-bg: initial;
+}
+
+code[data-ansi] span {
+  background-color: var(--shiki-light-bg);
+  font-weight: var(--shiki-light-font-weight);
+  text-decoration: var(--shiki-light-text-decoration);
+}
+
+.dark code[data-ansi] span {
+  background-color: var(--shiki-dark-bg);
+  font-weight: var(--shiki-dark-font-weight);
+  text-decoration: var(--shiki-dark-text-decoration);
+}
+
+/* Geist Mono against the Encode Sans body. X-height parity with Encode Sans lands
+   near 1.0em, but even at parity the mono reads a touch large in a sentence, so we
+   set it a tick UNDER (0.95em ≈ x-height ratio 0.93) so the token sits *in* the
+   line rather than on top of it. Border removed — the soft background tint alone
+   marks a token as code without boxing it in. em-relative so it tracks the
+   surrounding size in headings, tables, and body. Code blocks (`pre code`) are
+   excluded and keep their own sizing.
+
+   `.nav-chip` (the sidebar's command chips) opts out: it is a deliberate
+   bordered chip, and `border: none` here sets border-STYLE, which computes
+   border-width to 0 no matter what width the chip asks for. */
+:not(pre) > code:not(.nav-chip) {
+  font-size: 0.95em;
+  letter-spacing: -0.005em;
   font-variant-ligatures: none;
+  border: none;
+}
+
+/* The bg-only chip needs a visible step above the page to register. fumadocs'
+   --color-fd-muted (#1b1916) sits barely above the #100f0d dark ground, so lift
+   the inline-code tint a notch in dark mode. Light mode's tint already reads.
+   `.nav-chip` opts out: at (0,1,2) this outranks the chip's own single-class
+   background utility, so it was overriding the active row's tint. */
+.dark :not(pre) > code:not(.nav-chip) {
+  background-color: #2a2620;
+}
+
+/* A backtick token in a frontmatter title (blog h1, blog index h2) renders
+   outside the prose scope, so it gets the tint above but no chip: no padding,
+   no radius. At display sizes the 0.95em token also reads a touch large next
+   to the heading's medium weight, so take it down another notch. em-relative
+   throughout, so the 5xl post title and the 3xl index title scale together.
+   The selector mirrors the base rule's shape on purpose: `code.title-code`
+   alone is (0,1,1) and loses `font-size` to the (0,1,2) rule above; this form
+   ties it and wins by order. */
+:not(pre) > code.title-code {
+  font-size: 0.85em;
+  padding: 0.06em 0.28em;
+  border-radius: 0.22em;
 }
 
 /* Constrain the home navbar's row to the content column so the search/theme/
@@ -383,6 +587,50 @@ pre .line[data-output] span {
   #nd-docs-layout {
     --fd-sidebar-width: 310px;
   }
+}
+
+/* Match the TOC rail to the sidebar. Fumadocs' 268px leaves ~226px of text once
+   the depth-3 indent and the rail's own padding are taken out, which is a hair
+   short of the longest API heading on the Modern APIs page
+   (`ArrayBuffer.prototype.transfer()`, 259px of Geist Mono) — so it wrapped
+   mid-identifier. 310px clears the longest heading in the docs tree with ~9px to
+   spare, and the two rails reading the same width is a bonus. The `:has()` guard
+   mirrors how Fumadocs gates its own 268px: the layout defaults the var to 0px
+   and only a rendered TOC (or its placeholder) claims a column, so an override
+   without the guard would reserve a phantom column on a TOC-less page. */
+@media (width >= 80rem) {
+  #nd-docs-layout:has(#nd-toc, #nd-toc-placeholder) {
+    --fd-toc-width: 310px;
+  }
+}
+
+/* TOC entries are mostly a single unbreakable identifier, and Fumadocs sets
+   `wrap-anywhere` on them — so anything a pixel too long split mid-word
+   (`String.prototype.isWellForme` / `d()`). Break on spaces only. `break-word`
+   rather than `normal` keeps a last-resort break for a heading longer than the
+   rail: the scroll area hides its scrollbar, so overflow would be silently
+   clipped, and a wrap is the better failure. */
+#nd-toc a,
+[data-toc-popover-content] a {
+  overflow-wrap: break-word;
+}
+
+/* Nav labels are Encode Sans at 14px, where its normal width reads a touch thin.
+   The variable face exposes the `wdth` axis (see the Encode Sans load in
+   layout.tsx), so a subtle font-stretch widens the letterforms via the real
+   designed axis — sturdier, no distortion, no weight bump. Sidebar-only; the rest
+   of the site keeps normal width. (Command chips are Geist Mono — no width axis —
+   so they're unaffected.) */
+#nd-sidebar a {
+  font-stretch: 110%;
+}
+
+/* An unlabeled `"---"` meta.json separator renders as an empty <p> that carries
+   only top-margin, so the divider is invisible whitespace. Draw a hairline rule
+   with symmetric spacing; the empty-guard leaves labeled separators untouched. */
+#nd-sidebar p:empty {
+  margin-block: 0.5rem;
+  border-top: 1px solid var(--color-fd-border);
 }
 
 /* Prev/next pager — the fumadocs FooterItem link is text-sm (14px) and the page-name
@@ -432,3 +680,29 @@ a[href] {
     transform: scaleX(1);
   }
 }
+
+/* Keep the nav's primary controls — search, theme switch, GitHub star pill —
+   visible down to the md breakpoint. Fumadocs' header hides that cluster below
+   lg (`max-lg:hidden`) and swaps in a compact mobile cluster (`lg:hidden`); we
+   shift both breakpoints from lg (1024px) to md (768px) for the md–lg band.
+   Keyed on the generated utility classes of the two direct <div> children of the
+   header <nav>, so it tracks fumadocs' header markup. */
+@media (min-width: 768px) and (max-width: 1023.98px) {
+  nav > div.max-lg\:hidden {
+    display: flex !important;
+  }
+  nav > div.lg\:hidden {
+    display: none !important;
+  }
+}
+
+/* Cap the docs/guides prose measure. The body serif (Newsreader) is unusually
+   compact (~0.43em average advance), so fumadocs' default 900px article column
+   runs ~116 characters per line; 720px brings it to a comfortable ~95. Keyed on
+   `#nd-page` (the fumadocs article id) so it overrides the built-in
+   `max-w-[900px]` without touching fumadocs' markup. */
+#nd-page {
+  max-width: 720px;
+}
+
+

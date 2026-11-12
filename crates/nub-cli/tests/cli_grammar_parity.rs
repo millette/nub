@@ -126,6 +126,11 @@ fn install_family_grammar_accepts_documented_forms() {
                 &["install", "--no-frozen-lockfile"],
                 "pnpm --no-frozen-lockfile",
             ),
+            (&["install", "--fix-lockfile"], "pnpm --fix-lockfile"),
+            (
+                &["install", "--fix-lockfile", "--frozen-lockfile"],
+                "pnpm accepts --fix-lockfile beside a frozen flag",
+            ),
             (
                 &["install", "--prefer-frozen-lockfile"],
                 "pnpm --prefer-frozen-lockfile",
@@ -134,6 +139,23 @@ fn install_family_grammar_accepts_documented_forms() {
             (&["install", "--prod"], "pnpm --prod"),
             (&["install", "-D"], "pnpm -D / --dev (dev only)"),
             (&["install", "--ignore-scripts"], "pnpm --ignore-scripts"),
+            // The pnpmfile trio (`pnpm install --help`, `installing/commands/src/install.ts`).
+            // Naming a path is also the remedy nub's own "pnpmfile ignored"
+            // warning offers a non-pnpm-incumbent project, so a missing flag
+            // here makes nub advertise something it rejects.
+            (
+                &["install", "--pnpmfile", "h.cjs"],
+                "pnpm --pnpmfile <path>",
+            ),
+            (
+                &["install", "--global-pnpmfile", "h.cjs"],
+                "pnpm --global-pnpmfile <path>",
+            ),
+            (&["install", "--ignore-pnpmfile"], "pnpm --ignore-pnpmfile"),
+            (
+                &["install", "--pnpmfile", "h.cjs", "express"],
+                "pnpm install --pnpmfile <path> <pkg> (routes through add)",
+            ),
             (&["install", "--no-optional"], "pnpm --no-optional"),
             (&["install", "--offline"], "pnpm --offline"),
             (&["install", "--prefer-offline"], "pnpm --prefer-offline"),
@@ -142,6 +164,26 @@ fn install_family_grammar_accepts_documented_forms() {
             (&["install", "-F", "foo"], "pnpm -F <pattern>"),
             (&["install", "--filter", "foo"], "pnpm --filter <pattern>"),
             (&["install", "-C", "/tmp"], "pnpm -C / --dir <dir>"),
+            // Output-verbosity flags (#179) — pnpm's reporter/silent/loglevel.
+            (&["install", "--silent"], "pnpm --silent"),
+            (&["install", "-s"], "pnpm -s (silent short)"),
+            (
+                &["install", "--reporter", "silent"],
+                "pnpm --reporter silent",
+            ),
+            (
+                &["install", "--reporter=append-only"],
+                "pnpm --reporter append-only",
+            ),
+            (
+                &["install", "--reporter=default"],
+                "pnpm --reporter default",
+            ),
+            (
+                &["install", "--loglevel", "error"],
+                "pnpm --loglevel <level>",
+            ),
+            (&["install", "--loglevel=debug"], "pnpm --loglevel=debug"),
             // A/B/C — pnpm install <pkg> routes through `add` (the P0 + save flags).
             (
                 &["install", "express"],
@@ -165,6 +207,11 @@ fn install_family_grammar_accepts_documented_forms() {
                 "pnpm --save-optional",
             ),
             (&["install", "express", "--save-peer"], "pnpm --save-peer"),
+            (&["install", "express", "--save-types"], "pnpm --save-types"),
+            (
+                &["install", "express", "--no-save-types"],
+                "pnpm --no-save-types",
+            ),
             (
                 &["install", "express", "-p"],
                 "pnpm -p / --save-prod (add default)",
@@ -299,19 +346,32 @@ fn leading_global_flags_before_info_verb_reach_engine() {
     );
 }
 
-// `nub ci` — pnpm `ci` (clean-install). pnpm's `ci` documents NO production
-// control (it is exactly `clean` + `install --frozen-lockfile`), so the
-// pnpm-only surface is bare `ci` plus nub's workspace/script knobs.
+// `nub ci` — pnpm `ci` (clean-install). pnpm 11 implements `ci` as `clean` +
+// `install --frozen-lockfile` and re-exports install's whole option table
+// (`cliOptionsTypes`/`shorthands` in `pnpm/src/cmd/cleanInstall.ts`), so the
+// dep-axis flags come with it: `pnpm ci -P` skips devDependencies, `-D` keeps
+// only them. pnpm 10's `ci` is a stub that throws `ERR_PNPM_CI_NOT_IMPLEMENTED`
+// and takes no options at all, so its rejections carry no grammar signal — nub
+// tracks the pnpm 11 surface here.
 #[test]
 fn ci_grammar_accepts_documented_forms() {
     assert_all_accepted(
         "ci",
         &[
             (&["ci"], "pnpm ci (clean-install)"),
+            (&["ci", "--prod"], "pnpm ci --prod"),
+            (&["ci", "-P"], "pnpm ci -P"),
+            (&["ci", "--production"], "pnpm ci --production"),
+            (&["ci", "--dev"], "pnpm ci --dev"),
+            (&["ci", "-D"], "pnpm ci -D"),
             (&["ci", "--ignore-scripts"], "pnpm --ignore-scripts"),
             (&["ci", "--no-optional"], "pnpm --no-optional"),
             (&["ci", "-r"], "pnpm -r ci"),
             (&["ci", "-F", "foo"], "pnpm -F <pattern>"),
+            // Output-verbosity flags (#179).
+            (&["ci", "--silent"], "pnpm --silent"),
+            (&["ci", "--reporter=silent"], "pnpm --reporter silent"),
+            (&["ci", "--loglevel=error"], "pnpm --loglevel <level>"),
         ],
     );
 }
@@ -336,6 +396,8 @@ fn engine_add_grammar_accepts_documented_forms() {
             (&["add", "foo", "-O"], "pnpm -O / --save-optional"),
             (&["add", "foo", "--save-optional"], "pnpm --save-optional"),
             (&["add", "foo", "--save-peer"], "pnpm --save-peer"),
+            (&["add", "foo", "--save-types"], "pnpm --save-types"),
+            (&["add", "foo", "--no-save-types"], "pnpm --no-save-types"),
             (&["add", "foo", "--no-save"], "pnpm --no-save"),
             (&["add", "foo", "-g"], "pnpm -g / --global"),
             (&["add", "foo", "--global"], "pnpm --global"),
@@ -343,6 +405,33 @@ fn engine_add_grammar_accepts_documented_forms() {
             (&["add", "foo", "-r"], "pnpm -r"),
             (&["add", "foo", "-F", "bar"], "pnpm -F <pattern>"),
             (&["add", "foo", "--ignore-scripts"], "pnpm --ignore-scripts"),
+            // The pnpmfile trio again (`installing/commands/src/add.ts:48,65`).
+            // Reachable from `install` too, since `nub install <pkg>` routes
+            // here — so a gap on `add` makes `install --pnpmfile <p> <pkg>`
+            // fail while the same flag without a package works.
+            (
+                &["add", "foo", "--pnpmfile", "h.cjs"],
+                "pnpm add --pnpmfile <path>",
+            ),
+            (
+                &["add", "foo", "--global-pnpmfile", "h.cjs"],
+                "pnpm add --global-pnpmfile <path>",
+            ),
+            (
+                &["add", "foo", "--ignore-pnpmfile"],
+                "pnpm add --ignore-pnpmfile",
+            ),
+            // Output-verbosity flags (#179), forwarded via EngineGlobals.
+            (&["add", "foo", "--silent"], "pnpm --silent"),
+            (&["add", "foo", "-s"], "pnpm -s (silent short)"),
+            (
+                &["add", "foo", "--reporter=silent"],
+                "pnpm --reporter silent",
+            ),
+            (
+                &["add", "foo", "--loglevel=warn"],
+                "pnpm --loglevel <level>",
+            ),
         ],
     );
 }
@@ -412,6 +501,14 @@ fn exec_dlx_grammar_accepts_documented_forms() {
             (
                 &["dlx", "-p", "cowsay", "cowsay"],
                 "pnpm dlx -p (aube's --package short)",
+            ),
+            // `x` is the short alias of `dlx` (bun's `bun x`): it must accept the
+            // exact same fetch-and-run grammar, including the `-p`/`--package`
+            // value-flag binding.
+            (&["x", "cowsay"], "nub x <pkg> (dlx alias)"),
+            (
+                &["x", "-p", "cowsay", "cowsay"],
+                "nub x -p (dlx alias, --package short)",
             ),
         ],
     );

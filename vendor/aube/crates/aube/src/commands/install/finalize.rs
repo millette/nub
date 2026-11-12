@@ -1,12 +1,19 @@
+use super::bin_linking::{
+    LinkAllBinsInput, ManagedBinLinks, link_all_bins, remove_managed_bin_links,
+    remove_unclaimed_preserved_bin_links,
+};
 use super::dep_selection::DepSelection;
 use super::lifecycle::{
-    JailBuildPolicy, run_dep_lifecycle_scripts, run_root_lifecycle, unreviewed_dep_builds,
+    JailBuildPolicy, run_dep_lifecycle_scripts, run_importer_lifecycle, run_link_lifecycle_scripts,
+    trash_failed_optional_links, unreviewed_dep_builds,
 };
-use super::side_effects_cache::{SideEffectsCacheConfig, side_effects_cache_root};
+use super::side_effects_cache::{
+    SideEffectsCacheConfig, SideEffectsCacheLocation, side_effects_cache_root,
+};
 use super::summary::{print_direct_dependency_summary, should_print_human_install_summary};
 use super::sweep::sweep_orphaned_aube_entries;
 use super::workspace::importer_project_dir;
-use super::{InstallPhaseTimings, delta, unreviewed_builds};
+use super::{InstallPhaseTimings, delta, gvs, unreviewed_builds};
 use crate::state;
 use miette::{Context, IntoDiagnostic, miette};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,8 +24,18 @@ pub(super) struct FinalizePhaseInput<'a> {
     pub(super) store: &'a aube_store::Store,
     pub(super) graph: &'a aube_lockfile::LockfileGraph,
     pub(super) graph_for_link: &'a aube_lockfile::LockfileGraph,
+    pub(super) ws_dirs: &'a BTreeMap<String, std::path::PathBuf>,
+    pub(super) has_workspace: bool,
     pub(super) manifests: &'a [(String, aube_manifest::PackageJson)],
+    pub(super) manifest: &'a aube_manifest::PackageJson,
     pub(super) lifecycle_manifests: &'a [(String, aube_manifest::PackageJson)],
+    /// The importers that run their own lifecycle hooks
+    /// ([`super::workspace::project_hook_importers`]).
+    pub(super) project_hook_importers: &'a [(String, aube_manifest::PackageJson)],
+    /// The root's `preinstall` already ran before resolution (install
+    /// step 1b), so step 7b must not run it a second time.
+    pub(super) root_preinstall_ran_early: bool,
+    pub(super) project_stages: super::ProjectStages,
     pub(super) direct_dep_info: &'a std::collections::HashMap<String, aube_resolver::DirectDepInfo>,
     pub(super) deprecations:
         &'a std::sync::Arc<std::sync::Mutex<Vec<crate::deprecations::DeprecationRecord>>>,
@@ -26,7 +43,9 @@ pub(super) struct FinalizePhaseInput<'a> {
     pub(super) default_trust_floor: &'a super::default_trust::DefaultTrustFloor,
     pub(super) jail_policy: &'a JailBuildPolicy,
     pub(super) stats: &'a aube_linker::LinkStats,
+    pub(super) managed_bin_links: &'a ManagedBinLinks,
     pub(super) node_linker: aube_linker::NodeLinker,
+    pub(super) planned_gvs: bool,
     pub(super) virtual_store_only: bool,
     pub(super) current_leaf_hashes: Option<BTreeMap<String, String>>,
     pub(super) current_subtree_hashes: Option<BTreeMap<String, String>>,
@@ -35,12 +54,21 @@ pub(super) struct FinalizePhaseInput<'a> {
     pub(super) aube_dir: &'a std::path::Path,
     pub(super) virtual_store_dir_max_length: usize,
     pub(super) child_concurrency: usize,
+    /// Node the dep lifecycle scripts will run under, keying the
+    /// side-effects cache so post-build artifacts never cross an ABI.
+    /// `None` when discovery failed.
+    pub(super) node_version: Option<&'a str>,
     pub(super) side_effects_cache_setting: bool,
     pub(super) side_effects_cache_readonly_setting: bool,
     pub(super) strict_dep_builds_setting: bool,
     pub(super) ignore_scripts: bool,
     pub(super) skip_root_lifecycle: bool,
-    pub(super) workspace_filter_empty: bool,
+    /// The lockfile read was npm's, so a `file:` directory link carries
+    /// npm's link build pass ([`run_link_lifecycle_scripts`]).
+    pub(super) npm_link_lifecycle: bool,
+    /// The importers a `--filter` install linked, `None` for the whole
+    /// workspace ([`super::workspace::linked_workspace_selection`]).
+    pub(super) workspace_selection: Option<std::collections::BTreeSet<String>>,
     pub(super) dep_selection: DepSelection,
     pub(super) cli_flags: &'a [(String, String)],
     pub(super) cached_count: usize,
@@ -50,18 +78,41 @@ pub(super) struct FinalizePhaseInput<'a> {
     pub(super) phase_timings: &'a mut InstallPhaseTimings,
 }
 
+/// Gates whether the next install may narrow its lifecycle phase to changed
+/// packages. The engine belongs in it because build scripts compile against a
+/// specific Node ABI: without it, switching Node majors leaves the prior
+/// install's state looking current, the delta filter selects nothing, and a
+/// native addon built for the old major survives untouched — the cache layers
+/// downstream never get consulted. Engine-name granularity (major, os, arch)
+/// rather than the raw version keeps a patch bump from forcing a full scan.
 fn dep_build_policy_hash(
     build_policy: &aube_scripts::BuildPolicy,
     default_trust_floor: &super::default_trust::DefaultTrustFloor,
+    node_version: Option<&str>,
+    shell_id: &str,
 ) -> String {
     let policy = build_policy.fingerprint();
     let floor = default_trust_floor.fingerprint();
+    let engine = node_version.map_or_else(aube_lockfile::graph_hash::platform_name, |v| {
+        aube_lockfile::graph_hash::engine_name_default(v).0
+    });
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dep-build-policy-v1");
+    hasher.update(b"dep-build-policy-v2");
     hasher.update(&(policy.len() as u64).to_le_bytes());
     hasher.update(policy.as_bytes());
     hasher.update(&(floor.len() as u64).to_le_bytes());
     hasher.update(floor.as_bytes());
+    hasher.update(&(engine.len() as u64).to_le_bytes());
+    hasher.update(engine.as_bytes());
+    // The shell the builds run under, for the engine's reason: output from
+    // another shell can be wrong (`cmd.exe` exits 0 having written `${VAR}`
+    // literally), so a shell change must widen the scan. The platform default
+    // adds nothing, so a hash written before this existed still matches and an
+    // upgrade does not force a full rescan everywhere.
+    if shell_id != aube_scripts::PLATFORM_DEFAULT_SHELL_ID {
+        hasher.update(&(shell_id.len() as u64).to_le_bytes());
+        hasher.update(shell_id.as_bytes());
+    }
     hasher.finalize().to_hex().to_string()
 }
 
@@ -77,10 +128,50 @@ fn lifecycle_delta_filter(
     if virtual_store_only {
         return None;
     }
+    // The filter's premise is "content hash unchanged ⇒ this package still has
+    // whatever its build left behind". That premise is upheld on the linker
+    // side: the hoisted pass reuses a placement whenever the driver can prove
+    // the fingerprint is unchanged AND the previous link completed (see
+    // `reusable_hoisted_dep_paths`), and anything it cannot prove gets wiped
+    // and refilled — which also moves that package's fingerprint, so it lands
+    // in `selected` here and is rebuilt. The two halves have to stay in step;
+    // loosening either one silently deletes build output (nubjs/nub#610).
     let prior_policy_hash = state::read_state_dep_build_policy_hash(cwd)?;
     if prior_policy_hash != dep_build_policy_hash {
         tracing::debug!("delta: dep build policy changed; running full eligible build scan");
         return None;
+    }
+    // A build the last install could not run is owed one, and the delta
+    // is the wrong instrument for finding it: the package's bytes did
+    // not change, so it is not `touched`, and it was policy-ALLOWED, so
+    // `select_previously_unreviewed_now_allowed` does not reach it
+    // either. It would be dropped at the `selected_dep_paths` guard
+    // before the runner could retry it, and the state write would then
+    // clear the marker and re-seal the tree. Busting freshness only
+    // gets the pipeline running again; this is what makes the retry
+    // actually happen (nubjs/nub#764).
+    //
+    // A full scan rather than adding these to `selected`: the state
+    // records spec keys and the filter is keyed by dep_path, and a
+    // deferral is rare enough that widening the scan costs nothing
+    // worth the mapping.
+    match state::read_state_deferred_dep_builds(cwd) {
+        Some(owed) if owed.is_empty() => {}
+        Some(_) => {
+            tracing::debug!("delta: a dependency build is owed; running full eligible build scan");
+            return None;
+        }
+        // State predating the field cannot say what it deferred, so the
+        // migration has to assume the worst here as well as in the
+        // freshness check. Narrowing on an unknown would drop a build
+        // stranded by the old behavior and then write `Some([])` over
+        // it, sealing the tree on the one install that could heal it.
+        None => {
+            tracing::debug!(
+                "delta: install state predates build-completion tracking; running full eligible build scan"
+            );
+            return None;
+        }
     }
     let prior_leaf_hashes = state::read_state_package_content_hashes(cwd)?;
     let prior_subtree_hashes = state::read_state_subtree_hashes(cwd)?;
@@ -146,15 +237,23 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
         store,
         graph,
         graph_for_link,
+        ws_dirs,
+        has_workspace,
         manifests,
+        manifest,
         lifecycle_manifests,
+        project_hook_importers,
+        root_preinstall_ran_early,
+        project_stages,
         direct_dep_info,
         deprecations,
         build_policy,
         default_trust_floor,
         jail_policy,
         stats,
+        managed_bin_links,
         node_linker,
+        planned_gvs,
         virtual_store_only,
         current_leaf_hashes,
         current_subtree_hashes,
@@ -163,12 +262,14 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
         aube_dir,
         virtual_store_dir_max_length,
         child_concurrency,
+        node_version,
         side_effects_cache_setting,
         side_effects_cache_readonly_setting,
         strict_dep_builds_setting,
         ignore_scripts,
         skip_root_lifecycle,
-        workspace_filter_empty,
+        npm_link_lifecycle,
+        workspace_selection,
         dep_selection,
         cli_flags,
         cached_count,
@@ -180,6 +281,39 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
 
     let placements_ref = stats.hoisted_placements.as_ref();
 
+    // Regenerate every `.bin/` shim against post-build targets. A build can
+    // replace a bin — a JS launcher becomes a native binary (esbuild, #394)
+    // — and the link phase shimmed it as `node <target>` before any script
+    // ran, so the shim now wraps a native binary and fails; and a bin a
+    // link's `prepare` generates did not exist to shim at all.
+    // `create_bin_shim` re-classifies each target and emits a direct-exec
+    // symlink/wrapper for the ones that turned native. Shared by the
+    // dependency build pass and npm's link build pass below.
+    let relink_bins = |graph: &aube_lockfile::LockfileGraph| -> miette::Result<()> {
+        let preserved = remove_managed_bin_links(managed_bin_links)?;
+        let relinked = link_all_bins(LinkAllBinsInput {
+            project_dir: cwd,
+            settings_ctx,
+            modules_dir_name,
+            aube_dir,
+            graph,
+            virtual_store_dir_max_length,
+            placements: placements_ref,
+            ws_dirs,
+            manifests,
+            manifest,
+            node_linker,
+            has_workspace,
+            virtual_store_only,
+            ignore_scripts,
+            has_any_allow_rule: build_policy.has_any_allow_rule(),
+            floor_may_allow_any: default_trust_floor.may_allow_any(),
+            preserved: Some(&preserved),
+        })?;
+        remove_unclaimed_preserved_bin_links(managed_bin_links, &preserved, &relinked)?;
+        Ok(())
+    };
+
     // Tear down the progress display before running post-link lifecycle
     // scripts or printing the final summary — scripts write directly to
     // stdout/stderr and would collide with an active progress bar.
@@ -190,32 +324,42 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
     // block and the branded line as redundant twins.
     let install_is_noop = stats.packages_linked == 0 && stats.top_level_linked == 0;
     if let Some(p) = prog_ref {
-        p.finish(!install_is_noop);
+        let tty_behavior = if install_is_noop {
+            crate::progress::TtyFinishBehavior::Clear
+        } else {
+            crate::progress::TtyFinishBehavior::Preserve
+        };
+        p.finish(!install_is_noop, tty_behavior);
     }
 
-    if !ignore_scripts && strict_dep_builds_setting && !virtual_store_only {
-        let unreviewed = unreviewed_dep_builds(
-            aube_dir,
-            graph_for_link,
-            build_policy,
-            default_trust_floor,
-            virtual_store_dir_max_length,
-            placements_ref,
-        )?;
-        if !unreviewed.is_empty() {
-            return Err(miette!(
-                "dependencies with build scripts must be reviewed before install:\n{}\nhelp: add the package(s) to `allowBuilds` with `true`/`false`, or set `strictDepBuilds=false`",
-                unreviewed
-                    .into_iter()
-                    .map(|b| format!("  - {}", b.spec_key))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ));
+    if !virtual_store_only {
+        let virtual_store_dir = if planned_gvs && node_linker == aube_linker::NodeLinker::Isolated {
+            store.virtual_store_dir()
+        } else {
+            aube_dir.to_path_buf()
+        };
+        gvs::write_modules_metadata(cwd, graph_for_link, modules_dir_name, &virtual_store_dir)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to write {modules_dir_name}/.modules.yaml"))?;
+        if planned_gvs && node_linker == aube_linker::NodeLinker::Isolated {
+            gvs::patch_legacy_vite_copies(
+                aube_dir,
+                graph_for_link,
+                virtual_store_dir_max_length,
+                &store.virtual_store_dir(),
+                modules_dir_name,
+            )
+            .into_diagnostic()
+            .wrap_err("failed to backport Vite global virtual store support")?;
         }
     }
 
-    let filtered_install = !workspace_filter_empty || dep_selection.is_filtered();
-    let dep_build_policy_hash = dep_build_policy_hash(build_policy, default_trust_floor);
+    let dep_build_policy_hash = dep_build_policy_hash(
+        build_policy,
+        default_trust_floor,
+        node_version,
+        &aube_scripts::resolved_shell_id(),
+    );
     let lifecycle_delta_filter = if ignore_scripts {
         None
     } else {
@@ -229,6 +373,14 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
             virtual_store_only,
         )
     };
+
+    // Recorded once the tree is linked and before any script can fail,
+    // so a failed hook never leaves the previous install's groups behind.
+    if !virtual_store_only {
+        state::write_dep_selection(cwd, dep_selection)
+            .into_diagnostic()
+            .wrap_err("failed to record the installed dependency groups")?;
+    }
 
     // 7a. Dependency lifecycle scripts (allowBuilds).
     //     Every dep that the `BuildPolicy` explicitly allows runs its
@@ -245,6 +397,7 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
     //     resolutions land at distinct paths.
     // The `defaultTrust` floor can allow builds even when the policy
     // itself has no allow rules, so it keeps the phase alive too.
+    let mut builds_not_attempted: Vec<String> = Vec::new();
     if super::default_trust::dep_build_scripts_may_run(
         ignore_scripts,
         build_policy.has_any_allow_rule(),
@@ -257,14 +410,15 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
         let side_effects_cache = side_effects_cache_root
             .as_deref()
             .map(|root| {
+                let location = SideEffectsCacheLocation { root, node_version };
                 if side_effects_cache_readonly_setting {
-                    SideEffectsCacheConfig::RestoreOnly(root)
+                    SideEffectsCacheConfig::RestoreOnly(location)
                 } else {
-                    SideEffectsCacheConfig::RestoreAndSave(root)
+                    SideEffectsCacheConfig::RestoreAndSave(location)
                 }
             })
             .unwrap_or(SideEffectsCacheConfig::Disabled);
-        let ran = run_dep_lifecycle_scripts(
+        let lifecycle_outcome = run_dep_lifecycle_scripts(
             cwd,
             modules_dir_name,
             aube_dir,
@@ -272,6 +426,7 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
             build_policy,
             default_trust_floor,
             virtual_store_dir_max_length,
+            cfg!(windows) && planned_gvs && node_linker == aube_linker::NodeLinker::Isolated,
             child_concurrency,
             placements_ref,
             side_effects_cache,
@@ -280,30 +435,99 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
             None,
         )
         .await?;
-        if ran > 0 {
-            tracing::debug!("allowBuilds: ran {ran} dep lifecycle script(s)");
+        // An allowed build the phase could not attempt leaves the tree
+        // incomplete. Carried to the state write so the next install
+        // retries it rather than short-circuiting on a sealed tree.
+        builds_not_attempted = lifecycle_outcome.unbuilt.clone();
+        if lifecycle_outcome.ran > 0 {
+            tracing::debug!(
+                "allowBuilds: ran {} dep lifecycle script(s)",
+                lifecycle_outcome.ran
+            );
         }
         phase_timings.record("dep_lifecycle", phase_start.elapsed());
+
+        // Gated on `package_contents_changed`, NOT on the script count: a
+        // `sideEffectsCache` restore (default on) recreates the package dir
+        // with the already-native bin and returns a zero script count, yet
+        // still needs the shim regenerated.
+        if lifecycle_outcome.package_contents_changed {
+            let phase_start = std::time::Instant::now();
+            relink_bins(graph_for_link)?;
+            tracing::debug!("phase:relink_bins {:.1?}", phase_start.elapsed());
+            phase_timings.record("relink_bins", phase_start.elapsed());
+        }
     }
 
-    // 7b. Post-link root lifecycle hooks: install → postinstall → prepare.
-    //     npm and pnpm run these in this order after deps are linked so the
-    //     scripts can use anything they depend on. Skipped with --ignore-scripts
-    //     and under `virtualStoreOnly` — scripts typically resolve
-    //     binaries via `node_modules/.bin`, which doesn't exist in
-    //     that mode.
+    // 7a. npm's link build pass, between the dependency builds and the
+    //     root's own hooks, where npm runs it. Same gates as 7b, minus the
+    //     root-lifecycle skip: a link target is not the root.
+    if npm_link_lifecycle && !ignore_scripts && !virtual_store_only {
+        let phase_start = std::time::Instant::now();
+        let outcome =
+            run_link_lifecycle_scripts(cwd, modules_dir_name, graph_for_link, lifecycle_manifests)
+                .await?;
+        phase_timings.record("link_lifecycle", phase_start.elapsed());
+        if !outcome.failed_optional.is_empty() {
+            // A failed optional link leaves the tree, its bins with it, and
+            // the state write below carries it as not attempted so the next
+            // install retries the build.
+            let mut pruned = graph_for_link.clone();
+            trash_failed_optional_links(
+                cwd,
+                modules_dir_name,
+                &mut pruned,
+                &outcome.failed_optional,
+            )?;
+            builds_not_attempted
+                .extend(outcome.failed_optional.iter().map(|link| link.spec.clone()));
+            let phase_start = std::time::Instant::now();
+            relink_bins(&pruned)?;
+            phase_timings.record("relink_bins", phase_start.elapsed());
+        } else if outcome.ran {
+            let phase_start = std::time::Instant::now();
+            relink_bins(graph_for_link)?;
+            phase_timings.record("relink_bins", phase_start.elapsed());
+        }
+    }
+
+    // 7b. Each project's own lifecycle hooks, once its dependencies are
+    //     linked so the scripts can use them: pnpm's
+    //     `PROJECT_LIFECYCLE_STAGES`, or just the install stages when
+    //     devDependencies were left out. Projects go one at a time in
+    //     dependency order, a linearization of pnpm's topological
+    //     scheduling. npm builds linked members before the root's
+    //     scripts, so its stages take the root last. Skipped with
+    //     --ignore-scripts and under
+    //     `virtualStoreOnly` — scripts typically resolve binaries via
+    //     `node_modules/.bin`, which doesn't exist in that mode.
     //     A hook that's not defined in package.json is a silent no-op.
     //     A hook that exits non-zero fails the install (fail-fast, matching pnpm).
     if !ignore_scripts && !virtual_store_only && !skip_root_lifecycle {
         let phase_start = std::time::Instant::now();
-        for (importer_path, importer_manifest) in lifecycle_manifests {
+        let include_dev = !dep_selection.prod_only();
+        let mut projects: Vec<_> = project_hook_importers.iter().collect();
+        if project_stages == super::ProjectStages::Npm {
+            projects.sort_by_key(|(importer_path, _)| importer_path == ".");
+        }
+        for (importer_path, importer_manifest) in projects {
             let project_dir = importer_project_dir(cwd, importer_path);
-            for hook in [
-                aube_scripts::LifecycleHook::Install,
-                aube_scripts::LifecycleHook::PostInstall,
-                aube_scripts::LifecycleHook::Prepare,
-            ] {
-                run_root_lifecycle(&project_dir, modules_dir_name, importer_manifest, hook).await?;
+            for &hook in project_stages.hooks(include_dev, importer_path == ".") {
+                if hook == aube_scripts::LifecycleHook::PreInstall
+                    && importer_path == "."
+                    && root_preinstall_ran_early
+                {
+                    continue;
+                }
+                run_importer_lifecycle(
+                    cwd,
+                    &project_dir,
+                    importer_path,
+                    modules_dir_name,
+                    importer_manifest,
+                    hook,
+                )
+                .await?;
             }
         }
         phase_timings.record("root_lifecycle", phase_start.elapsed());
@@ -327,8 +551,10 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
     // the post-install warning emission below. The walk does a stat per
     // package, so collapsing two callers into one cuts the linker-tail
     // cost on large graphs roughly in half.
-    let unreviewed_builds = if !ignore_scripts && !strict_dep_builds_setting && !virtual_store_only
-    {
+    // The same walk also separates out the builds this run deferred for
+    // a reason it invented rather than one the config decided — see
+    // `UnreviewedScan::deferred`.
+    let scan = if !ignore_scripts && !virtual_store_only {
         unreviewed_dep_builds(
             aube_dir,
             graph_for_link,
@@ -336,41 +562,77 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
             default_trust_floor,
             virtual_store_dir_max_length,
             placements_ref,
+            None,
+            None,
         )?
     } else {
-        Vec::new()
+        super::lifecycle::UnreviewedScan::default()
     };
+    let unreviewed_builds = scan.unreviewed;
+    // Both halves say the same thing to the freshness predicate: a
+    // build this tree is supposed to carry is not in it, for a reason
+    // another install might not hit. `--ignore-scripts` contributes
+    // nothing — it writes an empty `dep_build_policy_hash`, which busts
+    // the warm path on its own.
+    let mut deferred_dep_builds = scan.deferred;
+    deferred_dep_builds.append(&mut builds_not_attempted);
+    deferred_dep_builds.sort();
+    deferred_dep_builds.dedup();
 
-    if !virtual_store_only && !filtered_install {
+    // A `--prod`/`--dev`/`--no-optional` install writes no state, so the
+    // next install rebuilds the full graph. A `--filter` install writes
+    // one that records its selection (`workspace_selection`), which is
+    // what lets a repeat of it take the warm path, and leaves out the
+    // per-package hashes: they would describe the whole graph to the
+    // next install's delta passes, which would then skip linking and
+    // building what this one never touched.
+    if !virtual_store_only && !dep_selection.is_filtered() {
         let phase_start = std::time::Instant::now();
+        let scoped = workspace_selection.is_some();
         // Fingerprint every package in the final graph so the next
         // install can diff and skip unchanged entries. Missing or
         // stale fingerprints fall back to a full install on the
         // read side. Safe for older readers that ignore the field.
         // When the early pass already produced the leaf map for
         // `graph_for_link`, reuse it here as long as it covers every
-        // dep_path in the writeback `graph`. Filtered installs short-
-        // circuit before this branch so the two graphs are normally
-        // identical, but verifying every key keeps the reuse safe
-        // against any future code path that diverges them. Any miss
-        // falls back to a fresh compute over `graph`.
-        let package_content_hashes = current_leaf_hashes
-            .filter(|leaf| {
-                leaf.len() == graph.packages.len()
-                    && graph.packages.keys().all(|k| leaf.contains_key(k))
-            })
-            .unwrap_or_else(|| delta::compute_package_hashes(graph, &patch_hashes, cwd));
-        let package_subtree_hashes = current_subtree_hashes.unwrap_or_else(|| {
-            delta::compute_subtree_hashes_from_leaf(graph, &package_content_hashes)
-        });
-        let graph_lthash = hex::encode(delta::lthash_of(&package_content_hashes).digest());
+        // dep_path in the writeback `graph`. Any miss falls back to a
+        // fresh compute over `graph`.
+        let (package_content_hashes, package_subtree_hashes, graph_lthash) = if scoped {
+            (BTreeMap::new(), BTreeMap::new(), String::new())
+        } else {
+            let package_content_hashes = current_leaf_hashes
+                .filter(|leaf| {
+                    leaf.len() == graph.packages.len()
+                        && graph.packages.keys().all(|k| leaf.contains_key(k))
+                })
+                .unwrap_or_else(|| delta::compute_package_hashes(graph, &patch_hashes, cwd));
+            let package_subtree_hashes = current_subtree_hashes.unwrap_or_else(|| {
+                delta::compute_subtree_hashes_from_leaf(graph, &package_content_hashes)
+            });
+            let graph_lthash = hex::encode(delta::lthash_of(&package_content_hashes).digest());
+            (package_content_hashes, package_subtree_hashes, graph_lthash)
+        };
         let package_json_hashes = state::collect_package_json_hashes_from_manifests(cwd, manifests);
+        // One parse for every prior-install field this block consumes.
+        // The per-field accessors each re-parse the full O(graph) state
+        // file; on a large monorepo that was four parses of the same
+        // bytes. The diagnostics below compare graphs, so a scoped
+        // install, which records none, skips them.
+        let prior_state = if scoped {
+            None
+        } else {
+            state::read_state_delta_snapshot(cwd)
+        };
         // Diff against the previous install. Logs delta counts at
         // debug so `-v` installs surface what actually moved. A
         // later pass feeds the plan into fetch and link as a
         // pre-filter.
-        if let Some(prior) = state::read_state_package_content_hashes(cwd) {
-            let plan = delta::diff(&prior, &package_content_hashes);
+        if let Some(prior) = prior_state
+            .as_ref()
+            .map(|s| &s.package_content_hashes)
+            .filter(|prior| !prior.is_empty())
+        {
+            let plan = delta::diff(prior, &package_content_hashes);
             if !plan.is_empty() {
                 // Touched set built once. Doubles as a membership
                 // probe so future wiring exercises the same shape
@@ -392,11 +654,12 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
             // Cheap sanity on the homomorphic add/remove ops. The
             // future causal scheduler needs these two to stay in
             // lockstep with the full recompute.
-            if let Some(prior_lthash_hex) = state::read_state_graph_lthash(cwd)
-                && let Ok(prior_bytes) = hex::decode(&prior_lthash_hex)
+            if let Some(prior_lthash_hex) =
+                prior_state.as_ref().and_then(|s| s.graph_lthash.as_deref())
+                && let Ok(prior_bytes) = hex::decode(prior_lthash_hex)
                 && prior_bytes.len() == 32
             {
-                let mut incr = delta::lthash_of(&prior);
+                let mut incr = delta::lthash_of(prior);
                 for dp in &plan.removed {
                     if let Some(fp) = prior.get(dp) {
                         incr.remove(fp);
@@ -429,7 +692,7 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
         // LtHash diagnostic. One 32-byte compare proves graph
         // equivalence with the last install. Beats the map diff
         // when both sides are known good.
-        if let Some(prior_lthash) = state::read_state_graph_lthash(cwd)
+        if let Some(prior_lthash) = prior_state.as_ref().and_then(|s| s.graph_lthash.as_deref())
             && prior_lthash != graph_lthash
         {
             tracing::debug!(
@@ -443,7 +706,11 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
         // Merkle subtree diagnostic. How many subtree roots moved
         // vs how many leaves moved. Fewer roots means tighter
         // re-link scope once the delta linker lands.
-        if let Some(prior_subtrees) = state::read_state_subtree_hashes(cwd) {
+        if let Some(prior_subtrees) = prior_state
+            .as_ref()
+            .map(|s| &s.package_subtree_hashes)
+            .filter(|prior| !prior.is_empty())
+        {
             let changed_subtrees = package_subtree_hashes
                 .iter()
                 .filter(|(k, v)| prior_subtrees.get(*k).is_none_or(|old| old != *v))
@@ -483,18 +750,31 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
                 layout: state::WriteStateLayout {
                     graph: graph_for_link,
                     node_linker,
+                    hoisting_limits: crate::commands::settings_hoisting_limits_to_linker(
+                        aube_settings::resolved::hoisting_limits(settings_ctx),
+                    ),
                     modules_dir_name,
                     aube_dir,
                     virtual_store_dir_max_length,
                     placements: placements_ref,
+                    use_global_virtual_store: planned_gvs,
                 },
                 unreviewed_builds: unreviewed_builds_for_state,
+                deferred_dep_builds,
+                workspace_selection,
             },
         )
         .into_diagnostic()
         .wrap_err("failed to write install state")?;
         phase_timings.record("state", phase_start.elapsed());
     }
+
+    // The tree now matches the state just written, so the next hoisted
+    // install may reuse placements. Deliberately after the state write: if
+    // that failed we bailed above and the sentinel stays, which costs a
+    // wipe-and-refill next time rather than trusting a tree we cannot
+    // describe.
+    state::clear_link_in_progress(cwd);
 
     // 8a. Sweep orphaned `.aube/<dep_path>` entries older than
     //     `modulesCacheMaxAge`. The "in use" set is built from the
@@ -568,8 +848,16 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
     // `--reporter=append-only` skip the progress object but still get the
     // dependency summary; silent and ndjson stay machine-clean.
     if !install_is_noop && should_print_human_install_summary() {
-        print_direct_dependency_summary(graph_for_link, manifests, direct_dep_info);
+        print_direct_dependency_summary(cwd, graph_for_link, manifests, direct_dep_info);
     }
+    // The embedder's report slot. Placed here so a host's own end-of-install
+    // block lands above the success line rather than after it. Inert with no
+    // hook registered, which is every standalone aube run.
+    super::emit_pre_summary(
+        cwd,
+        planned_gvs && node_linker == aube_linker::NodeLinker::Isolated,
+        install_is_noop,
+    );
     if let Some(p) = prog_ref {
         p.print_install_summary(
             stats.packages_linked,
@@ -579,19 +867,16 @@ pub(super) async fn run_finalize_phase(input: FinalizePhaseInput<'_>) -> miette:
         );
     }
 
-    // Surface packages whose build scripts were skipped because they're
-    // not on the `allowBuilds` / `onlyBuiltDependencies` allowlist. Without
-    // this, a fresh install of a project that depends on native bindings
-    // (`better-sqlite3`, `esbuild`, napi-rs packages, etc.) looks like it
-    // succeeded but leaves those packages unbuilt — the failure only
-    // surfaces later when something tries to `require` the binding.
-    // Skipped under `--ignore-scripts`, `virtualStoreOnly`, and
-    // `strictDepBuilds=true` (the strict path already errored above).
-    if !unreviewed_builds.is_empty() {
-        unreviewed_builds::emit_warning(&unreviewed_builds);
-    }
-
-    Ok(())
+    // Packages whose build scripts were skipped because nothing approved
+    // them. Without this, a fresh install of a project that depends on
+    // native bindings (`better-sqlite3`, napi-rs packages, etc.) looks like
+    // it succeeded but leaves those packages unbuilt. Under
+    // `strictDepBuilds` (the default, as in pnpm 12) the install fails
+    // here — after `node_modules`, the approved builds, the root hooks and
+    // the state file are all in place, so the next step is approving, and
+    // a repeat install fails the same way from the warm path. Skipped
+    // under `--ignore-scripts` and `virtualStoreOnly`, which collect none.
+    unreviewed_builds::report(&unreviewed_builds, strict_dep_builds_setting, cwd)
 }
 
 #[cfg(test)]
@@ -607,6 +892,56 @@ mod tests {
             "unexpected policy warnings: {warnings:?}"
         );
         policy
+    }
+
+    #[test]
+    fn dep_build_policy_hash_tracks_the_node_major() {
+        // The delta filter reuses the prior install's selection whenever this
+        // hash is unchanged, so a Node major switch has to move it — otherwise
+        // the lifecycle phase is skipped and a native addon built for the old
+        // ABI is never rebuilt. A patch bump must NOT move it: the engine name
+        // is major-granular, and rescanning every build on a 22.15.0 → 22.15.1
+        // upgrade would be pure cost.
+        let (policy, floor) = (
+            policy(),
+            super::super::default_trust::DefaultTrustFloor::disabled(),
+        );
+        let h = |v: Option<&str>| {
+            dep_build_policy_hash(&policy, &floor, v, aube_scripts::PLATFORM_DEFAULT_SHELL_ID)
+        };
+
+        assert_ne!(
+            h(Some("22.15.0")),
+            h(Some("26.5.0")),
+            "a Node major switch must widen the lifecycle scan"
+        );
+        assert_eq!(
+            h(Some("22.15.0")),
+            h(Some("22.15.1")),
+            "a patch bump shares the ABI and must stay a narrow scan"
+        );
+        assert_ne!(
+            h(None),
+            h(Some("22.15.0")),
+            "an unresolved version must not collide with a resolved one"
+        );
+    }
+
+    #[test]
+    fn dep_build_policy_hash_tracks_a_non_default_lifecycle_shell() {
+        // Output from another shell can be wrong rather than stale, so a shell
+        // change has to widen the lifecycle scan the way a Node major switch does.
+        let (policy, floor) = (
+            policy(),
+            super::super::default_trust::DefaultTrustFloor::disabled(),
+        );
+        let h = |shell: &str| dep_build_policy_hash(&policy, &floor, Some("26.5.0"), shell);
+        let other = if cfg!(windows) { "sh" } else { "bash" };
+        assert_ne!(
+            h(aube_scripts::PLATFORM_DEFAULT_SHELL_ID),
+            h(other),
+            "a lifecycle shell change must widen the lifecycle scan"
+        );
     }
 
     #[test]
@@ -637,5 +972,144 @@ mod tests {
         );
 
         assert_eq!(selected, BTreeSet::from(["esbuild@1.0.0".to_string()]));
+    }
+
+    /// The SELECTION half of the nubjs/nub#764 fix, guarded directly — and it
+    /// needs its own test because nothing else reaches it. Busting freshness
+    /// only restarts the pipeline; this bail is what gets the owed package
+    /// another attempt.
+    ///
+    /// That gap was measured, not assumed. Deleting the bail and re-running
+    /// everything else left the two state-layer unit tests green AND the
+    /// binary-level integration test green, because freshness still busts, the
+    /// delta still narrows, the build is still dropped, and the tree still
+    /// settles on the install after. A regression here would have shipped
+    /// silently — which is the exact shape of the defect the bail fixes.
+    #[test]
+    fn lifecycle_delta_widens_when_a_dependency_build_is_owed() {
+        const HASH: &str = "policy-hash-under-test";
+        let dir = std::env::temp_dir().join(format!("aube-delta-owed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let aube_dir = dir.join("node_modules/.aube");
+        std::fs::create_dir_all(&aube_dir).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+
+        // A real package, and NON-EMPTY hash maps: both
+        // `read_state_package_content_hashes` and
+        // `read_state_subtree_hashes` return `None` for an empty map, which
+        // would make the filter bail through `?` before ever reaching the
+        // branch under test — the control below is what caught that.
+        let mut graph = LockfileGraph::default();
+        let pkg = LockedPackage {
+            name: "dep".into(),
+            version: "1.0.0".into(),
+            dep_path: "dep@1.0.0".into(),
+            integrity: Some("sha512-dep".into()),
+            ..Default::default()
+        };
+        graph.packages.insert(pkg.dep_path.clone(), pkg);
+        let recorded =
+            BTreeMap::from([("dep@1.0.0".to_string(), "recorded-content-hash".to_string())]);
+
+        state::write_state(
+            &dir,
+            state::WriteStateInput {
+                section_filtered: false,
+                package_json_hashes: BTreeMap::new(),
+                cli_flags: &[],
+                package_content_hashes: recorded.clone(),
+                graph_lthash: String::new(),
+                package_subtree_hashes: recorded.clone(),
+                dep_build_policy_hash: HASH.to_string(),
+                layout: state::WriteStateLayout {
+                    graph: &graph,
+                    node_linker: aube_linker::NodeLinker::Isolated,
+                    hoisting_limits: aube_linker::HoistingLimits::None,
+                    modules_dir_name: "node_modules",
+                    aube_dir: &aube_dir,
+                    virtual_store_dir_max_length: 120,
+                    placements: None,
+                    use_global_virtual_store: false,
+                },
+                unreviewed_builds: Vec::new(),
+                deferred_dep_builds: Vec::new(),
+                workspace_selection: None,
+            },
+        )
+        .expect("state should write");
+
+        // The state directory is named for the embedder, so find it rather
+        // than hard-coding a spelling this test does not own.
+        let state_dir = std::fs::read_dir(dir.join("node_modules"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("-state"))
+            })
+            .expect("install state directory");
+
+        // Rewrite the recorded deferral in place, as an install that could not
+        // run a build does. `None` strips the field entirely: the shape of
+        // state written before it existed.
+        let set_deferred = |owed: Option<&str>| {
+            let mut touched = 0;
+            for name in ["state.json", "fresh.json"] {
+                let path = state_dir.join(name);
+                let Ok(raw) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                match owed {
+                    Some(key) => doc["deferred_dep_builds"] = serde_json::json!([key]),
+                    None => {
+                        doc.as_object_mut().unwrap().remove("deferred_dep_builds");
+                    }
+                }
+                std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+                touched += 1;
+            }
+            assert!(touched > 0, "no state files at {}", state_dir.display());
+        };
+
+        let run = || {
+            lifecycle_delta_filter(
+                &dir,
+                &graph,
+                &BTreeMap::new(),
+                &policy(),
+                &super::super::default_trust::DefaultTrustFloor::disabled(),
+                HASH,
+                false,
+            )
+        };
+
+        // CONTROL. A filter that returned `None` unconditionally would satisfy
+        // both assertions below while narrowing nothing, ever.
+        assert!(
+            run().is_some(),
+            "control: with nothing owed the delta may narrow to changed packages, or the \
+             assertions below cannot tell widening from a filter that never narrows"
+        );
+
+        set_deferred(Some("dep@1.0.0"));
+        assert!(
+            run().is_none(),
+            "an owed build must force the full eligible scan: its bytes are unchanged so it is \
+             not `touched`, and it was policy-ALLOWED so the previously-unreviewed pass does not \
+             reach it either — a narrowed delta drops it and the state write then re-seals the tree"
+        );
+
+        set_deferred(None);
+        assert!(
+            run().is_none(),
+            "state predating the field cannot say what it deferred, so the migration must widen \
+             here as well as at the freshness check — narrowing on an unknown drops a build \
+             stranded by the old behavior and records the tree as clean"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

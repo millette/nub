@@ -6,6 +6,7 @@ import {
   TOCScrollArea,
 } from 'fumadocs-ui/components/toc';
 import { TOCItems, TOCItem } from 'fumadocs-ui/components/toc/default';
+import { TocStarNudge } from '@/components/toc-star-nudge';
 
 /**
  * Persistent right-gutter table of contents for the blog post, mirroring the
@@ -14,7 +15,7 @@ import { TOCItems, TOCItem } from 'fumadocs-ui/components/toc/default';
  * heading; TOCItems draws the moving accent thumb along the left border.
  *
  * The owning <aside> in the server component controls placement (sticky, gutter
- * width, max-xl:hidden). This component only renders the list + scroll-spy.
+ * width, hidden below lg). This component only renders the list + scroll-spy.
  */
 export function BlogTOC({ toc }: { toc: TableOfContents }) {
   return (
@@ -41,6 +42,7 @@ export function BlogTOC({ toc }: { toc: TableOfContents }) {
           ))}
         </TOCItems>
       </TOCScrollArea>
+      <TocStarNudge href="https://github.com/nubjs/nub" />
     </TOCProvider>
   );
 }

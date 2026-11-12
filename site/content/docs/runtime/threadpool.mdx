@@ -1,0 +1,38 @@
+---
+title: Threadpool
+description: Nub sizes libuv's threadpool to the cores available to the process instead of Node's fixed four, and on Linux runs the extra threads at a lower priority.
+---
+
+Node runs async `fs`, `dns.lookup`, async `zlib` and `crypto`, and native addons such as `bcrypt` and `sharp` on libuv's threadpool, which has four threads on any machine. Nub sizes it to the cores available to the process by setting `UV_THREADPOOL_SIZE` when it starts Node.
+
+```sh
+nub server.ts                        # sized to the cores: 16 on 16 vCPUs
+node server.ts                       # pool of 4
+UV_THREADPOOL_SIZE=6 nub server.ts   # your value, used as is
+```
+
+The size is the larger of four and the available cores, so a container gets its CPU quota rather than the host's core count. A container's thread limit caps it, and Windows stops at eight.
+
+<Callout>
+Read the [full docs](https://docs.libuv.org/en/v1.x/threadpool.html) for the threadpool on docs.libuv.org.
+</Callout>
+
+## Priority
+
+On Linux, the threads beyond the first four run at [nice](https://man7.org/linux/man-pages/man7/sched.7.html) 10. On an idle machine they run at full speed; under contention they yield most of the CPU to the other threads in the same cgroup, including your event loop.
+
+## Child processes
+
+A process your app spawns, including a `cluster` worker, starts with Node's default of four. A child that runs through `nub` is sized again. A `UV_THREADPOOL_SIZE` you set, in the shell or in an env file, is inherited as under Node.
+
+## Opting out
+
+A `UV_THREADPOOL_SIZE` of your own wins, from the shell or an env file. On Node 22.17 and newer, so does one your program sets before it first uses the pool, as under Node:
+
+```ts
+process.env.UV_THREADPOOL_SIZE = "4";
+```
+
+The pool size is also how many tasks run at once, so memory-heavy work such as resizing large images holds more in flight on a bigger pool. Set a smaller value when memory is the limit rather than CPU.
+
+Under [`--node`](/docs/runtime#--node) or [`NODE_COMPAT`](/docs/runtime#node_compat) the pool keeps Node's default.

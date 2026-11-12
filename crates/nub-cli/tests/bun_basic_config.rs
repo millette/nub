@@ -38,6 +38,10 @@ fn run_with_xdg_config(dir: &Path, xdg_config: &Path, args: &[&str]) -> (String,
         .current_dir(dir)
         .env_clear()
         .env("PATH", path)
+        // The fixture pins a differing `nub@<v>` to exercise nub identity, not the
+        // self-shim — opt out so a PM verb doesn't try to provision that nub.
+        // (env_clear above drops the ambient value, so set it explicitly.)
+        .env("NUB_SELF_SHIM", "0")
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", xdg_config)
         .env("XDG_DATA_HOME", dir.join("xdg-data"))
@@ -85,7 +89,8 @@ fn bun_incumbent_reads_project_and_global_bunfig_install_subset() {
         r#"
         [install]
         registry = "https://global.registry.example/"
-        linker = "isolated"
+        linker = "hoisted"
+        minimumReleaseAge = 3600
         "#,
     )
     .unwrap();
@@ -98,6 +103,12 @@ fn bun_incumbent_reads_project_and_global_bunfig_install_subset() {
         config_get(&dir, &xdg_config, "@acme:registry"),
         "https://scope.registry.example/"
     );
+    // The global bunfig IS read for a bun incumbent — `minimumReleaseAge` is
+    // resolution config, and 3600 bunfig seconds arriving as 60 engine minutes
+    // could come from nowhere else.
+    assert_eq!(config_get(&dir, &xdg_config, "minimumReleaseAge"), "60");
+    // Its unsupported `linker` is not mapped, so the setting stays at Nub's
+    // default instead of the bunfig's `hoisted`.
     assert_eq!(config_get(&dir, &xdg_config, "nodeLinker"), "isolated");
 }
 
@@ -141,7 +152,7 @@ fn nub_identity_does_not_read_project_or_global_bunfig() {
                 r#"{"name":"app","version":"1.0.0","packageManager":"nub@0.0.1"}"#,
             ),
             (
-                "lock.yaml",
+                "nub.lock",
                 "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n",
             ),
             (
@@ -149,7 +160,7 @@ fn nub_identity_does_not_read_project_or_global_bunfig() {
                 r#"
                 [install]
                 registry = "https://must-not-read.project.example/"
-                linker = "isolated"
+                minimumReleaseAge = 3600
                 "#,
             ),
         ],
@@ -169,7 +180,15 @@ fn nub_identity_does_not_read_project_or_global_bunfig() {
         config_get(&dir, &xdg_config, "registry"),
         "https://registry.npmjs.org/"
     );
-    assert_eq!(config_get(&dir, &xdg_config, "nodeLinker"), "undefined");
+    // Resolution config in the bunfig is ignored too, not just the registry:
+    // under a bun incumbent 3600 bunfig seconds arrive as 60 engine minutes, so
+    // anything else proves the file went unread. (Asserting the exact value
+    // would pin nub's own default, which is not what this test is about.)
+    assert_ne!(
+        config_get(&dir, &xdg_config, "minimumReleaseAge"),
+        "60",
+        "the bunfig's minimumReleaseAge must not be read under nub identity"
+    );
 }
 
 #[test]

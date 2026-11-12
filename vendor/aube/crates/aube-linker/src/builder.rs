@@ -23,6 +23,7 @@ impl Linker {
             virtual_store: store.virtual_store_dir(),
             store: store.clone(),
             use_global_virtual_store,
+            project_local_dep_paths: rustc_hash::FxHashSet::default(),
             strategy,
             patches: Patches::new(),
             hashes: None,
@@ -41,7 +42,94 @@ impl Linker {
             virtual_store_only: false,
             modules_dir_name: "node_modules".to_string(),
             aube_dir_override: None,
+            no_integrity_read_keys: std::collections::BTreeMap::new(),
+            link_progress: None,
+            disk_materialize: crate::PackageNameMatcher::default(),
+            reusable_hoisted: std::collections::HashSet::new(),
         }
+    }
+
+    /// Vouch that these dep paths are already correctly and completely placed
+    /// on disk, letting the hoisted pass skip its wipe-and-refill for them.
+    ///
+    /// The caller owns this judgement (see the field docs on [`Linker`]): it
+    /// has to combine an unchanged content fingerprint with proof that the
+    /// last link ran to completion. Vouching for a dep path whose tree is
+    /// actually partial would leave that package permanently broken, so the
+    /// driver errs toward not vouching. Standalone aube never calls this, so
+    /// the set stays empty and the hoisted pass is unchanged.
+    pub fn with_reusable_hoisted(mut self, dep_paths: std::collections::HashSet<String>) -> Self {
+        self.reusable_hoisted = dep_paths;
+        self
+    }
+
+    /// Force a set of packages to materialize as real project-local directories
+    /// even under the global virtual store (see the field docs on [`Linker`]).
+    /// Entries are matched as package-name patterns against each graph package.
+    /// Standalone aube and every test omit this → the set is empty and the GVS
+    /// pass is unchanged.
+    pub fn with_disk_materialize(mut self, names: &[String]) -> Self {
+        self.disk_materialize = crate::PackageNameMatcher::new(names);
+        self
+    }
+
+    /// Whether `pkg_name` is on the disk-materialize list. Consulted once per
+    /// graph package in the global-virtual-store link pass — hence the
+    /// compiled-once matcher; always false when the list is empty.
+    pub(crate) fn disk_materialize_matches(&self, pkg_name: &str) -> bool {
+        self.disk_materialize.matches(pkg_name)
+    }
+
+    /// Supply a shared counter the materialize pass bumps once per linked
+    /// file, so the progress UI can render a live file count during the
+    /// linking phase. The install driver hands in the progress UI's
+    /// `files_linked` atomic. Omitted by standalone callers and tests →
+    /// the pokes are no-ops and link behavior is unchanged.
+    pub fn with_link_progress(
+        mut self,
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.link_progress = Some(counter);
+        self
+    }
+
+    /// Bump the live file-linking counter by `n`, if one was installed
+    /// via [`with_link_progress`]. A no-op otherwise. Called at each
+    /// site the materialize pass credits files to `LinkStats`.
+    pub(crate) fn note_files_linked(&self, n: usize) {
+        if let Some(c) = &self.link_progress {
+            c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Supply `<registry-name>@<version>` → computed-sha512 bindings so the
+    /// `load_index` fallback can content-address the index read for a
+    /// no-integrity package instead of keying by `None` (see the field docs
+    /// on [`Linker`]). The install driver populates this by projecting the
+    /// global URL-keyed bindings down to `<name>@<version>` keys
+    /// (`state::read_no_integrity_index_for`); standalone callers and tests
+    /// omit it and get unchanged behavior.
+    pub fn with_no_integrity_read_keys(
+        mut self,
+        keys: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.no_integrity_read_keys = keys;
+        self
+    }
+
+    /// The index-cache read key for `pkg`: its lockfile SRI when present,
+    /// else this project's computed-sha512 binding for the coordinate
+    /// (no-integrity packages). `None` only when a no-integrity package
+    /// has no binding yet — the caller then misses cleanly and re-fetches.
+    pub(crate) fn index_read_key<'a>(
+        &'a self,
+        pkg: &'a aube_lockfile::LockedPackage,
+    ) -> Option<&'a str> {
+        pkg.integrity.as_deref().or_else(|| {
+            self.no_integrity_read_keys
+                .get(&format!("{}@{}", pkg.registry_name(), pkg.version))
+                .map(String::as_str)
+        })
     }
 
     /// Select the layout mode. Defaults to `NodeLinker::Isolated`
@@ -128,6 +216,19 @@ impl Linker {
     /// anything that lands outside its declared filesystem root.
     pub fn with_use_global_virtual_store(mut self, enabled: bool) -> Self {
         self.use_global_virtual_store = enabled;
+        self
+    }
+
+    /// Materialize selected dep paths into the project-local virtual
+    /// store while all other packages continue to use the GVS.
+    ///
+    /// Callers use this for package-specific compatibility transforms
+    /// that must never mutate a shared store entry.
+    pub fn with_project_local_dep_paths(
+        mut self,
+        dep_paths: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.project_local_dep_paths = dep_paths.into_iter().collect();
         self
     }
 
@@ -221,8 +322,8 @@ impl Linker {
     /// copy via the root-level symlink, so consumer code is
     /// unaffected. Default false (pnpm parity). No-op under
     /// `virtualStoreOnly=true` (no per-importer symlink pass runs)
-    /// and under `NodeLinker::Hoisted` (each importer gets an
-    /// independent flat tree — no shared root to dedupe against).
+    /// and under `NodeLinker::Hoisted` (its workspace-wide placement
+    /// plan deduplicates compatible packages independently).
     pub fn with_dedupe_direct_deps(mut self, on: bool) -> Self {
         self.dedupe_direct_deps = on;
         self

@@ -1,7 +1,10 @@
-use super::berry::{parse_berry_spec, range_has_protocol, split_berry_header};
+use super::berry::{
+    PatchSelector, parse_berry_spec, patch_protocol_path, range_has_protocol, split_berry_header,
+};
 use super::classic::{parse_npm_alias_real_name, parse_spec_name};
 use super::*;
 use crate::{DepType, LocalSource, LockedPackage};
+use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -68,6 +71,10 @@ bar@^2.0.0:
     let foo = &graph.packages["foo@1.2.3"];
     assert_eq!(foo.integrity.as_deref(), Some("sha512-aaa"));
     assert_eq!(
+        foo.tarball_url.as_deref(),
+        Some("https://example.com/foo-1.2.3.tgz")
+    );
+    assert_eq!(
         foo.dependencies.get("bar").map(String::as_str),
         Some("2.5.0")
     );
@@ -76,6 +83,83 @@ bar@^2.0.0:
     assert_eq!(root.len(), 1);
     assert_eq!(root[0].name, "foo");
     assert_eq!(root[0].dep_path, "foo@1.2.3");
+}
+
+#[test]
+fn classic_import_preserves_custom_registry_tarball_url() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"# yarn lockfile v1
+
+"@scope/pkg@^1.0.0":
+  version "1.0.0"
+  resolved "https://npm.example.test/@scope/pkg/-/pkg-1.0.0.tgz#0123456789abcdef0123456789abcdef01234567"
+  integrity sha512-private
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(&[("@scope/pkg", "^1.0.0")], &[]);
+    let graph = parse(tmp.path(), &manifest).unwrap();
+    let pkg = graph
+        .packages
+        .get("@scope/pkg@1.0.0")
+        .expect("scoped package");
+    assert_eq!(
+        pkg.tarball_url.as_deref(),
+        Some("https://npm.example.test/@scope/pkg/-/pkg-1.0.0.tgz")
+    );
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    crate::pnpm::write(out.path(), &graph, &manifest).unwrap();
+    let yaml = std::fs::read_to_string(out.path()).unwrap();
+    assert!(
+        yaml.contains("tarball: https://npm.example.test/@scope/pkg/-/pkg-1.0.0.tgz"),
+        "{yaml}"
+    );
+
+    let round_trip_graph = crate::pnpm::parse(out.path()).unwrap();
+    let second_out = tempfile::NamedTempFile::new().unwrap();
+    crate::pnpm::write(second_out.path(), &round_trip_graph, &manifest).unwrap();
+    let second_yaml = std::fs::read_to_string(second_out.path()).unwrap();
+    assert!(
+        second_yaml.contains("tarball: https://npm.example.test/@scope/pkg/-/pkg-1.0.0.tgz"),
+        "{second_yaml}"
+    );
+}
+
+/// A git block's `resolved` is the pinned repo+commit, never a tarball —
+/// keeping it as `tarball_url` would make the writers emit a `tarball:`
+/// that 404s (the non-npmjs-host preserve rule would otherwise carry it
+/// through verbatim). nub's classic reader classifies a pinned git block
+/// as a real `LocalSource::Git`, so the entry is keyed by the FS-safe git
+/// dep_path rather than a registry `name@version`.
+#[test]
+fn classic_parse_does_not_treat_git_resolved_url_as_tarball_url() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"# yarn lockfile v1
+
+"git-pkg@git+https://github.com/acme/git-pkg.git#main":
+  version "1.0.0"
+  resolved "https://github.com/acme/git-pkg.git#abcdef0123456789abcdef0123456789abcdef01"
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(
+        &[("git-pkg", "git+https://github.com/acme/git-pkg.git#main")],
+        &[],
+    );
+    let graph = parse(tmp.path(), &manifest).unwrap();
+    let dep = graph.importers["."]
+        .iter()
+        .find(|d| d.name == "git-pkg")
+        .expect("git direct dep");
+    let pkg = &graph.packages[&dep.dep_path];
+    assert!(
+        pkg.tarball_url.is_none(),
+        "git resolved URL must not be kept as a tarball URL, got {:?}",
+        pkg.tarball_url
+    );
+    let Some(LocalSource::Git(git)) = &pkg.local_source else {
+        panic!("expected a git local source, got {:?}", pkg.local_source);
+    };
+    assert_eq!(git.resolved, "abcdef0123456789abcdef0123456789abcdef01");
 }
 
 #[test]
@@ -104,7 +188,7 @@ fn test_parse_scoped_and_multi_spec() {
 /// in the spec key and the real name only behind the `npm:` value.
 /// Without surfacing the real name into `LockedPackage.alias_of`,
 /// the install path would fetch the alias-qualified URL and 404
-/// (https://github.com/jdx/aube/discussions/681).
+/// (https://github.com/aubepkg/aube/discussions/681).
 #[test]
 fn test_parse_npm_protocol_alias_transitive() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -553,9 +637,9 @@ fn test_parse_berry_skips_builtin_patch_protocol() {
   version: 8
   cacheKey: 10c0
 
-"glob@patch:glob@npm%3A8.1.0#~builtin<compat/glob>":
+"glob@patch:glob@npm%3A8.1.0#builtin<compat/glob>":
   version: 8.1.0
-  resolution: "glob@patch:glob@npm%3A8.1.0#~builtin<compat/glob>"
+  resolution: "glob@patch:glob@npm%3A8.1.0#builtin<compat/glob>"
   checksum: 10c0/patched
   languageName: node
   linkType: hard
@@ -567,6 +651,317 @@ fn test_parse_berry_skips_builtin_patch_protocol() {
     assert!(graph.packages.is_empty());
     assert!(graph.patched_dependencies.is_empty());
     assert!(graph.importers["."].is_empty());
+}
+
+/// `optional!builtin<…>` is the canonical compat-patch spelling in real
+/// yarn 4 lockfiles; it must be skipped like a bare `builtin<…>`.
+#[test]
+fn test_parse_berry_skips_optional_builtin_patch_protocol() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"fsevents@patch:fsevents@npm%3A2.3.2#optional!builtin<compat/fsevents>::version=2.3.2&hash=df0bf1":
+  version: 2.3.2
+  resolution: "fsevents@patch:fsevents@npm%3A2.3.2#optional!builtin<compat/fsevents>::version=2.3.2&hash=df0bf1"
+  checksum: 10c0/patched
+  languageName: node
+  linkType: hard
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(&[("fsevents", "^2.3.2")], &[]);
+    let graph = parse(tmp.path(), &manifest).unwrap();
+
+    assert!(graph.packages.is_empty());
+    assert!(graph.patched_dependencies.is_empty());
+    assert!(graph.importers["."].is_empty());
+}
+
+/// A `&`-joined selector can mix a real project patch with a builtin
+/// compat patch; keep the real file, ignore the builtin segment.
+#[test]
+fn test_parse_berry_composed_patch_keeps_real_file() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"foo@patch:foo@npm%3A1.0.0#./.yarn/patches/foo.patch&optional!builtin<compat/foo>::version=1.0.0&hash=abc123":
+  version: 1.0.0
+  resolution: "foo@patch:foo@npm%3A1.0.0#./.yarn/patches/foo.patch&optional!builtin<compat/foo>::version=1.0.0&hash=abc123"
+  checksum: 10c0/patched
+  languageName: node
+  linkType: hard
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(&[("foo", "^1.0.0")], &[]);
+    let graph = parse(tmp.path(), &manifest).unwrap();
+
+    assert!(graph.packages.contains_key("foo@1.0.0"));
+    assert_eq!(
+        graph
+            .patched_dependencies
+            .get("foo@1.0.0")
+            .map(String::as_str),
+        Some("./.yarn/patches/foo.patch")
+    );
+}
+
+/// Composed selectors are order-independent: builtin segment first, real patch still kept.
+#[test]
+fn test_parse_berry_composed_patch_builtin_first_keeps_real_file() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"foo@patch:foo@npm%3A1.0.0#optional!builtin<compat/foo>&./.yarn/patches/foo.patch::version=1.0.0&hash=abc123":
+  version: 1.0.0
+  resolution: "foo@patch:foo@npm%3A1.0.0#optional!builtin<compat/foo>&./.yarn/patches/foo.patch::version=1.0.0&hash=abc123"
+  checksum: 10c0/patched
+  languageName: node
+  linkType: hard
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(&[("foo", "^1.0.0")], &[]);
+    let graph = parse(tmp.path(), &manifest).unwrap();
+
+    assert!(graph.packages.contains_key("foo@1.0.0"));
+    assert_eq!(
+        graph
+            .patched_dependencies
+            .get("foo@1.0.0")
+            .map(String::as_str),
+        Some("./.yarn/patches/foo.patch")
+    );
+}
+
+/// A selector listing two real patch files can't be represented (aube stores
+/// one patch path per package). Rather than apply only the first and
+/// materialize a package that doesn't match the lockfile, parsing fails
+/// loudly. Yarn permits the form but its CLI never emits it.
+#[test]
+fn test_parse_berry_multiple_real_patches_errors() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"foo@patch:foo@npm%3A1.0.0#./.yarn/patches/a.patch&./.yarn/patches/b.patch::version=1.0.0&hash=abc123":
+  version: 1.0.0
+  resolution: "foo@patch:foo@npm%3A1.0.0#./.yarn/patches/a.patch&./.yarn/patches/b.patch::version=1.0.0&hash=abc123"
+  checksum: 10c0/patched
+  languageName: node
+  linkType: hard
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(&[("foo", "^1.0.0")], &[]);
+    // Pin the failure to the multi-patch guard, not an unrelated parse error,
+    // so this can't pass for the wrong reason.
+    let err = parse(tmp.path(), &manifest).expect_err("multi-patch selector must fail");
+    assert!(
+        err.to_string().contains("multiple patch files"),
+        "expected the multi-patch guard to fire, got: {err}"
+    );
+}
+
+/// Yarn writes project-root-relative patch paths with a `~/` prefix
+/// (the default form, e.g. `#~/.yarn/patches/foo.patch`). The `~/` must
+/// be stripped or the materializer looks for a literal `~` dir and fails.
+#[test]
+fn test_parse_berry_patch_protocol_project_root_tilde() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"ink@patch:ink@npm%3A3.2.0#~/.yarn/patches/ink-npm-3.2.0-2f1df5b094.patch":
+  version: 3.2.0
+  resolution: "ink@patch:ink@npm%3A3.2.0#~/.yarn/patches/ink-npm-3.2.0-2f1df5b094.patch::version=3.2.0&hash=b7953f"
+  checksum: 10c0/patched
+  languageName: node
+  linkType: hard
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(&[("ink", "^3.2.0")], &[]);
+    let graph = parse(tmp.path(), &manifest).unwrap();
+
+    assert!(graph.packages.contains_key("ink@3.2.0"));
+    // The `~/` project-root prefix is stripped (Yarn `onProject`), so the
+    // path resolves against the project root just like a `./` path.
+    assert_eq!(
+        graph
+            .patched_dependencies
+            .get("ink@3.2.0")
+            .map(String::as_str),
+        Some(".yarn/patches/ink-npm-3.2.0-2f1df5b094.patch")
+    );
+}
+
+/// Builtin compat patches coexist with the plain `name@npm:…` block, and
+/// transitive consumers reference the npm spec — skipping the builtin
+/// patch must leave that edge resolving cleanly, never strand the package.
+#[test]
+fn test_parse_berry_builtin_skip_keeps_transitive_npm_edge() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"consumer@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "consumer@npm:1.0.0"
+  dependencies:
+    resolve: "npm:^1.20.0"
+  checksum: 10c0/consumer
+  languageName: node
+  linkType: hard
+
+"resolve@npm:1.22.2, resolve@npm:^1.20.0":
+  version: 1.22.2
+  resolution: "resolve@npm:1.22.2"
+  checksum: 10c0/resolvereal
+  languageName: node
+  linkType: hard
+
+"resolve@patch:resolve@npm%3A1.22.2#optional!builtin<compat/resolve>, resolve@patch:resolve@npm%3A^1.20.0#optional!builtin<compat/resolve>":
+  version: 1.22.2
+  resolution: "resolve@patch:resolve@npm%3A1.22.2#optional!builtin<compat/resolve>::version=1.22.2&hash=c3c19d"
+  checksum: 10c0/resolvepatched
+  languageName: node
+  linkType: hard
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(&[("consumer", "^1.0.0")], &[]);
+    let graph = parse(tmp.path(), &manifest).unwrap();
+
+    // The builtin patch block is skipped: no bogus patch entry, only the
+    // consumer and the real npm resolve survive.
+    assert!(graph.patched_dependencies.is_empty());
+    assert_eq!(graph.packages.len(), 2);
+    assert!(graph.packages.contains_key("consumer@1.0.0"));
+    assert!(graph.packages.contains_key("resolve@1.22.2"));
+
+    // The transitive edge still resolves to the real npm package — the
+    // skip didn't strand it.
+    assert_eq!(
+        graph.packages["consumer@1.0.0"]
+            .dependencies
+            .get("resolve")
+            .map(String::as_str),
+        Some("resolve@1.22.2")
+    );
+}
+
+/// The compat-builtin skip must be identical across every
+/// `__metadata.version` and every spelling Yarn has emitted:
+///   `builtin<…>`           yarn 2.x      (pre-flag)
+///   `~builtin<…>`          yarn 3.0–3.6  (leading-`~` optional flag)
+///   `optional!builtin<…>`  yarn 4.0+     (`!`-delimited flag)
+#[test]
+fn test_parse_berry_builtin_skip_is_meta_version_independent() {
+    for v in [3u64, 6, 8] {
+        for sel in [
+            "builtin<compat/fsevents>",
+            "~builtin<compat/fsevents>",
+            "optional!builtin<compat/fsevents>",
+        ] {
+            let res =
+                format!("fsevents@patch:fsevents@npm%3A2.3.2#{sel}::version=2.3.2&hash=df0bf1");
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let content = format!(
+                "__metadata:\n  version: {v}\n  cacheKey: 10c0\n\n\"{res}\":\n  version: 2.3.2\n  resolution: \"{res}\"\n  checksum: 10c0/patched\n  languageName: node\n  linkType: hard\n"
+            );
+            std::fs::write(tmp.path(), &content).unwrap();
+            let manifest = make_manifest(&[("fsevents", "^2.3.2")], &[]);
+            let graph = parse(tmp.path(), &manifest).unwrap();
+            assert!(
+                graph.packages.is_empty(),
+                "v{v} sel={sel}: package not skipped"
+            );
+            assert!(
+                graph.patched_dependencies.is_empty(),
+                "v{v} sel={sel}: bogus patch recorded"
+            );
+            assert!(
+                graph.importers["."].is_empty(),
+                "v{v} sel={sel}: importer not empty"
+            );
+        }
+    }
+}
+
+/// All-builtin multi-segment selectors (two compat shims joined with `&`) have
+/// no real file to apply, so they classify as `Skip`, never `Multiple`. The
+/// `Multiple` guard counts real paths *after* the builtin filter, so this
+/// guards against a regression that miscounts builtins toward the limit and
+/// wrongly hard-errors a perfectly normal two-builtin block.
+#[test]
+fn test_patch_protocol_all_builtin_multi_is_skip() {
+    let body = "fsevents@npm%3A2.3.2#builtin<compat/a>&optional!builtin<compat/b>::version=2.3.2&hash=df0bf1";
+    assert!(matches!(patch_protocol_path(body), PatchSelector::Skip));
+}
+
+/// Yarn's `optional` flag can prefix a *real* patch, not just a builtin. aube
+/// strips the `!`-delimited flags and keeps the path (it does not yet preserve
+/// the optionality: Yarn tolerates a failed apply, aube treats it as required;
+/// see the investigation's known limitations). Every other `!` test path is a
+/// builtin that gets filtered, so this pins the `!`-strip on a *kept* path.
+#[test]
+fn test_patch_protocol_optional_flag_on_real_patch_keeps_path() {
+    let body = "foo@npm%3A1.0.0#optional!./.yarn/patches/a.patch::version=1.0.0&hash=abc123";
+    assert!(matches!(
+        patch_protocol_path(body),
+        PatchSelector::Single(p) if p == "./.yarn/patches/a.patch"
+    ));
+}
+
+/// One Yarn-shaped patch-selector segment (every form the grammar emits).
+fn berry_patch_segment() -> impl Strategy<Value = String> {
+    let name = "[a-z][a-z0-9._/-]{0,12}";
+    prop_oneof![
+        name.prop_map(|n| format!("builtin<compat/{n}>")),
+        name.prop_map(|n| format!("~builtin<compat/{n}>")),
+        name.prop_map(|n| format!("optional!builtin<compat/{n}>")),
+        name.prop_map(|n| format!("~/.yarn/patches/{n}.patch")),
+        name.prop_map(|n| format!("./.yarn/patches/{n}.patch")),
+        name.prop_map(|n| format!(".yarn/patches/{n}.patch")),
+        name.prop_map(|n| format!("optional!~/.yarn/patches/{n}.patch")),
+    ]
+}
+
+proptest! {
+    /// The bug-class invariant: for any `&`-joined selector of Yarn-shaped
+    /// segments, a `PatchSelector::Single` path is always clean — never a
+    /// leftover `~` prefix and never a `builtin<…>` marker (the exact forms
+    /// that broke installs). Must hold across arbitrary combinations, with or
+    /// without `::`-params.
+    #[test]
+    fn prop_patch_protocol_path_never_leaks_builtin_or_tilde(
+        segments in prop::collection::vec(berry_patch_segment(), 1..4),
+        with_params in any::<bool>(),
+    ) {
+        let params = if with_params { "::version=1.0.0&hash=deadbeef" } else { "" };
+        let body = format!("foo@npm%3A1.0.0#{}{params}", segments.join("&"));
+        if let PatchSelector::Single(p) = patch_protocol_path(&body) {
+            prop_assert!(!p.is_empty(), "empty path from {body}");
+            prop_assert!(!p.starts_with('~'), "leaked ~ prefix {p:?} from {body}");
+            prop_assert!(
+                !(p.starts_with("builtin<") && p.ends_with('>')),
+                "leaked builtin marker {p:?} from {body}"
+            );
+        }
+    }
+
+    /// Robustness: arbitrary garbage after `#` must never panic, and a
+    /// returned path is never empty.
+    #[test]
+    fn prop_patch_protocol_path_no_panic_on_arbitrary_input(selector in ".*") {
+        if let PatchSelector::Single(p) = patch_protocol_path(&format!("foo#{selector}")) {
+            prop_assert!(!p.is_empty());
+        }
+    }
 }
 
 /// Scoped package names (`@types/node`) and the `, `-joined
@@ -639,6 +1034,109 @@ fn test_parse_berry_applies_root_resolution_to_direct_dep() {
     assert_eq!(dep.dep_path, "@types/node@18.19.130");
 }
 
+/// A root `resolutions` pin rewrites a TRANSITIVE descriptor's block key
+/// too, not just a direct dep's: `resolutions: {"picomatch@^2.3.1":
+/// "2.3.2"}` makes yarn key the block `picomatch@npm:2.3.2`, while
+/// micromatch's edge stays `picomatch@npm:^2.3.1`. The reader must apply
+/// the resolution when resolving the transitive edge or the pinned
+/// subtree silently drops from the graph (cal.com's `build-icons`
+/// `Cannot find module 'picomatch'` under a resolutions-pinned tree).
+#[test]
+fn test_parse_berry_applies_root_resolution_to_transitive_edge() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"micromatch@npm:^4.0.8":
+  version: 4.0.8
+  resolution: "micromatch@npm:4.0.8"
+  dependencies:
+    picomatch: "npm:^2.3.1"
+  checksum: 10c0/aaa
+  languageName: node
+  linkType: hard
+
+"picomatch@npm:2.3.2":
+  version: 2.3.2
+  resolution: "picomatch@npm:2.3.2"
+  checksum: 10c0/bbb
+  languageName: node
+  linkType: hard
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let mut manifest = make_manifest(&[("micromatch", "^4.0.8")], &[]);
+    manifest.extra.insert(
+        "resolutions".to_string(),
+        serde_json::json!({ "picomatch@^2.3.1": "2.3.2" }),
+    );
+
+    let graph = parse(tmp.path(), &manifest).unwrap();
+
+    let micromatch = &graph.packages["micromatch@4.0.8"];
+    assert_eq!(
+        micromatch.dependencies.get("picomatch").map(String::as_str),
+        Some("picomatch@2.3.2"),
+        "resolutions-pinned transitive edge must resolve to the rewritten block key"
+    );
+}
+
+/// A `resolutions: {pkg: "patch:pkg@<ver>#./.yarn/patches/<file>"}` pin
+/// resolves to the patch block AND records the patch. Yarn writes the
+/// block header with a trailing `::locator=…` qualifier the resolution
+/// value lacks, so a verbatim match misses and the patched package drops
+/// from the importer (cal.com's `libphonenumber-js` absent at `apps/web`).
+/// The qualifier-stripped descriptor must resolve.
+#[test]
+fn test_parse_berry_resolutions_patch_locator_resolves_and_records_patch() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"libphonenumber-js@npm:1.12.38":
+  version: 1.12.38
+  resolution: "libphonenumber-js@npm:1.12.38"
+  checksum: 10c0/aaa
+  languageName: node
+  linkType: hard
+
+"libphonenumber-js@patch:libphonenumber-js@1.12.38#./.yarn/patches/libphonenumber-js+1.12.38.patch::locator=root%40workspace%3A.":
+  version: 1.12.38
+  resolution: "libphonenumber-js@patch:libphonenumber-js@npm%3A1.12.38#./.yarn/patches/libphonenumber-js+1.12.38.patch::version=1.12.38&hash=18a67d&locator=root%40workspace%3A."
+  checksum: 10c0/bbb
+  languageName: node
+  linkType: hard
+"#;
+    std::fs::write(tmp.path(), content).unwrap();
+
+    let mut manifest = make_manifest(&[("libphonenumber-js", "^1.12.38")], &[]);
+    manifest.extra.insert(
+        "resolutions".to_string(),
+        serde_json::json!({
+            "libphonenumber-js": "patch:libphonenumber-js@1.12.38#./.yarn/patches/libphonenumber-js+1.12.38.patch"
+        }),
+    );
+
+    let graph = parse(tmp.path(), &manifest).unwrap();
+
+    let root = graph.importers.get(".").unwrap();
+    let dep = root
+        .iter()
+        .find(|d| d.name == "libphonenumber-js")
+        .expect("resolutions patch: pin must resolve the direct dep, not drop it");
+    assert_eq!(dep.dep_path, "libphonenumber-js@1.12.38");
+    assert_eq!(
+        graph
+            .patched_dependencies
+            .get("libphonenumber-js@1.12.38")
+            .map(String::as_str),
+        Some("./.yarn/patches/libphonenumber-js+1.12.38.patch"),
+        "the patch file must be recorded so the linker applies it at materialize"
+    );
+}
+
 /// Blocks for the project's own workspace entry shouldn't become
 /// `LockedPackage`s — they're the root importer, not a
 /// resolved dep. Skipping them keeps the graph shape identical to
@@ -672,6 +1170,127 @@ fn test_parse_berry_skips_workspace_root() {
     assert_eq!(graph.packages.len(), 1);
     assert!(graph.packages.contains_key("foo@1.0.0"));
     assert!(!graph.packages.contains_key("my-project@0.0.0-use.local"));
+}
+
+/// A classic yarn.lock never records workspace members (they aren't
+/// registry packages), so a member that depends on a SIBLING member has
+/// no resolution entry to cross-reference. The reconstructed member
+/// importer must still carry that sibling as a workspace-link DirectDep
+/// — a `dep_path` (`name@version`) with NO `packages` entry — so the
+/// linker symlinks the sibling into the consumer's node_modules. Before
+/// the fix the dep was silently dropped and the consumer couldn't
+/// resolve it (the yarn-incumbent bug).
+#[test]
+fn test_classic_member_links_workspace_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true, "workspaces": ["packages/*"] }"#,
+    )
+    .unwrap();
+    for (member, body) in [
+        (
+            "app",
+            r#"{ "name": "@x/app", "version": "1.0.0", "dependencies": { "@x/utils": "1.0.0" } }"#,
+        ),
+        ("utils", r#"{ "name": "@x/utils", "version": "1.0.0" }"#),
+    ] {
+        let mdir = root.join("packages").join(member);
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("package.json"), body).unwrap();
+    }
+    // A genuinely empty classic lockfile — the members are the only deps.
+    let lock = root.join("yarn.lock");
+    std::fs::write(&lock, "# yarn lockfile v1\n").unwrap();
+
+    let manifest = aube_manifest::PackageJson::from_path(&root.join("package.json")).unwrap();
+    let graph = parse(&lock, &manifest).unwrap();
+
+    let app = graph
+        .importers
+        .get("packages/app")
+        .expect("app member importer must be reconstructed");
+    let utils = app
+        .iter()
+        .find(|d| d.name == "@x/utils")
+        .expect("the sibling workspace dep must survive as a DirectDep");
+    assert_eq!(utils.dep_path, "@x/utils@1.0.0");
+    // The workspace-link convention the linker keys on: a DirectDep whose
+    // dep_path has no `packages` entry => link the sibling dir, don't fetch.
+    assert!(
+        !graph.packages.contains_key(&utils.dep_path),
+        "a workspace-sibling dep must NOT have a packages entry"
+    );
+
+    // `utils` has no deps, so its importer is present but empty.
+    assert!(graph.importers.contains_key("packages/utils"));
+}
+
+/// Each arm of the workspace-link match: the `workspace:` protocol
+/// (always links), a `link:`-to-a-member spec (binds by name, path tail
+/// ignored), a SATISFIABLE caret range (the dominant real-world
+/// yarn-classic member-to-member form — exercises `version_satisfies`),
+/// and a bare-semver range the sibling does NOT satisfy (must NOT link —
+/// it resolves from the registry instead). The negative case is the one
+/// that guards against silently substituting the wrong local copy.
+#[test]
+fn test_classic_workspace_protocol_and_range_gating() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true, "workspaces": ["packages/*"] }"#,
+    )
+    .unwrap();
+    for (member, body) in [
+        (
+            "app",
+            r#"{ "name": "@x/app", "version": "1.0.0",
+                "dependencies": {
+                    "@x/proto": "workspace:*",
+                    "@x/portal": "link:../portal",
+                    "@x/caret": "^1.0.0",
+                    "@x/mismatch": "2.0.0"
+                } }"#,
+        ),
+        ("proto", r#"{ "name": "@x/proto", "version": "9.9.9" }"#),
+        ("portal", r#"{ "name": "@x/portal", "version": "0.0.0" }"#),
+        ("caret", r#"{ "name": "@x/caret", "version": "1.4.2" }"#),
+        (
+            "mismatch",
+            r#"{ "name": "@x/mismatch", "version": "1.0.0" }"#,
+        ),
+    ] {
+        let mdir = root.join("packages").join(member);
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("package.json"), body).unwrap();
+    }
+    let lock = root.join("yarn.lock");
+    std::fs::write(&lock, "# yarn lockfile v1\n").unwrap();
+
+    let manifest = aube_manifest::PackageJson::from_path(&root.join("package.json")).unwrap();
+    let graph = parse(&lock, &manifest).unwrap();
+    let app = graph.importers.get("packages/app").unwrap();
+    let links = |name: &str| app.iter().any(|d| d.name == name);
+
+    // `workspace:*` links regardless of the version.
+    assert!(links("@x/proto"), "workspace:* must link the sibling");
+    // `link:`-to-a-member binds by name; the `../portal` path tail is the
+    // on-disk location, not a version constraint.
+    assert!(links("@x/portal"), "link: to a member must link it by name");
+    // `^1.0.0` against a member at `1.4.2` satisfies — the common case.
+    assert!(
+        links("@x/caret"),
+        "a satisfiable caret range must link the sibling"
+    );
+    // `2.0.0` against a sibling at `1.0.0` does NOT satisfy, so it is left
+    // for registry resolution — not silently linked to the wrong local
+    // copy. (No yarn.lock entry exists either, so it's simply absent.)
+    assert!(
+        !links("@x/mismatch"),
+        "an unsatisfied bare-semver range must not link the sibling"
+    );
 }
 
 /// Berry emits `version:` unquoted, so scalar-looking values can
@@ -1746,7 +2365,11 @@ ms@^2.1.3:
 
     // The empty root importer carries no deps; the two members are
     // reconstructed as their own importers with their child deps.
-    assert_eq!(graph.importers["."].len(), 0, "root importer must stay empty");
+    assert_eq!(
+        graph.importers["."].len(),
+        0,
+        "root importer must stay empty"
+    );
     let pkg_a = graph
         .importers
         .get("packages/pkg-a")
@@ -1763,4 +2386,362 @@ ms@^2.1.3:
     assert_eq!(pkg_b.len(), 1);
     assert_eq!(pkg_b[0].name, "kleur");
     assert_eq!(pkg_b[0].dep_path, "kleur@4.1.5");
+}
+
+// ── strict_unsupported_source: gating + classifier ──────────────────────────
+//
+// These run under the DEFAULT (standalone-aube) embedder — `strict_unsupported_source`
+// is false — so they assert the historical lenient behavior is byte-identical
+// (the strict/fatal path is exercised in `tests/unsupported_source.rs`, which
+// registers a strict profile in its own process).
+
+#[test]
+fn lenient_berry_jsr_dep_is_warn_dropped_not_fatal() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\"foo@jsr:^1.0.0\":\n  version: 1.0.0\n  resolution: \"foo@jsr:1.0.0\"\n  languageName: node\n  linkType: hard\n";
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(&[("foo", "jsr:^1.0.0")], &[]);
+    let graph = parse(tmp.path(), &manifest).expect("default embedder must not fatal");
+    // Historical behavior: the jsr block is dropped, so `foo` never lands.
+    assert!(!graph.importers["."].iter().any(|d| d.name == "foo"));
+}
+
+#[test]
+fn classic_git_dep_resolves_to_git_source_under_default_embedder() {
+    // Git resolution is a universal reader bug-fix, NOT gated on the strict
+    // embedder: under the default (standalone-aube) profile a git block now
+    // resolves to a `LocalSource::Git` pinned from its `resolved` URL, instead
+    // of the old reclassify to a registry `name@version` that 404s at fetch.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let sha = "abcdef0123456789abcdef0123456789abcdef01";
+    let spec = format!("git+https://github.com/u/r.git#{sha}");
+    let content = format!(
+        "# yarn lockfile v1\n\n\"foo@{spec}\":\n  version \"1.0.0\"\n  resolved \"{spec}\"\n"
+    );
+    std::fs::write(tmp.path(), &content).unwrap();
+    let manifest = make_manifest(&[("foo", &spec)], &[]);
+    let graph = parse(tmp.path(), &manifest).expect("default embedder must not fatal");
+    assert!(graph.importers["."].iter().any(|d| d.name == "foo"));
+    let pkg = graph
+        .packages
+        .values()
+        .find(|p| p.name == "foo")
+        .expect("foo must be in the graph");
+    let Some(LocalSource::Git(git)) = &pkg.local_source else {
+        panic!("expected git LocalSource, got {:?}", pkg.local_source);
+    };
+    assert_eq!(git.url, "https://github.com/u/r.git");
+    assert_eq!(git.resolved, sha);
+}
+
+// The exact yarn.lock yarn@1.22.22 writes for the `git-dep` conformance
+// fixture: a `git+https://…#<sha>` URL dep (`ms`) and a `github:owner/repo#ref`
+// shorthand (`is-number`). #217 mis-classified both as `Unsupported`, aborting
+// the frozen install npm/pnpm/bun all accept (the lockfile-roundtrip nightly
+// regression). They must read back as resolvable git sources: the URL form a
+// plain `LocalSource::Git` pinned to its SHA, the shorthand the codeload-tarball
+// stand-in (`RemoteTarball { git_hosted: true }`), with the pinned SHA the
+// `resolved` line carries — NOT the spec range's `7.0.0` tag.
+#[test]
+fn classic_git_deps_read_back_as_resolvable_git_sources() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = "\
+# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.
+# yarn lockfile v1
+
+
+\"is-number@github:jonschlinkert/is-number#7.0.0\":
+  version \"7.0.0\"
+  resolved \"https://codeload.github.com/jonschlinkert/is-number/tar.gz/98e8ff1da1a89f93d1397a24d7413ed15421c139\"
+
+\"ms@git+https://github.com/vercel/ms.git#1c6264b795492e8fdecbc82cb8802fcfbfc08d26\":
+  version \"2.1.3\"
+  resolved \"git+https://github.com/vercel/ms.git#1c6264b795492e8fdecbc82cb8802fcfbfc08d26\"
+";
+    std::fs::write(tmp.path(), content).unwrap();
+    let manifest = make_manifest(
+        &[
+            (
+                "ms",
+                "git+https://github.com/vercel/ms.git#1c6264b795492e8fdecbc82cb8802fcfbfc08d26",
+            ),
+            ("is-number", "github:jonschlinkert/is-number#7.0.0"),
+        ],
+        &[],
+    );
+    let graph = parse(tmp.path(), &manifest).expect("git deps must parse, not abort");
+
+    let by_name: BTreeMap<&str, &LockedPackage> = graph
+        .packages
+        .values()
+        .map(|p| (p.name.as_str(), p))
+        .collect();
+
+    let Some(LocalSource::Git(ms)) = &by_name["ms"].local_source else {
+        panic!(
+            "ms must be a git source, got {:?}",
+            by_name["ms"].local_source
+        );
+    };
+    assert_eq!(ms.url, "https://github.com/vercel/ms.git");
+    assert_eq!(ms.resolved, "1c6264b795492e8fdecbc82cb8802fcfbfc08d26");
+    assert_eq!(by_name["ms"].version, "2.1.3");
+
+    let Some(LocalSource::RemoteTarball(is_number)) = &by_name["is-number"].local_source else {
+        panic!(
+            "is-number must be a hosted-git tarball, got {:?}",
+            by_name["is-number"].local_source
+        );
+    };
+    assert!(is_number.git_hosted);
+    assert_eq!(
+        is_number.url,
+        "https://codeload.github.com/jonschlinkert/is-number/tar.gz/98e8ff1da1a89f93d1397a24d7413ed15421c139"
+    );
+
+    // Both direct deps resolve (their manifest range matches the block spec key).
+    for dep in ["ms", "is-number"] {
+        assert!(
+            graph.importers["."].iter().any(|d| d.name == dep),
+            "{dep} must be a resolved direct dep"
+        );
+    }
+}
+
+#[test]
+fn classic_local_source_classification() {
+    use super::classic::{ClassicSource, classic_local_source};
+    let is = |spec: &str, resolved: Option<&str>| classic_local_source(spec, "foo", resolved);
+    // Registry-resolvable: semver ranges, dist-tags, and npm-aliases.
+    assert!(matches!(is("foo@^1.0.0", None), ClassicSource::Registry));
+    assert!(matches!(is("foo@latest", None), ClassicSource::Registry));
+    assert!(matches!(
+        is("foo@>=1.0.0 <2.0.0", None),
+        ClassicSource::Registry
+    ));
+    assert!(matches!(
+        is("foo@npm:@scope/real@1.2.3", None),
+        ClassicSource::Registry
+    ));
+    // Local on-disk sources.
+    assert!(matches!(is("foo@link:./x", None), ClassicSource::Local(_)));
+    assert!(matches!(
+        is("foo@file:./x.tgz", None),
+        ClassicSource::Local(_)
+    ));
+    assert!(matches!(
+        is("foo@portal:./x", None),
+        ClassicSource::Local(_)
+    ));
+    // Git deps resolve from the block's `resolved` URL. A `git+…#<sha>` URL
+    // → `LocalSource::Git`; a hosted-shorthand's codeload archive →
+    // `RemoteTarball { git_hosted: true }`. Both the explicit-protocol and the
+    // bare `user/repo#ref` spellings classify the same way.
+    let sha = "abcdef0123456789abcdef0123456789abcdef01";
+    let git_url = format!("git+https://github.com/u/r.git#{sha}");
+    assert!(matches!(
+        is(&format!("foo@{git_url}"), Some(git_url.as_str())),
+        ClassicSource::Local(LocalSource::Git(_))
+    ));
+    let codeload = format!("https://codeload.github.com/u/r/tar.gz/{sha}");
+    assert!(matches!(
+        is("foo@user/repo#7.0.0", Some(codeload.as_str())),
+        ClassicSource::Local(LocalSource::RemoteTarball(_))
+    ));
+    // A git spec whose `resolved` carries no pinned commit can't be
+    // reproduced by a frozen install — it stays `Unsupported`, NOT a silent
+    // registry reclassify that 404s at fetch.
+    assert!(matches!(
+        is("foo@git+https://h/r.git#c", None),
+        ClassicSource::Unsupported(_)
+    ));
+    assert!(matches!(
+        is("foo@user/repo#ref", None),
+        ClassicSource::Unsupported(_)
+    ));
+    assert_eq!(
+        is("foo@user/repo#semver:^1.2.3", None),
+        ClassicSource::Unsupported("git".to_string())
+    );
+    // A genuinely unresolvable non-git protocol stays `Unsupported` with its
+    // own token regardless of `resolved`.
+    assert_eq!(
+        is("foo@jsr:^1.0.0", None),
+        ClassicSource::Unsupported("jsr".to_string())
+    );
+}
+
+proptest::proptest! {
+    /// A registry-shaped range (semver, no protocol `:` and no `/`) must
+    /// ALWAYS classify as `Registry` — never a false-positive `Unsupported`
+    /// that would turn a valid yarn.lock into an eager fatal under nub.
+    #[test]
+    fn registry_ranges_never_classify_unsupported(
+        range in r"[\^~]?[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}",
+    ) {
+        use super::classic::{ClassicSource, classic_local_source};
+        let spec = format!("foo@{range}");
+        proptest::prop_assert!(matches!(
+            classic_local_source(&spec, "foo", None),
+            ClassicSource::Registry
+        ));
+    }
+}
+
+/// A berry (v2+) yarn.lock records a `@name@workspace:<path>` block per
+/// member, but merges each member's `dependencies` + `devDependencies` into
+/// one block field. The reader reconstructs member importers from the on-disk
+/// member manifests instead (like the classic reader), so the dev/prod split
+/// is exact. Before the fix a frozen install linked only the root and silently
+/// skipped every member (the cal.com 114-workspace bug: exit 0, members absent).
+#[test]
+fn test_berry_member_importer_split_by_dep_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true, "workspaces": ["packages/*"] }"#,
+    )
+    .unwrap();
+    let app = root.join("packages/app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{ "name": "@x/app", "version": "1.0.0",
+             "dependencies": { "is-odd": "3.0.1" },
+             "devDependencies": { "is-number": "6.0.0" } }"#,
+    )
+    .unwrap();
+
+    let lock = root.join("yarn.lock");
+    std::fs::write(
+        &lock,
+        r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"@x/app@workspace:packages/app":
+  version: 0.0.0-use.local
+  resolution: "@x/app@workspace:packages/app"
+  dependencies:
+    is-number: "npm:6.0.0"
+    is-odd: "npm:3.0.1"
+  languageName: unknown
+  linkType: soft
+
+"is-number@npm:6.0.0":
+  version: 6.0.0
+  resolution: "is-number@npm:6.0.0"
+  languageName: node
+  linkType: hard
+
+"is-odd@npm:3.0.1":
+  version: 3.0.1
+  resolution: "is-odd@npm:3.0.1"
+  dependencies:
+    is-number: "npm:^6.0.0"
+  languageName: node
+  linkType: hard
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+"#,
+    )
+    .unwrap();
+
+    let manifest = aube_manifest::PackageJson::from_path(&root.join("package.json")).unwrap();
+    let graph = parse(&lock, &manifest).unwrap();
+
+    let member = graph
+        .importers
+        .get("packages/app")
+        .expect("member importer must be reconstructed from disk");
+    let odd = member
+        .iter()
+        .find(|d| d.name == "is-odd")
+        .expect("prod dep");
+    let num = member
+        .iter()
+        .find(|d| d.name == "is-number")
+        .expect("dev dep");
+    assert_eq!(odd.dep_path, "is-odd@3.0.1");
+    assert_eq!(odd.dep_type, DepType::Production);
+    // The lockfile merges dep types into one field; reading the manifest keeps
+    // the split exact — is-number stays a devDependency.
+    assert_eq!(num.dep_type, DepType::Dev);
+}
+
+/// A berry member that depends on a workspace SIBLING via `workspace:*` links
+/// to the local member: the reconstructed importer carries a DirectDep whose
+/// `dep_path` (`name@version`) has NO `packages` entry, the convention the
+/// linker keys on to symlink the sibling rather than fetch it.
+#[test]
+fn test_berry_member_links_workspace_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "root", "private": true, "workspaces": ["packages/*"] }"#,
+    )
+    .unwrap();
+    for (member, body) in [
+        (
+            "app",
+            r#"{ "name": "@x/app", "version": "1.0.0", "dependencies": { "@x/utils": "workspace:*" } }"#,
+        ),
+        ("utils", r#"{ "name": "@x/utils", "version": "1.0.0" }"#),
+    ] {
+        let mdir = root.join("packages").join(member);
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("package.json"), body).unwrap();
+    }
+    let lock = root.join("yarn.lock");
+    std::fs::write(
+        &lock,
+        r#"__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"@x/app@workspace:packages/app":
+  version: 0.0.0-use.local
+  resolution: "@x/app@workspace:packages/app"
+  dependencies:
+    "@x/utils": "workspace:*"
+  languageName: unknown
+  linkType: soft
+
+"@x/utils@workspace:*, @x/utils@workspace:packages/utils":
+  version: 0.0.0-use.local
+  resolution: "@x/utils@workspace:packages/utils"
+  languageName: unknown
+  linkType: soft
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+"#,
+    )
+    .unwrap();
+
+    let manifest = aube_manifest::PackageJson::from_path(&root.join("package.json")).unwrap();
+    let graph = parse(&lock, &manifest).unwrap();
+
+    let app = graph
+        .importers
+        .get("packages/app")
+        .expect("app member importer must be reconstructed");
+    let utils = app
+        .iter()
+        .find(|d| d.name == "@x/utils")
+        .expect("the sibling workspace dep must survive as a DirectDep");
+    assert!(
+        !graph.packages.contains_key(&utils.dep_path),
+        "a workspace-sibling dep must NOT have a packages entry"
+    );
+    assert!(graph.importers.contains_key("packages/utils"));
 }

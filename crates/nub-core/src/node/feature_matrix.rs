@@ -7,7 +7,7 @@
 //! this table (it iterates [`FEATURES`]); the webstorage gating predicates are
 //! derived from it too. There is no second copy of the bands to drift against.
 //!
-//! ## The three mitigation shapes
+//! ## The mitigation shapes
 //!
 //! A feature reaches the user through exactly one of these per Node version:
 //!
@@ -17,18 +17,36 @@
 //!   the flag does not exist is a hard "bad option" / "not allowed in
 //!   NODE_OPTIONS" startup abort — so the bands are tuned to the exact range
 //!   where the flag both exists and is needed.)
+//! - **`UnflagArgv(flag)`** — the same idea for a **V8** flag that Node accepts
+//!   ONLY on the command line. These are absent from
+//!   `process.allowedNodeEnvironmentFlags` and Node aborts on them in
+//!   `NODE_OPTIONS`, so they must never enter the NODE_OPTIONS-bound inject set.
+//!   [`unflag_flags_for`] deliberately does not match this variant;
+//!   [`argv_unflag_flags_for`] serves the argv-bearing call sites instead.
+//! - **`RuntimeV8Flag(flag)`** — a **V8** flag the preload turns on from INSIDE the
+//!   process with `v8.setFlagsFromString`, the first time it loads a module whose
+//!   source uses the syntax the flag gates. Sound only for a flag V8 consults per
+//!   parse; for such a flag it is equivalent to argv, and it leaves V8's flags at
+//!   their defaults for every program that never uses the syntax — a V8 flag that
+//!   is non-default at startup makes Node reject its embedded builtin code cache
+//!   for every internal compiled afterwards. Never enters argv or `NODE_OPTIONS`;
+//!   [`runtime_v8_flags_for`] serves the spawn sites, which hand the set to the
+//!   preload through `super::flags::RUNTIME_V8_FLAGS_ENV`.
 //! - **`StorageFile`** — webstorage-specific: the global is native (or unflagged)
 //!   but still needs a runtime-computed `--localstorage-file=<path>` to
 //!   materialize. The path is workspace-keyed, so it lives in `spawn.rs`; this
 //!   row records the *floor* and *intent*, not the path.
 //! - **`Polyfill { runtime_file, global }`** — no Node version ships it (or the
 //!   floor doesn't), so nub installs a JS polyfill from `runtime/<file>`, gated
-//!   at runtime by a `typeof <global>` feature-detect. The matrix records the
+//!   at runtime by a `typeof <global>` feature-detect (`"key" in owner` for an
+//!   accessor, whose getter throws on its prototype). The matrix records the
 //!   intent + the floor; it does **not** version-gate the polyfill in Rust (the
 //!   polyfill bows out on its own when the global is already present). A unit
 //!   test asserts each named file exists and contains the named feature-detect.
-//! - **`Absent`** — below the feature's floor nub does nothing and the feature is
-//!   simply unavailable (the honest compat-tier outcome).
+//!
+//! Below a feature's floor no band matches (`mitigation_for` returns `None`):
+//! nub does nothing and the feature is simply unavailable (the honest
+//! compat-tier outcome).
 //!
 //! ## Why this is THE place
 //!
@@ -41,7 +59,7 @@
 //! audited for exactness and must be corrected in place, never silently dropped.
 //! NOTE the site sync is MANUAL — nothing programmatic consumes this table for
 //! copy, so an edit to a row requires a matching pass over site/content (the
-//! Modern APIs tables) by hand.
+//! Modern APIs page) by hand.
 //!
 //! ## How to add a feature
 //!
@@ -64,17 +82,17 @@ use super::version::NodeVersion;
 /// iff `lo <= v && (hi.is_none() || v < hi)`.
 #[derive(Clone)]
 pub struct VersionBand {
-    pub lo: NodeVersion,
-    pub hi: Option<NodeVersion>,
+    lo: NodeVersion,
+    hi: Option<NodeVersion>,
 }
 
 impl VersionBand {
-    pub const fn new(lo: NodeVersion, hi: Option<NodeVersion>) -> Self {
+    const fn new(lo: NodeVersion, hi: Option<NodeVersion>) -> Self {
         Self { lo, hi }
     }
 
     /// Whether `v` falls in this `[lo, hi)` band.
-    pub fn contains(&self, v: &NodeVersion) -> bool {
+    fn contains(&self, v: &NodeVersion) -> bool {
         *v >= self.lo && self.hi.as_ref().is_none_or(|hi| v < hi)
     }
 }
@@ -87,6 +105,18 @@ pub enum Mitigation {
     Native,
     /// nub injects this experimental flag (it exists here and is still required).
     Unflag(&'static str),
+    /// nub injects this V8 flag as ARGV ONLY. Distinct from [`Mitigation::Unflag`]
+    /// because Node refuses these in `NODE_OPTIONS` — they are absent from
+    /// `process.allowedNodeEnvironmentFlags`, so both the NODE_OPTIONS-bound
+    /// script-runner path and `compute_inject_flags`' accepted-flag intersection
+    /// would mishandle them. See [`argv_unflag_flags_for`].
+    UnflagArgv(&'static str),
+    /// The preload turns this V8 flag on from inside the process, the first time it
+    /// loads a module whose source uses the syntax the flag gates. Only sound for a
+    /// flag V8 reads per parse (a `v8_flags.<x>` check in the parser, no
+    /// isolate-creation state) — see the `import-defer` row for the proof shape.
+    /// Never enters argv or `NODE_OPTIONS`. See [`runtime_v8_flags_for`].
+    RuntimeV8Flag(&'static str),
     /// Webstorage: the global is native/unflagged but still needs a
     /// runtime-computed `--localstorage-file=<path>` (handled in spawn.rs).
     StorageFile,
@@ -97,24 +127,26 @@ pub enum Mitigation {
         runtime_file: &'static str,
         global: &'static str,
     },
-    /// Below the feature's floor: nub does nothing, the feature is unavailable.
-    Absent,
 }
 
 /// One user-facing runtime feature and its per-version mitigation.
-pub struct Feature {
+pub(crate) struct Feature {
     /// Stable, human-readable feature name (unique across the table).
-    pub name: &'static str,
+    name: &'static str,
     /// The per-version mitigation bands, sorted ascending and non-overlapping.
     /// A version's mitigation is the band it falls into (or "nothing" if none).
-    pub mitigations: &'static [(VersionBand, Mitigation)],
+    mitigations: &'static [(VersionBand, Mitigation)],
     /// Changelog / PR citation for the whole feature (the bands' evidence).
-    pub evidence: &'static str,
+    /// Documentation-as-data: nothing in the production path reads it (hence the
+    /// allow — the lib target can't see the cfg(test) reader); the
+    /// `every_row_carries_changelog_evidence` test enforces it stays populated.
+    #[allow(dead_code)]
+    evidence: &'static str,
 }
 
 impl Feature {
     /// The mitigation that applies to `v` — the band it falls into, if any.
-    pub fn mitigation_for(&self, v: &NodeVersion) -> Option<Mitigation> {
+    pub(crate) fn mitigation_for(&self, v: &NodeVersion) -> Option<Mitigation> {
         self.mitigations
             .iter()
             .find(|(band, _)| band.contains(v))
@@ -135,7 +167,55 @@ const fn band(lo: (u32, u32, u32), hi: Option<(u32, u32, u32)>) -> VersionBand {
 /// feature with its per-version mitigation and changelog evidence. Everything
 /// version-keyed in [`super::flags`] and the webstorage predicates is derived
 /// from this — do not add a parallel table elsewhere.
-pub static FEATURES: &[Feature] = &[
+// @lat: [[architecture#Architecture#Feature support across Node versions]]
+static FEATURES: &[Feature] = &[
+    // ── util.debounce / util.throttle ──────────────────────────────────────
+    // Native in 26.10 and backported to 24.22. 25.x reached end of life without
+    // the backport, so the row has a hole there, the same shape as URL.parse.
+    Feature {
+        name: "util.debounce",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((24, 22, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "util/rate.cjs",
+                    global: "util.debounce",
+                },
+            ),
+            (band((24, 22, 0), Some((25, 0, 0))), Mitigation::Native),
+            (
+                band((25, 0, 0), Some((26, 10, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "util/rate.cjs",
+                    global: "util.debounce",
+                },
+            ),
+            (band((26, 10, 0), None), Mitigation::Native),
+        ],
+        evidence: "nodejs/node#65899; native 26.10.0, backported to 24.22.0; 25.x never got it",
+    },
+    Feature {
+        name: "util.throttle",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((24, 22, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "util/rate.cjs",
+                    global: "util.throttle",
+                },
+            ),
+            (band((24, 22, 0), Some((25, 0, 0))), Mitigation::Native),
+            (
+                band((25, 0, 0), Some((26, 10, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "util/rate.cjs",
+                    global: "util.throttle",
+                },
+            ),
+            (band((26, 10, 0), None), Mitigation::Native),
+        ],
+        evidence: "nodejs/node#65899; native 26.10.0, backported to 24.22.0; 25.x never got it",
+    },
     // ── vm.Module / vm.SourceTextModule ────────────────────────────────────
     // Flag added in Node 9.6.0 (#14253) and NEVER unflagged through Node 26 —
     // `vm.Module` stays experimental and the flag is always required. So inject
@@ -149,29 +229,34 @@ pub static FEATURES: &[Feature] = &[
         )],
         evidence: "flag added Node 9.6.0 (#14253); never unflagged through Node 26",
     },
-    // ── ShadowRealm global ──────────────────────────────────────────────────
-    // `--experimental-shadow-realm` gates `globalThis.ShadowRealm` (TC39 Stage 3:
-    // an isolated global with fresh intrinsics). The flag was added in Node
-    // 18.13.0 / 19.0.0 — below nub's 18.19 floor — and has NEVER been made
-    // default-on through Node 26 (still experimental, rides the V8
-    // `--harmony-shadow-realm` staging). So, like vm-modules, inject across the
-    // ENTIRE supported floor: [18.19.0, ∞). It survives as an accepted bool at
-    // every higher version, so the open-ended band never over-injects into an
-    // unsupported range.
-    Feature {
-        name: "shadow-realm",
-        mitigations: &[(
-            band((18, 19, 0), None),
-            Mitigation::Unflag("--experimental-shadow-realm"),
-        )],
-        evidence: "flag added Node 18.13.0/19.0.0; never default-on through 26 (TC39 Stage 3)",
-    },
+    // ── ShadowRealm — DELIBERATELY NOT AUTO-UNFLAGGED (the harmony-flag policy) ──
+    // POLICY (load-bearing — enforced by `no_v8_harmony_flag_in_unflag_set` and
+    // listed in V8_HARMONY_UNFLAG_DENYLIST below): nub NEVER auto-injects a V8
+    // *harmony* / startup-snapshot-affecting flag into the tree-wide NODE_OPTIONS.
+    // `--experimental-shadow-realm` implies V8's `--harmony-shadow-realm`, which is
+    // part of the isolate's V8-flag hash. NODE_OPTIONS is inherited by the WHOLE
+    // process subtree, including EMBEDDED Node runtimes that boot from a V8 context
+    // SNAPSHOT (Electron). When the runtime V8-flag hash ≠ the snapshot's, V8's
+    // `Context::FromSnapshot` returns empty and `node::CreateEnvironment` aborts on a
+    // failed CHECK — an EXC_BREAKPOINT/SIGTRAP crash BEFORE any preload JS runs, so
+    // no in-process self-disable can catch it (issue #246: Electron 42.5.1 / Node
+    // 24.17 / V8 14.8 crashed deterministically on this flag alone; Electron 37 /
+    // V8 13.8 tolerated it — the breakage is V8-snapshot-version-dependent, which is
+    // exactly why this is a categorical ban, not a per-version carve-out). Node
+    // itself rejects the same flag in Worker execArgv (ERR_WORKER_INVALID_EXEC_ARGV);
+    // runtime/worker-polyfill.mjs already strips it for the same harmony reason.
+    // Only snapshot-NEUTRAL Node feature flags (vm-modules, eventsource, sqlite, …)
+    // are safe to auto-unflag. The cost of NOT injecting: `globalThis.ShadowRealm`
+    // (TC39 Stage 3) is no longer auto-provided — deferred until Node ships it
+    // default-on, at which point no flag is needed and the snapshot hazard is gone.
+    // Full rationale + evidence: internal/runtime/harmony-flag-policy.md.
+    //
     // ── EventSource global ──────────────────────────────────────────────────
     // #51575 ("add EventSource Client"). Landed on the 22.x line at 22.3.0 and was
     // backported to the 20.x LTS line at 20.18.0. The 21.x line was already EOL
     // when it landed, so the flag NEVER existed there — injecting it on any 21.x
     // is a "bad option" startup crash. Never unflagged through 26. Injection set:
-    // [20.18.0, 21.0.0) ∪ [22.3.0, ∞). Below 20.18 it is Absent.
+    // [20.18.0, 21.0.0) ∪ [22.3.0, ∞). Below 20.18 the feature is absent (no band).
     Feature {
         name: "eventsource",
         mitigations: &[
@@ -258,6 +343,227 @@ pub static FEATURES: &[Feature] = &[
         ],
         evidence: "flag added 23.6.0 (23.x) / 22.20.0 (22.x backport); Stability 1.0; never default-on through Node 27",
     },
+    // ── import-text (importing source as text via import attributes) ─────────
+    // `import txt from './x.txt' with { type: 'text' }` — the module's default export
+    // is the file's string contents. Node gained this behind `--experimental-import-text`
+    // on the 26.x line at 26.5.0 (SEMVER-MINOR, #62300), then backported it to the 24.x
+    // LTS line at 24.19.0 (24.18.1 does not have it). Where the flag does not exist —
+    // below 24.19.0, and the whole 25.x line, which ended at 25.9.0 before the backport —
+    // injecting it is a "bad option" startup abort, so those are holes. It is still
+    // flag-gated (never default-on) through Node 27 nightly, hence the open-ended upper
+    // band: [24.19.0, 25.0.0) ∪ [26.5.0, ∞).
+    //
+    // This row is ONLY the native side. nub ALSO provides import-text on EVERY version
+    // that can parse the `with` syntax (Node 18.20+) via a loader polyfill —
+    // `loadTextImport` in runtime/transform-core.mjs, dispatched by the load hooks on
+    // `importAttributes.type === "text"`. Per the additive contract, the fast-tier hook
+    // (preload-common.cjs) feature-detects native support (`--experimental-import-text`
+    // in `process.allowedNodeEnvironmentFlags`) and STEPS ASIDE to Node's own
+    // textStrategy there; elsewhere the polyfill owns it. That detection asks whether the
+    // running binary KNOWS the flag, so these bands must cover every release that knows
+    // it — a version nub steps aside on but does not inject for lands in Node's default
+    // loader and dies with ERR_UNKNOWN_FILE_EXTENSION (#688, the 24.19.0 backport). The
+    // polyfill is a load-hook, not a typeof-global, so it does not fit the `Polyfill`
+    // mitigation shape and lives in the runtime rather than as a band here.
+    Feature {
+        name: "import-text",
+        mitigations: &[
+            (
+                band((24, 19, 0), Some((25, 0, 0))),
+                Mitigation::Unflag("--experimental-import-text"),
+            ),
+            (
+                band((26, 5, 0), None),
+                Mitigation::Unflag("--experimental-import-text"),
+            ),
+        ],
+        evidence: "flag added Node 26.5.0 (#62300), backported to 24.19.0; absent on 24.18.1 and the whole 25.x line; still flag-gated through Node 27 nightly; nub loader-polyfills below via runtime/transform-core.mjs loadTextImport",
+    },
+    // ── Deferred module evaluation (`import defer`) ──────────────────────────
+    // TC39 proposal-defer-import-eval: `import defer * as ns from "m"` resolves and
+    // LINKS `m` but does not EVALUATE it until the first property access on `ns`.
+    // The enabling flag is V8's `--js-defer-import-eval` (V8's
+    // JAVASCRIPT_INPROGRESS_FEATURES_BASE), not a Node `--experimental-*` flag. Node
+    // REFUSES it in NODE_OPTIONS in BOTH polarities ("--js-defer-import-eval is not
+    // allowed in NODE_OPTIONS") and omits it from `process.allowedNodeEnvironmentFlags`,
+    // so a plain `Unflag` row would be silently dropped by `compute_inject_flags`'
+    // Stage-4 accepted-flag intersection whenever that probe succeeds, and would abort
+    // the script-runner child (which must send every flag through NODE_OPTIONS)
+    // whenever it does not.
+    //
+    // The only `RuntimeV8Flag` row: the preload turns the flag on with
+    // `v8.setFlagsFromString` the first time it loads a module whose source uses the
+    // syntax (runtime/transform-core.mjs `noteRuntimeV8FlagSource`), instead of nub
+    // putting it on argv at launch. Sound because V8 consults
+    // `v8_flags.js_defer_import_eval` only in the parser (parser.cc
+    // ParseImportDeclaration and parser-base.h ParseImportExpressions, with an empty
+    // bootstrapper hook), Node runs V8 with `--no-freeze-flags-after-init`, and the
+    // load hook returns the source BEFORE Node compiles it, so the module that needs
+    // the flag is parsed with it on. Verified on 26.4.0 and 26.7.0: a hook-time flip
+    // defers identically to the argv flag.
+    //
+    // Why not argv: a V8 flag that is non-default at startup enters V8's flag hash
+    // (`ComputeFlagListHash` skips only defaults plus a short exclusion list), and the
+    // code cache Node embeds for its own internals is keyed on that hash — every
+    // builtin compiled AFTER startup (`node:http`, `crypto`, `zlib`, …) is rejected
+    // with kFlagsMismatch and rebuilt from source. Measured on 26.7.0 through
+    // `internalBinding('builtins').getCacheUsage()`: 104 builtins from cache and 0
+    // without under default flags, 0 and 104 with the flag on argv; a program loading
+    // http, crypto, zlib, stream/web and worker_threads goes 44.8 → 66.0 ms (min of
+    // 80 runs). The bare bootstrap is unaffected (30.5 vs 30.4 ms), so the cost is the
+    // builtin code cache, not the startup snapshot. With the flip, a program that never
+    // uses the syntax pays nothing, and one that does pays only for the internals
+    // loaded after the flip. It also keeps the flag out of `process.execArgv`
+    // entirely, where forwarding it into a Worker once killed a Next.js 16 + Turbopack
+    // build (ERR_WORKER_INVALID_EXEC_ARGV).
+    //
+    // The 26.4.0 floor is a NODE floor, not a V8-flag floor: V8 has carried the flag
+    // since Node 26.0, but Node only wired the defer phase through in #63712 (landed
+    // 2026-06-16, first released in 26.4.0). Verified against real Node — 25.9.0
+    // rejects the flag outright ("bad option"); 26.0/26.1/26.2/26.3 accept it and then
+    // abort in `to_phase_constant` (module_wrap.cc:561) the moment a deferred import is
+    // evaluated; 26.4.0 and 26.5.0 defer correctly. The argv probe that guards a future
+    // removal of the flag (`accepts_argv_flag`) gates this row too: a flag V8 no longer
+    // knows is an "Error: unrecognized flag" on stderr from `setFlagsFromString`.
+    //
+    // Snapshot safety, since this is a V8 flag and #246 is the cautionary tale: the flag
+    // never rides NODE_OPTIONS (Node refuses it there) and no longer rides argv, so a
+    // downstream Electron binary can never meet it at startup. The env var that carries
+    // the row to the preload is stamped with the Node version it was computed for, and
+    // the preload ignores it under any other Node.
+    //
+    // ADDITIVITY, stated plainly. The STATIC form is genuinely additive: previously a
+    // `SyntaxError`, now valid, and the flag turns on only for a program that writes
+    // it. The dynamic form `import.defer(spec)` is deliberately NOT part of the
+    // detection: it aborts the process on every 26.x measured (26.4–26.7, V8 fatal
+    // "unreachable code", exit 133), so a program that uses only the dynamic form keeps
+    // bare Node's catchable `SyntaxError`. What remains: once a program has used the
+    // static form, the flag is on for the whole process, and a later `import.defer()`
+    // in that program dies on the fatal instead of the SyntaxError — bounded to
+    // programs already opted in by their own syntax. Source V8 parses without passing
+    // through the load hook (`vm.SourceTextModule`) does not trigger the flip; an
+    // `-e`/`--print` string does, because the preload scans `process.execArgv`.
+    Feature {
+        name: "import-defer",
+        mitigations: &[(
+            band((26, 4, 0), None),
+            Mitigation::RuntimeV8Flag("--js-defer-import-eval"),
+        )],
+        evidence: "V8 js_defer_import_eval (JAVASCRIPT_INPROGRESS_FEATURES_BASE); Node wiring #63712 landed 2026-06-16, first released 26.4.0; verified 25.9 rejects, 26.0-26.3 abort in to_phase_constant, 26.4/26.5 defer correctly",
+    },
+    // ── Module syntax detection (ambiguous ESM `.js`) ────────────────────────
+    // `--experimental-detect-module` makes Node parse an ambiguous file — ES-module
+    // syntax, a `.js` extension, and a `package.json` with no `"type"` field — and run it
+    // as ESM when module syntax is found. Bare Node below the default-on cutover refuses
+    // such a file ("To load an ES module, set type: module", exit 1). Introduced on the
+    // 21.x line at 21.1.0 (#50096) and backported to the 20.x LTS line at 20.10.0; the
+    // 21.0.0 release predates the flag, so injecting it there is a "bad option" startup
+    // abort (the same EOL-line hole as eventsource). It became default-on (flag →
+    // default-true, no longer required) at 20.19.0 on the 20.x line and 22.7.0 on the 22.x
+    // line (#53619, "unflag detect-module"). Inject only where the flag both EXISTS and is
+    // still REQUIRED: [20.10.0, 20.19.0) ∪ [21.1.0, 22.7.0). Empirically confirmed —
+    // 20.18.0 needs the flag, 20.19.0 detects by default, 21.0.0 rejects the flag, 21.1.0
+    // needs it, 22.7.0 detects by default.
+    Feature {
+        name: "detect-module",
+        mitigations: &[
+            (
+                band((20, 10, 0), Some((20, 19, 0))),
+                Mitigation::Unflag("--experimental-detect-module"),
+            ),
+            (
+                band((21, 1, 0), Some((22, 7, 0))),
+                Mitigation::Unflag("--experimental-detect-module"),
+            ),
+        ],
+        evidence: "intro 21.1.0 (#50096), backported 20.10.0; default-on 20.19.0 & 22.7.0 (#53619); flag absent on 21.0.0",
+    },
+    // ── node:ffi (foreign function interface) ────────────────────────────────
+    // `--experimental-ffi` gates the `node:ffi` module (loading dynamic libraries and
+    // calling native symbols). Added on the 26.x line at 26.1.0 (#62072); the flag does
+    // not exist on 26.0.0 or below, where injecting it is a "bad option" startup abort.
+    // Snapshot-neutral (a module gate, not a V8 harmony flag — unlike ShadowRealm above),
+    // so it is safe to auto-unflag; enabling the flag only makes the module importable,
+    // and node:ffi is unsafe solely if user code actively misuses it. Stability 1.0 and
+    // still flag-gated (default-off — `import('node:ffi')` throws
+    // ERR_UNKNOWN_BUILTIN_MODULE without the flag) through Node 26.5 / 27 nightly, so this
+    // open-ended band injects it on [26.1.0, ∞). (node:ffi additionally wants --allow-ffi
+    // under the Permission Model; nub does not inject permission flags.)
+    Feature {
+        name: "ffi",
+        mitigations: &[(
+            band((26, 1, 0), None),
+            Mitigation::Unflag("--experimental-ffi"),
+        )],
+        evidence: "node:ffi added Node 26.1.0 (#62072); absent 26.0.0; default-off through Node 27 nightly",
+    },
+    // ── node:vfs (virtual file system) ───────────────────────────────────────
+    // `--experimental-vfs` gates the minimal `node:vfs` subsystem. Added on the 26.x line
+    // at 26.4.0 (#63115); absent on 26.3.0 and below (injecting there is a "bad option"
+    // abort). Snapshot-neutral. Still flag-gated (default-off — `import('node:vfs')` throws
+    // ERR_UNKNOWN_BUILTIN_MODULE without the flag) through Node 26.5 / 27 nightly, so this
+    // open-ended band injects it on [26.4.0, ∞).
+    Feature {
+        name: "vfs",
+        mitigations: &[(
+            band((26, 4, 0), None),
+            Mitigation::Unflag("--experimental-vfs"),
+        )],
+        evidence: "node:vfs added Node 26.4.0 (#63115); absent 26.3.0; default-off through Node 27 nightly",
+    },
+    // ── node:stream/iter (async-iterator stream adapters) ────────────────────
+    // `--experimental-stream-iter` gates the `node:stream/iter` module. Added on the 25.x
+    // line at 25.9.0 (#62066); absent on 25.8.x and below (injecting there is a "bad
+    // option" abort). Snapshot-neutral. Still flag-gated (default-off —
+    // `import('node:stream/iter')` throws ERR_UNKNOWN_BUILTIN_MODULE without the flag)
+    // through Node 26.5 / 27 nightly, so this open-ended band injects it on [25.9.0, ∞).
+    Feature {
+        name: "stream-iter",
+        mitigations: &[(
+            band((25, 9, 0), None),
+            Mitigation::Unflag("--experimental-stream-iter"),
+        )],
+        evidence: "node:stream/iter added Node 25.9.0 (#62066); absent 25.8.1; default-off through Node 27 nightly",
+    },
+    // ── AsyncLocalStorage on AsyncContextFrame ───────────────────────────────
+    // A PERFORMANCE unflag, the only one in the table: `AsyncLocalStorage` rebuilt
+    // on V8's continuation-preserved embedder data instead of async_hooks (#48528,
+    // landed 22.7.0 behind `--experimental-async-context-frame`; Node 24.0.0 made it
+    // the default via #55552 and renamed the switch `--no-async-context-frame`, so
+    // the `--experimental-` spelling is a "bad option" abort on 24+). Every request
+    // hop that reads the store — OpenTelemetry, Sentry, request-context plugins,
+    // Next.js — pays roughly half the propagation cost: measured 2× on a
+    // request-shaped store/await loop on 22.11 and 22.23, and Node 24's default
+    // shows the same 2× against its own `--no-async-context-frame`.
+    //
+    // Floor is 22.9.0, not the 22.7.0 landing: 22.7 and 22.8 throw
+    // `TypeError: Method Map.prototype.set called on incompatible receiver` under the
+    // flag (#54503, fixed by #54510 in 22.9.0). From 22.16.0 the implementation file
+    // is byte-identical to 24.0's default apart from the option name, so this band
+    // ships the Node 24 behavior to the 22 LTS line. A user `--no-experimental-
+    // async-context-frame` in argv or NODE_OPTIONS opts out through the ordinary
+    // negation subtraction. Rides argv like every other gated flag, so an embedded
+    // Electron below the tree never sees it (Electron keeps the async_hooks model
+    // because Chromium uses the same V8 embedder-data slot — the reason the old path
+    // survives, per the `--no-async-context-frame` docs).
+    //
+    // Not a memory regression on the 22 line, measured by store liveness (a WeakRef per
+    // store, the issue's request shape, counted after GC): with the flag an idle HTTP
+    // parser keeps the last request's store until it is reused (#61882, fixed on 24.15
+    // by #61995, no 22 backport), so 22.23.2 holds 50 stores at concurrency 50, 1 at
+    // concurrency 1, and 5 with `http.setMaxIdleHTTPParsers(5)`. Without the flag the
+    // legacy async_hooks path holds 52 and 3 on the same runs, through a different
+    // pooled resource (the parser cap does not move it). Both are flat from 500 to
+    // 5000 requests and bounded by peak concurrency; only the fixed 24 line reaches 0.
+    // Injecting the flag moves the retainer, not the amount retained.
+    Feature {
+        name: "async-context-frame",
+        mitigations: &[(
+            band((22, 9, 0), Some((24, 0, 0))),
+            Mitigation::Unflag("--experimental-async-context-frame"),
+        )],
+        evidence: "rewrite #48528 landed 22.7.0; #54503 TypeError fixed 22.9.0 (#54510); default + renamed --no-async-context-frame at 24.0.0 (#55552); verified 22.6 rejects, 22.7/22.11/22.23.2/23.0 accept, 24.0 rejects",
+    },
     // ── WebSocket global ────────────────────────────────────────────────────
     // Flag-gated on [20.10.0, 22.0.0) — the global exists on 20.10+ and all of the
     // 21.x line behind `--experimental-websocket`, then becomes default-on at
@@ -277,7 +583,7 @@ pub static FEATURES: &[Feature] = &[
     // ── Web Storage (localStorage / sessionStorage) ─────────────────────────
     // `--experimental-webstorage` + `--localstorage-file` landed in Node 22.4.0;
     // below it both are "bad option" (compat tier 18.19–22.3 runs without
-    // webstorage → Absent). The experimental flag was unflagged (defaults on) in
+    // webstorage — no band). The experimental flag was unflagged (defaults on) in
     // Node 25.0.0 (PR #57666). So:
     //   • [22.4.0, 25.0.0) → Unflag("--experimental-webstorage") + a storage file.
     //   • [25.0.0, ∞)      → StorageFile only (global is native; the
@@ -370,25 +676,394 @@ pub static FEATURES: &[Feature] = &[
         evidence: "native on Node 24+",
     },
     // ── Promise.try ─────────────────────────────────────────────────────────
-    // Native on Node 24+; polyfilled on 22.x.
+    // Native on Node 23+; polyfilled below.
     Feature {
         name: "Promise.try",
         mitigations: &[
             (
-                band((18, 19, 0), Some((24, 0, 0))),
+                band((18, 19, 0), Some((23, 0, 0))),
                 Mitigation::Polyfill {
                     runtime_file: "polyfills.cjs",
                     global: "Promise.try",
                 },
             ),
+            (band((23, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "native on Node 23+ (typeof probe on 22.23.2 vs 23.0.0)",
+    },
+    // ── Stage 3+ library surfaces ───────────────────────────────────────────
+    // union is the detect anchor for all SEVEN set methods (union/intersection/
+    // difference/symmetricDifference/isSubsetOf/isSupersetOf/isDisjointFrom); each
+    // is still guarded individually in the runtime file.
+    Feature {
+        name: "Set.union",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((22, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Set.prototype.union",
+                },
+            ),
+            (band((22, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 / ES2025 (new Set methods); native on Node 22+",
+    },
+    Feature {
+        name: "Array.fromAsync",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((22, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Array.fromAsync",
+                },
+            ),
+            (band((22, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 / ES2025; native on Node 22+",
+    },
+    // Shipped under the name getOrInsert, NOT the proposal's original `upsert` --
+    // no runtime ever exposed `upsert`. Anchor also covers getOrInsertComputed and
+    // the WeakMap forms.
+    Feature {
+        name: "Map.getOrInsert",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((26, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Map.prototype.getOrInsert",
+                },
+            ),
+            (band((26, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 / ES2026 (upsert, shipped as getOrInsert); native on Node 26+",
+    },
+    // Anchor for Iterator.from plus the eleven ES2025 helpers (map/filter/take/drop/
+    // flatMap/reduce/toArray/some/every/find/forEach).
+    Feature {
+        name: "Iterator.from",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((22, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Iterator.from",
+                },
+            ),
+            (band((22, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 / ES2025 (sync iterator helpers); native on Node 22+",
+    },
+    Feature {
+        name: "Iterator.concat",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((26, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Iterator.concat",
+                },
+            ),
+            (band((26, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 (iterator-sequencing); native on Node 26+",
+    },
+    Feature {
+        name: "Iterator.zip",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Iterator.zip",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 (joint-iteration); native in Node 27 Alpha (V8 15.6)",
+    },
+    Feature {
+        name: "Iterator.zipKeyed",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Iterator.zipKeyed",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 (joint-iteration); native in Node 27 Alpha (V8 15.6)",
+    },
+    Feature {
+        name: "Iterator.includes",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Iterator.prototype.includes",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "iterator-includes; native in Node 27 Alpha (V8 15.6)",
+    },
+    Feature {
+        name: "Iterator.join",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Iterator.prototype.join",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "iterator-join; native in Node 27 Alpha (V8 15.6)",
+    },
+    Feature {
+        name: "Intl.Locale.variants",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Intl.Locale.prototype.variants",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Intl.Locale variants accessor; native in Node 27 Alpha (V8 15.6)",
+    },
+    Feature {
+        name: "Math.sumPrecise",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Math.sumPrecise",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 (proposal-math-sum); native in Node 27 Alpha (V8 15.6)",
+    },
+    // chunks/windows are separate from the includes/join methods native in 27.
+    Feature {
+        name: "Iterator.chunks",
+        mitigations: &[(
+            band((18, 19, 0), None),
+            Mitigation::Polyfill {
+                runtime_file: "polyfills.cjs",
+                global: "Iterator.prototype.chunks",
+            },
+        )],
+        evidence: "Stage 4 (iterator-chunking); absent in Node 27 Alpha (V8 15.6)",
+    },
+    // JSON.parse exists everywhere, so this anchor's runtime detect probes the
+    // options behavior rather than the global's presence.
+    Feature {
+        name: "JSON.parse options",
+        mitigations: &[(
+            band((18, 19, 0), None),
+            Mitigation::Polyfill {
+                runtime_file: "polyfills.cjs",
+                global: "JSON.parse",
+            },
+        )],
+        evidence: "Stage 2.7 (proposal-json-parseimmutable, 2026-09); absent on every Node through 26.7",
+    },
+    // Only the well-known symbol; POPULATING class metadata is the decorator
+    // transform's job, and the spec's value for an undecorated class is undefined.
+    Feature {
+        name: "Symbol.metadata",
+        mitigations: &[(
+            band((18, 19, 0), None),
+            Mitigation::Polyfill {
+                runtime_file: "polyfills.cjs",
+                global: "Symbol.metadata",
+            },
+        )],
+        evidence: "Stage 3 (decorator metadata); absent on every Node through 26.5",
+    },
+    // ── Shipped-standard builtins missing below their Node line ─────────────
+    // All Stage 4 except Atomics.pause (Stage 3). Each was left unpolyfilled by the
+    // same stale-floor premise as Promise.withResolvers below; bands are measured,
+    // not read off release notes.
+    //
+    // URL.parse is the awkward one: Node backported it to 20.18 but the 21.x line
+    // never got it, so the row has a HOLE — native on 20.18-20.x, absent again
+    // across all of 21.x, native from 22.1. Same shape as the eventsource 21.x hole.
+    Feature {
+        name: "URL.parse",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((20, 18, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "URL.parse",
+                },
+            ),
+            (band((20, 18, 0), Some((21, 0, 0))), Mitigation::Native),
+            (
+                band((21, 0, 0), Some((22, 1, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "URL.parse",
+                },
+            ),
+            (band((22, 1, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4; native 22.1 and backported to 20.18.0 (#52280); the 21.x line never got it",
+    },
+    // isWellFormed/toWellFormed ship together; isWellFormed is the detect anchor.
+    Feature {
+        name: "String.isWellFormed",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((20, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "String.prototype.isWellFormed",
+                },
+            ),
+            (band((20, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 (well-formed unicode strings); native on Node 20+",
+    },
+    Feature {
+        name: "Object.groupBy",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((21, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Object.groupBy",
+                },
+            ),
+            (band((21, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4; native on Node 21+ (V8 12.0)",
+    },
+    Feature {
+        name: "Map.groupBy",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((21, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Map.groupBy",
+                },
+            ),
+            (band((21, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4; native on Node 21+ (V8 12.0)",
+    },
+    // Change-array-by-copy. toSorted is the detect anchor for the whole family
+    // (Array toSorted/toReversed/toSpliced/with + the TypedArray forms, which get
+    // everything but toSpliced since a typed array cannot change length).
+    Feature {
+        name: "Array.toSorted",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((20, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Array.prototype.toSorted",
+                },
+            ),
+            (band((20, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 (change array by copy); native on Node 20+",
+    },
+    // transfer/transferToFixedLength/detached. Polyfillable ONLY because
+    // structuredClone's transfer list performs a real detach on the floor.
+    Feature {
+        name: "ArrayBuffer.transfer",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((21, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "ArrayBuffer.prototype.transfer",
+                },
+            ),
+            (band((21, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 (resizable ArrayBuffer / transfer); native on Node 21+",
+    },
+    // A micro-architectural hint, so a validate-and-return implementation is
+    // fully faithful — the spec lets an implementation do nothing.
+    Feature {
+        name: "Atomics.pause",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((24, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Atomics.pause",
+                },
+            ),
             (band((24, 0, 0), None), Mitigation::Native),
         ],
-        evidence: "native on Node 24+",
+        evidence: "TC39 proposal-atomics-microwait; native on Node 24+ (typeof probe on 23.11.1 vs 24.0.0)",
+    },
+    // ── Promise.withResolvers ───────────────────────────────────────────────
+    // TC39 Stage 4 / ES2024; native on Node 22+, absent on the 18.19–21.x compat
+    // tier. It went unpolyfilled until 2026-07 because the candidates survey
+    // judged it "native on Nub's floor" while the floor was still 22.15; the
+    // verdict was never revisited when the floor moved to 18.19.
+    Feature {
+        name: "Promise.withResolvers",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((22, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Promise.withResolvers",
+                },
+            ),
+            (band((22, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "TC39 Stage 4 / ES2024; native on Node 22.0+ (V8 12.4)",
+    },
+    // ── Promise.allKeyed / Promise.allSettledKeyed ──────────────────────────
+    // TC39 "await dictionary", Stage 3. Shipped by NO engine, so unlike the rows
+    // above there is no Native band to fall through to — the whole supported range
+    // is polyfilled, the same shape as reportError. The runtime feature-detect is
+    // what steps aside once V8 lands it, so this row needs no revision then.
+    Feature {
+        name: "Promise.allKeyed",
+        mitigations: &[(
+            band((18, 19, 0), None),
+            Mitigation::Polyfill {
+                runtime_file: "polyfills.cjs",
+                global: "Promise.allKeyed",
+            },
+        )],
+        evidence: "TC39 Stage 3 (proposal-await-dictionary); absent on every Node through 26.5",
+    },
+    Feature {
+        name: "Promise.allSettledKeyed",
+        mitigations: &[(
+            band((18, 19, 0), None),
+            Mitigation::Polyfill {
+                runtime_file: "polyfills.cjs",
+                global: "Promise.allSettledKeyed",
+            },
+        )],
+        evidence: "TC39 Stage 3 (proposal-await-dictionary); absent on every Node through 26.5",
     },
     // ── Float16Array ────────────────────────────────────────────────────────
     // TC39 Stage 4; native on Node 24+, absent on the 22.x floor, polyfilled from
     // the vendored `@petamoriken/float16` package. See
-    // wiki/runtime/float16array-polyfill.md.
+    // internal/runtime/float16array-polyfill.md.
     Feature {
         name: "Float16Array",
         mitigations: &[
@@ -403,26 +1078,99 @@ pub static FEATURES: &[Feature] = &[
         ],
         evidence: "TC39 Stage 4; native on Node 24+",
     },
+    // ── Uint8Array base64/hex ───────────────────────────────────────────────
+    // TC39 Stage 3 (Uint8Array to/from base64/hex). Native on Node 25+; absent on
+    // the whole 18.19–24.x range below, where nub installs a spec-faithful port of
+    // the proposal's reference polyfill (verified byte-for-byte against Node native).
+    // The toBase64 prototype method is the feature-detect anchor for the whole
+    // family (toBase64/fromBase64/setFromBase64/toHex/fromHex/setFromHex).
+    Feature {
+        name: "Uint8Array.toBase64",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((25, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Uint8Array.prototype.toBase64",
+                },
+            ),
+            (band((25, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "TC39 Stage 3; native on Node 25+ (V8 13.x)",
+    },
+    // ── DisposableStack / AsyncDisposableStack / SuppressedError ─────────────
+    // TC39 Stage 4 (Explicit Resource Management). The `using`/`await using` SYNTAX
+    // is down-leveled by nub's transpiler; these runtime CLASSES are native on Node
+    // 24+ and absent below, where nub polyfills them (spec LIFO disposal + the
+    // SuppressedError aggregation chain, verified byte-for-byte against native).
+    // The well-known symbols Symbol.dispose / Symbol.asyncDispose are present on
+    // every supported Node, so only the classes + SuppressedError need polyfilling.
+    Feature {
+        name: "DisposableStack",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((24, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "globalThis.DisposableStack",
+                },
+            ),
+            (band((24, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "TC39 Stage 4 (Explicit Resource Management); native on Node 24+",
+    },
+    Feature {
+        name: "AsyncDisposableStack",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((24, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "globalThis.AsyncDisposableStack",
+                },
+            ),
+            (band((24, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "TC39 Stage 4 (Explicit Resource Management); native on Node 24+",
+    },
+    Feature {
+        name: "SuppressedError",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((24, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "globalThis.SuppressedError",
+                },
+            ),
+            (band((24, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "TC39 Stage 4 (Explicit Resource Management); native on Node 24+",
+    },
     // ── Temporal ────────────────────────────────────────────────────────────
-    // Not shipped by ANY Node version, so polyfilled across the whole floor — but
+    // Native on Node 26+, polyfilled below it — but
     // installed as a LAZY global by the preload entry (A37: the polyfill is ~18ms
     // to load, so it is deferred behind a getter), NOT eagerly in polyfills.cjs.
     // The feature-detect lives in preload-common.cjs (`installTemporalLazyGlobal`).
     Feature {
         name: "Temporal",
-        mitigations: &[(
-            band((18, 19, 0), None),
-            Mitigation::Polyfill {
-                runtime_file: "preload-common.cjs",
-                global: "globalThis.Temporal",
-            },
-        )],
-        evidence: "TC39 proposal; not in any Node through 26; lazy global (A37)",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((26, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "preload-common.cjs",
+                    global: "globalThis.Temporal",
+                },
+            ),
+            (band((26, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "TC39 Stage 4; native on Node 26+ (typeof probe on 25.9.0 vs 26.0.0); lazy global (A37)",
     },
     // ── Worker (browser-shape global) ───────────────────────────────────────
-    // The browser-shape `Worker` global is not shipped by any Node version (Node
-    // has `node:worker_threads.Worker`, not the browser global), so nub polyfills
-    // it across the floor, wrapping `worker_threads.Worker` with EventTarget.
+    // Node's own browser-shape `Worker` global exists only behind
+    // `--experimental-web-worker` (26.9+), which nub does not inject, so nub polyfills
+    // it across the floor, wrapping `worker_threads.Worker` with EventTarget. With
+    // that flag set, the polyfill finds a constructor already there and stands aside.
     Feature {
         name: "Worker",
         mitigations: &[(
@@ -432,13 +1180,35 @@ pub static FEATURES: &[Feature] = &[
                 global: "globalThis.Worker",
             },
         )],
-        evidence: "browser-shape Worker not in any Node; wraps node:worker_threads",
+        evidence: "browser-shape Worker only behind --experimental-web-worker (26.9+); wraps node:worker_threads",
+    },
+    // ── navigator global ────────────────────────────────────────────────────
+    // The `navigator` object (hardwareConcurrency / userAgent / language / languages
+    // / platform, and from 24.5 `locks`) was added in Node 21.0.0 (#47769). Below 21
+    // it is wholly absent, so any API hosted ON navigator — chiefly navigator.locks —
+    // has no object to attach to. nub backfills the navigator object from
+    // navigator-shim.mjs so the surface (and locks, below) reaches the 18.19 floor.
+    // The userAgent stays `Node.js/<major>` — never `Nub/…` (brand boundary).
+    Feature {
+        name: "navigator",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((21, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "navigator-shim.mjs",
+                    global: "globalThis.navigator",
+                },
+            ),
+            (band((21, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "navigator global added Node 21.0.0 (#47769); backfilled below the 21.0 floor",
     },
     // ── navigator.locks (Web Locks API) ─────────────────────────────────────
     // Native on Node 24.5+ (worker: add web locks api, #58666 — NOT 24.0: the
     // global is undefined on 24.0–24.4); below that nub installs a Web Locks
     // polyfill onto `navigator.locks` (typeof-gated, so the 24.0–24.4 gap is
-    // covered either way).
+    // covered either way). On Node < 21 the polyfill rides on the navigator object
+    // the `navigator` row backfills (navigator-shim.mjs runs first).
     Feature {
         name: "navigator.locks",
         mitigations: &[
@@ -455,11 +1225,22 @@ pub static FEATURES: &[Feature] = &[
     },
 ];
 
+/// V8 *harmony* / startup-snapshot-affecting flags that must NEVER appear in the
+/// auto-unflag set (the harmony-flag policy — see the ShadowRealm note in
+/// [`FEATURES`] and internal/runtime/harmony-flag-policy.md). These imply a V8
+/// `--harmony-*` staging flag that changes the isolate's V8-flag hash; injected
+/// into the tree-wide NODE_OPTIONS they crash any embedded Node that boots from a
+/// V8 context snapshot (Electron) in `Context::FromSnapshot` → `CreateEnvironment`,
+/// before any preload JS can intervene (#246). The
+/// `no_v8_harmony_flag_in_unflag_set` test enforces this against the whole matrix.
+#[cfg(test)]
+const V8_HARMONY_UNFLAG_DENYLIST: &[&str] = &["--experimental-shadow-realm"];
+
 /// Look up a feature row by name (used by the webstorage-predicate derivation in
 /// [`super::flags`]). Panics if the name is absent — it is only ever called with
 /// a literal that must exist in [`FEATURES`], so an absent name is a programming
 /// error worth failing loudly.
-pub fn feature(name: &str) -> &'static Feature {
+pub(crate) fn feature(name: &str) -> &'static Feature {
     FEATURES
         .iter()
         .find(|f| f.name == name)
@@ -473,11 +1254,45 @@ pub fn feature(name: &str) -> &'static Feature {
 ///
 /// Order follows table order (vm-modules, eventsource, sqlite, websocket,
 /// webstorage…) so the produced flag list is deterministic.
-pub fn unflag_flags_for(node_version: &NodeVersion) -> Vec<&'static str> {
+pub(crate) fn unflag_flags_for(node_version: &NodeVersion) -> Vec<&'static str> {
     FEATURES
         .iter()
         .filter_map(|f| match f.mitigation_for(node_version) {
             Some(Mitigation::Unflag(flag)) => Some(flag),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every ARGV-ONLY V8 flag nub should inject for `node_version` — the
+/// [`Mitigation::UnflagArgv`] counterpart of [`unflag_flags_for`].
+///
+/// These deliberately sit OUTSIDE `compute_inject_flags`: that function's Stage-4
+/// intersection is against `process.allowedNodeEnvironmentFlags`, which describes
+/// NODE_OPTIONS eligibility and therefore excludes every flag in this set, and its
+/// output feeds the NODE_OPTIONS-bound script-runner path where these flags abort
+/// startup. Argv-bearing call sites own the injection instead, exactly as they do
+/// for `--experimental-webstorage` and user `v8Flags`.
+pub(crate) fn argv_unflag_flags_for(node_version: &NodeVersion) -> Vec<&'static str> {
+    FEATURES
+        .iter()
+        .filter_map(|f| match f.mitigation_for(node_version) {
+            Some(Mitigation::UnflagArgv(flag)) => Some(flag),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every V8 flag the PRELOAD should turn on from inside the process for
+/// `node_version` — the [`Mitigation::RuntimeV8Flag`] counterpart of
+/// [`argv_unflag_flags_for`], kept outside `compute_inject_flags` for the same
+/// reason. The spawn sites hand the set to the preload through
+/// `super::flags::RUNTIME_V8_FLAGS_ENV`; nothing here ever reaches argv.
+pub(crate) fn runtime_v8_flags_for(node_version: &NodeVersion) -> Vec<&'static str> {
+    FEATURES
+        .iter()
+        .filter_map(|f| match f.mitigation_for(node_version) {
+            Some(Mitigation::RuntimeV8Flag(flag)) => Some(flag),
             _ => None,
         })
         .collect()
@@ -491,7 +1306,7 @@ pub fn unflag_flags_for(node_version: &NodeVersion) -> Vec<&'static str> {
 /// exactly `[0, floor)`. [`super::flags::strip_unsupported_node_options`] uses this
 /// to snip a below-floor gated flag out of an inherited NODE_OPTIONS. Derived from
 /// the same matrix the inject path reads — no parallel floor table.
-pub fn unflag_floor(flag: &str) -> Option<NodeVersion> {
+pub(crate) fn unflag_floor(flag: &str) -> Option<NodeVersion> {
     FEATURES
         .iter()
         .flat_map(|f| f.mitigations.iter())
@@ -525,6 +1340,19 @@ mod tests {
             assert!(
                 seen.insert(f.name),
                 "duplicate feature name in matrix: {:?}",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_row_carries_changelog_evidence() {
+        // The module doc requires each row to cite its changelog/PR evidence;
+        // an empty string would silently drop the audit trail.
+        for f in FEATURES {
+            assert!(
+                !f.evidence.trim().is_empty(),
+                "feature {:?} has no evidence citation",
                 f.name
             );
         }
@@ -567,7 +1395,10 @@ mod tests {
     fn every_unflag_flag_starts_with_double_dash() {
         for f in FEATURES {
             for (_, m) in f.mitigations {
-                if let Mitigation::Unflag(flag) = m {
+                if let Mitigation::Unflag(flag)
+                | Mitigation::UnflagArgv(flag)
+                | Mitigation::RuntimeV8Flag(flag) = m
+                {
                     assert!(
                         flag.starts_with("--"),
                         "feature {:?}: unflag string {:?} must start with '--'",
@@ -604,8 +1435,14 @@ mod tests {
                         )
                     });
                     let needle = format!("typeof {global}");
+                    // Accessor guards must not read the getter on its prototype:
+                    // Intl.Locale accessors require a branded instance.
+                    let property_guard = global
+                        .rsplit_once('.')
+                        .map(|(owner, key)| format!("\"{key}\" in {owner}"));
                     assert!(
-                        src.contains(&needle),
+                        src.contains(&needle)
+                            || property_guard.is_some_and(|guard| src.contains(&guard)),
                         "feature {:?}: {} does not contain feature-detect {:?}",
                         f.name,
                         runtime_file,
@@ -630,10 +1467,11 @@ mod tests {
         // vm-modules: whole floor.
         assert!(unflag_flags_for(&v(18, 19, 0)).contains(&"--experimental-vm-modules"));
         assert!(unflag_flags_for(&v(26, 2, 0)).contains(&"--experimental-vm-modules"));
-        // shadow-realm: whole floor, open-ended (never default-on).
-        assert!(unflag_flags_for(&v(18, 19, 0)).contains(&"--experimental-shadow-realm"));
-        assert!(unflag_flags_for(&v(22, 19, 0)).contains(&"--experimental-shadow-realm"));
-        assert!(unflag_flags_for(&v(26, 0, 0)).contains(&"--experimental-shadow-realm"));
+        // shadow-realm: DELIBERATELY never injected (the harmony-flag policy —
+        // it crashes embedded-Node/Electron via a snapshot-flag-hash mismatch, #246).
+        assert!(!unflag_flags_for(&v(18, 19, 0)).contains(&"--experimental-shadow-realm"));
+        assert!(!unflag_flags_for(&v(22, 19, 0)).contains(&"--experimental-shadow-realm"));
+        assert!(!unflag_flags_for(&v(26, 0, 0)).contains(&"--experimental-shadow-realm"));
         // eventsource: the 21.x hole.
         assert!(!unflag_flags_for(&v(21, 0, 0)).contains(&"--experimental-eventsource"));
         assert!(unflag_flags_for(&v(20, 18, 0)).contains(&"--experimental-eventsource"));
@@ -673,6 +1511,150 @@ mod tests {
         assert!(unflag_flags_for(&v(22, 4, 0)).contains(&"--experimental-webstorage"));
         assert!(unflag_flags_for(&v(24, 99, 0)).contains(&"--experimental-webstorage"));
         assert!(!unflag_flags_for(&v(25, 0, 0)).contains(&"--experimental-webstorage"));
+        // import-text: [24.19.0, 25.0.0) ∪ [26.5.0, ∞). The flag arrived at 26.5.0 and
+        // was backported to 24.19.0; it exists on neither 24.18.1 nor any 25.x release.
+        let it = "--experimental-import-text";
+        assert!(!unflag_flags_for(&v(24, 18, 1)).contains(&it));
+        assert!(unflag_flags_for(&v(24, 19, 0)).contains(&it));
+        assert!(!unflag_flags_for(&v(25, 9, 0)).contains(&it)); // flag absent (hole)
+        assert!(!unflag_flags_for(&v(26, 4, 0)).contains(&it));
+        assert!(unflag_flags_for(&v(26, 5, 0)).contains(&it));
+        assert!(unflag_flags_for(&v(27, 0, 0)).contains(&it));
+        assert_eq!(unflag_floor(it), Some(v(24, 19, 0)));
+        // detect-module: [20.10.0, 20.19.0) ∪ [21.1.0, 22.7.0). Below the backport
+        // floor and at each default-on cutover it is excluded; the 21.0.0 release
+        // predates the flag (injecting it is a "bad option" crash — the eventsource hole).
+        let dm = "--experimental-detect-module";
+        assert!(!unflag_flags_for(&v(20, 9, 0)).contains(&dm));
+        assert!(unflag_flags_for(&v(20, 10, 0)).contains(&dm));
+        assert!(unflag_flags_for(&v(20, 18, 0)).contains(&dm));
+        assert!(!unflag_flags_for(&v(20, 19, 0)).contains(&dm)); // default-on
+        assert!(!unflag_flags_for(&v(21, 0, 0)).contains(&dm)); // flag absent (hole)
+        assert!(unflag_flags_for(&v(21, 1, 0)).contains(&dm));
+        assert!(unflag_flags_for(&v(22, 6, 0)).contains(&dm));
+        assert!(!unflag_flags_for(&v(22, 7, 0)).contains(&dm)); // default-on
+        assert_eq!(unflag_floor(dm), Some(v(20, 10, 0)));
+        // ffi: open-ended [26.1.0, ∞); the flag doesn't exist on 26.0.0.
+        let ffi = "--experimental-ffi";
+        assert!(!unflag_flags_for(&v(26, 0, 0)).contains(&ffi));
+        assert!(unflag_flags_for(&v(26, 1, 0)).contains(&ffi));
+        assert!(unflag_flags_for(&v(26, 5, 0)).contains(&ffi));
+        assert!(unflag_flags_for(&v(27, 0, 0)).contains(&ffi));
+        assert_eq!(unflag_floor(ffi), Some(v(26, 1, 0)));
+        // vfs: open-ended [26.4.0, ∞); the flag doesn't exist on 26.3.0.
+        let vfs = "--experimental-vfs";
+        assert!(!unflag_flags_for(&v(26, 3, 0)).contains(&vfs));
+        assert!(unflag_flags_for(&v(26, 4, 0)).contains(&vfs));
+        assert!(unflag_flags_for(&v(26, 5, 0)).contains(&vfs));
+        assert_eq!(unflag_floor(vfs), Some(v(26, 4, 0)));
+        // stream-iter: open-ended [25.9.0, ∞); the flag doesn't exist on 25.8.x.
+        let si = "--experimental-stream-iter";
+        assert!(!unflag_flags_for(&v(25, 8, 1)).contains(&si));
+        assert!(unflag_flags_for(&v(25, 9, 0)).contains(&si));
+        assert!(unflag_flags_for(&v(26, 5, 0)).contains(&si));
+        assert_eq!(unflag_floor(si), Some(v(25, 9, 0)));
+    }
+
+    /// The `import defer` band, pinned to the four Node behaviors measured on real
+    /// binaries. The 26.4.0 floor is a NODE floor, not a V8-flag one: 26.0–26.3 carry
+    /// the flag but abort in `to_phase_constant` when a deferred import evaluates, so
+    /// arming the preload there would turn a clean SyntaxError into a process abort.
+    ///
+    /// The row is a runtime flip, never argv: the second loop pins that too, because a
+    /// row silently moved back to `UnflagArgv` would re-enable the flag for every
+    /// program and re-open the builtin-code-cache cost the flip exists to avoid.
+    #[test]
+    fn import_defer_band_starts_at_the_node_that_works() {
+        let flag = "--js-defer-import-eval";
+        for below in [v(24, 19, 0), v(25, 9, 0), v(26, 0, 0), v(26, 3, 0)] {
+            assert!(
+                !runtime_v8_flags_for(&below).contains(&flag),
+                "{flag} must not be armed at Node {below:?}: \
+                 <=25.x rejects it as a bad option, and 26.0-26.3 abort in to_phase_constant"
+            );
+        }
+        for at_or_above in [v(26, 4, 0), v(26, 5, 0), v(27, 0, 0)] {
+            assert!(
+                runtime_v8_flags_for(&at_or_above).contains(&flag),
+                "{flag} must be armed for the preload at Node {at_or_above:?}"
+            );
+            assert!(
+                !argv_unflag_flags_for(&at_or_above).contains(&flag),
+                "{flag} must never ride argv at Node {at_or_above:?}: a non-default V8 \
+                 flag at startup invalidates Node's embedded builtin code cache"
+            );
+        }
+    }
+
+    /// The invariant that makes `UnflagArgv` safe: such a flag must NEVER reach the
+    /// NODE_OPTIONS payload. Node rejects these in NODE_OPTIONS, so a leak aborts the
+    /// script-runner child at startup on every affected version.
+    ///
+    /// Asserts against `compute_inject_flags` — the function whose output actually
+    /// BECOMES that payload — rather than against `unflag_flags_for`. Comparing the two
+    /// matrix accessors would be near-vacuous, since they match disjoint `Mitigation`
+    /// variants and could only collide if one flag string were entered in both shapes.
+    /// Going through `compute_inject_flags` also covers the routes that bypass the
+    /// matrix entirely, `ALWAYS_INJECT` above all.
+    #[test]
+    fn argv_only_flags_never_enter_the_node_options_payload() {
+        for ver in [
+            v(18, 19, 0),
+            v(22, 15, 0),
+            v(24, 17, 0),
+            v(26, 4, 0),
+            v(26, 5, 0),
+            v(27, 0, 0),
+        ] {
+            // `None` accepted-flags: the widest possible inject set, so nothing is
+            // masked by the Stage-4 intersection.
+            let payload =
+                super::super::flags::compute_inject_flags(ver.clone(), &[], None, true, None);
+            // The runtime rows are held to the same line: they reach the preload
+            // through an env var, and a leak into this payload would abort the same
+            // script-runner child.
+            for off_channel in argv_unflag_flags_for(&ver)
+                .into_iter()
+                .chain(runtime_v8_flags_for(&ver))
+            {
+                assert!(
+                    !payload.contains(&off_channel),
+                    "{off_channel:?} is an UnflagArgv/RuntimeV8Flag flag but reached the \
+                     NODE_OPTIONS payload at Node {ver:?} — Node refuses it there and will abort"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_v8_harmony_flag_in_unflag_set() {
+        // The harmony-flag policy, enforced (not just documented): no flag in
+        // V8_HARMONY_UNFLAG_DENYLIST may ever appear in the auto-unflag set, at ANY
+        // version. Such flags imply a V8 `--harmony-*` staging flag that changes the
+        // isolate's V8-flag hash and crashes embedded Node booting from a context
+        // snapshot (Electron) in CreateEnvironment, before any preload JS — #246.
+        // Sweep the whole supported range plus the boundary majors so a future matrix
+        // edit that re-adds shadow-realm (or any other harmony flag) trips here.
+        let versions = [
+            v(18, 19, 0),
+            v(20, 18, 0),
+            v(22, 15, 0),
+            v(23, 6, 0),
+            v(24, 17, 0),
+            v(25, 0, 0),
+            v(26, 2, 0),
+        ];
+        for ver in versions {
+            let set = unflag_flags_for(&ver);
+            for &banned in V8_HARMONY_UNFLAG_DENYLIST {
+                assert!(
+                    !set.contains(&banned),
+                    "harmony-flag policy violated: {banned:?} is auto-unflagged at Node {ver:?} \
+                     — it crashes embedded Node (Electron) via a snapshot-flag-hash mismatch (#246). \
+                     See the ShadowRealm note in FEATURES + internal/runtime/harmony-flag-policy.md."
+                );
+            }
+        }
     }
 
     #[test]

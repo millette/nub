@@ -7,6 +7,246 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.5](https://github.com/aubepkg/aube/compare/aube-resolver-v2.2.4...aube-resolver-v2.2.5) - 2026-09-03
+
+### Other
+
+- move routine workflows to GitHub-hosted runners ([#1469](https://github.com/aubepkg/aube/pull/1469))
+- move project to aubepkg and aube.sh ([#1460](https://github.com/aubepkg/aube/pull/1460))
+- refresh benchmarks for v2.2.4 ([#1434](https://github.com/aubepkg/aube/pull/1434))
+
+## [2.2.4](https://github.com/jdx/aube/compare/aube-resolver-v2.2.3...aube-resolver-v2.2.4) - 2026-08-31
+
+### Other
+
+- refresh benchmarks for v2.2.3 ([#1417](https://github.com/jdx/aube/pull/1417))
+
+## [2.2.1](https://github.com/jdx/aube/compare/aube-resolver-v2.2.0...aube-resolver-v2.2.1) - 2026-08-29
+
+### Fixed
+
+- *(resolver)* match pnpm importer peer semantics ([#1399](https://github.com/jdx/aube/pull/1399))
+
+### Other
+
+- *(install)* validate trustPolicy from compact trust histories ([#1403](https://github.com/jdx/aube/pull/1403))
+- refresh benchmarks for v2.2.0 ([#1384](https://github.com/jdx/aube/pull/1384))
+- *(sponsors)* replace 37signals with omacom foundation ([#1380](https://github.com/jdx/aube/pull/1380))
+
+## [2.2.0](https://github.com/jdx/aube/compare/aube-resolver-v2.1.0...aube-resolver-v2.2.0) - 2026-08-25
+
+### Other
+
+- refresh benchmarks for v2.1.0 ([#1372](https://github.com/jdx/aube/pull/1372))
+
+## [2.1.0](https://github.com/jdx/aube/compare/aube-resolver-v2.0.1...aube-resolver-v2.1.0) - 2026-08-23
+
+### Other
+
+- *(resolver)* bypass network limit for primer metadata ([#1353](https://github.com/jdx/aube/pull/1353))
+- *(resolver)* bypass network limit for disk metadata ([#1352](https://github.com/jdx/aube/pull/1352))
+- refresh benchmarks for v2.0.1 ([#1350](https://github.com/jdx/aube/pull/1350))
+
+## [1.41.0](https://github.com/jdx/aube/compare/aube-resolver-v1.40.0...aube-resolver-v1.41.0) - 2026-08-16
+
+### Fixed
+
+- *(resolver)* avoid lowest-direct API break ([#1311](https://github.com/jdx/aube/pull/1311))
+- *(sbom)* filter unsupported optional packages ([#1309](https://github.com/jdx/aube/pull/1309))
+- *(resolver)* separate lowest-direct resolution ([#1307](https://github.com/jdx/aube/pull/1307))
+- *(install)* enable embedded memory diagnostics ([#1303](https://github.com/jdx/aube/pull/1303))
+- *(resolver)* skip optional peers in auto-install hoist pass ([#1291](https://github.com/jdx/aube/pull/1291))
+
+### Other
+
+- refresh benchmarks for v1.40.0 ([#1290](https://github.com/jdx/aube/pull/1290))
+
+## [1.40.0](https://github.com/jdx/aube/compare/aube-resolver-v1.39.0...aube-resolver-v1.40.0) - 2026-08-13
+
+### Other
+
+- refresh benchmarks for v1.39.0 ([#1285](https://github.com/jdx/aube/pull/1285))
+- Update Star History chart links with sealed tokens
+
+## [1.39.0](https://github.com/jdx/aube/compare/aube-resolver-v1.38.1...aube-resolver-v1.39.0) - 2026-08-12
+
+### Other
+
+- refresh benchmarks for v1.38.1 ([#1257](https://github.com/jdx/aube/pull/1257))
+
+## [1.38.1](https://github.com/jdx/aube/compare/aube-resolver-v1.38.0...aube-resolver-v1.38.1) - 2026-08-10
+
+### Fixed
+
+- *(resolver)* preserve dependency type for auto-installed peers ([#1252](https://github.com/jdx/aube/pull/1252))
+
+### Other
+
+- refresh benchmarks for v1.38.0 ([#1244](https://github.com/jdx/aube/pull/1244))
+
+## [1.38.0](https://github.com/jdx/aube/compare/aube-resolver-v1.37.0...aube-resolver-v1.38.0) - 2026-08-07
+
+### Other
+
+- refresh benchmarks for v1.37.0 ([#1211](https://github.com/jdx/aube/pull/1211))
+- refresh benchmarks for v1.37.0 ([#1206](https://github.com/jdx/aube/pull/1206))
+
+## [1.37.0](https://github.com/jdx/aube/compare/aube-resolver-v1.36.0...aube-resolver-v1.37.0) - 2026-07-31
+
+### Added
+
+- *(scripts)* use pnpm trusted dependency list ([#1199](https://github.com/jdx/aube/pull/1199))
+
+### Fixed
+
+- *(update)* warn when release age hides upgrades ([#1193](https://github.com/jdx/aube/pull/1193))
+
+### Other
+
+- refresh benchmarks for v1.36.0 ([#1185](https://github.com/jdx/aube/pull/1185))
+
+## [1.36.0](https://github.com/jdx/aube/compare/aube-resolver-v1.35.0...aube-resolver-v1.36.0) - 2026-07-29
+
+### Fixed
+
+- *(resolver)* use local root version for peer context ([#1179](https://github.com/jdx/aube/pull/1179))
+
+### Other
+
+- refresh benchmarks for v1.35.0 ([#1172](https://github.com/jdx/aube/pull/1172))
+
+## [1.35.0](https://github.com/jdx/aube/compare/aube-resolver-v1.34.0...aube-resolver-v1.35.0) - 2026-07-28
+
+### Added
+
+- *(add)* block new and lookalike package names ([#1157](https://github.com/jdx/aube/pull/1157))
+- *(trust)* add package publishing checks ([#1144](https://github.com/jdx/aube/pull/1144))
+
+### Other
+
+- refresh benchmarks for v1.34.0 ([#1124](https://github.com/jdx/aube/pull/1124))
+
+## [1.34.0](https://github.com/jdx/aube/compare/aube-resolver-v1.33.1...aube-resolver-v1.34.0) - 2026-07-27
+
+### Fixed
+
+- *(resolver)* never prefer a deprecated version inside a range ([#1136](https://github.com/jdx/aube/pull/1136))
+
+## [1.33.1](https://github.com/jdx/aube/compare/aube-resolver-v1.33.0...aube-resolver-v1.33.1) - 2026-07-25
+
+### Fixed
+
+- *(resolver)* make versioned entries in the trust-exclude defaults work ([#1118](https://github.com/jdx/aube/pull/1118))
+- *(resolver)* exclude @hono/node-server from no-downgrade by default ([#1113](https://github.com/jdx/aube/pull/1113))
+
+## [1.33.0](https://github.com/jdx/aube/compare/aube-resolver-v1.32.0...aube-resolver-v1.33.0) - 2026-07-25
+
+### Fixed
+
+- *(resolver)* explain trust downgrade failures ([#1110](https://github.com/jdx/aube/pull/1110))
+- *(resolver)* exclude @octokit/endpoint from no-downgrade by default ([#1088](https://github.com/jdx/aube/pull/1088))
+
+### Other
+
+- refresh benchmarks for v1.32.0 ([#1080](https://github.com/jdx/aube/pull/1080))
+
+## [1.32.0](https://github.com/jdx/aube/compare/aube-resolver-v1.31.0...aube-resolver-v1.32.0) - 2026-07-22
+
+### Other
+
+- refresh benchmarks for v1.31.0 ([#1072](https://github.com/jdx/aube/pull/1072))
+
+## [1.30.0](https://github.com/jdx/aube/compare/aube-resolver-v1.29.1...aube-resolver-v1.30.0) - 2026-07-20
+
+### Other
+
+- refresh benchmarks for v1.29.1 ([#1060](https://github.com/jdx/aube/pull/1060))
+
+## [1.29.1](https://github.com/jdx/aube/compare/aube-resolver-v1.29.0...aube-resolver-v1.29.1) - 2026-07-16
+
+### Fixed
+
+- *(add)* honor minimumReleaseAge when pinning manifest versions ([#1056](https://github.com/jdx/aube/pull/1056))
+
+## [1.29.0](https://github.com/jdx/aube/compare/aube-resolver-v1.28.0...aube-resolver-v1.29.0) - 2026-07-16
+
+### Other
+
+- refresh benchmarks for v1.28.0 ([#1050](https://github.com/jdx/aube/pull/1050))
+
+## [1.28.0](https://github.com/jdx/aube/compare/aube-resolver-v1.27.0...aube-resolver-v1.28.0) - 2026-07-16
+
+### Fixed
+
+- *(resolver)* handle versionless scoped npm aliases ([#1044](https://github.com/jdx/aube/pull/1044))
+
+### Other
+
+- refresh benchmarks for v1.27.0 ([#1041](https://github.com/jdx/aube/pull/1041))
+- undo 7-day soak toolchain changes ([#1039](https://github.com/jdx/aube/pull/1039))
+
+## [1.27.0](https://github.com/jdx/aube/compare/aube-resolver-v1.26.0...aube-resolver-v1.27.0) - 2026-07-13
+
+### Other
+
+- 7-day soak across toolchain and deps, cold-path hints, pinned tooling ([#1020](https://github.com/jdx/aube/pull/1020))
+- refresh benchmarks for v1.26.0 ([#1002](https://github.com/jdx/aube/pull/1002))
+
+## [1.26.0](https://github.com/jdx/aube/compare/aube-resolver-v1.25.2...aube-resolver-v1.26.0) - 2026-07-06
+
+### Added
+
+- *(resolver)* allow trust exclude version ranges ([#989](https://github.com/jdx/aube/pull/989))
+
+### Fixed
+
+- *(resolver)* derive integrity from dist.shasum when dist.integrity is absent ([#994](https://github.com/jdx/aube/pull/994))
+
+### Other
+
+- Update sponsor references for jdx.dev ([#978](https://github.com/jdx/aube/pull/978))
+- refresh benchmarks for v1.25.2 ([#975](https://github.com/jdx/aube/pull/975))
+
+## [1.25.2](https://github.com/jdx/aube/compare/aube-resolver-v1.25.1...aube-resolver-v1.25.2) - 2026-07-01
+
+### Fixed
+
+- *(resolver)* allow git deps without package manifests ([#970](https://github.com/jdx/aube/pull/970))
+
+### Other
+
+- refresh benchmarks for v1.25.1 ([#962](https://github.com/jdx/aube/pull/962))
+- *(deps)* update rust crate criterion to 0.8 ([#955](https://github.com/jdx/aube/pull/955))
+
+## [1.25.1](https://github.com/jdx/aube/compare/aube-resolver-v1.25.0...aube-resolver-v1.25.1) - 2026-06-25
+
+### Other
+
+- *(resolver)* share ancestor chains via Arc instead of per-dep deep clone ([#949](https://github.com/jdx/aube/pull/949))
+- refresh benchmarks for v1.25.0 ([#947](https://github.com/jdx/aube/pull/947))
+
+## [1.25.0](https://github.com/jdx/aube/compare/aube-resolver-v1.24.0...aube-resolver-v1.25.0) - 2026-06-25
+
+### Added
+
+- *(runtime)* add shell-activated tool shims ([#945](https://github.com/jdx/aube/pull/945))
+- *(resolver)* support globs and version unions in minimumReleaseAgeExclude ([#941](https://github.com/jdx/aube/pull/941))
+
+### Other
+
+- *(resolver)* index existing-lockfile scans by name ([#930](https://github.com/jdx/aube/pull/930))
+- refresh benchmarks for v1.24.0 ([#937](https://github.com/jdx/aube/pull/937))
+
+## [1.24.0](https://github.com/jdx/aube/compare/aube-resolver-v1.23.0...aube-resolver-v1.24.0) - 2026-06-23
+
+### Fixed
+
+- *(install)* validate trust policy on lockfile reuse ([#929](https://github.com/jdx/aube/pull/929))
+
+### Other
+
+- refresh benchmarks for v1.23.0 ([#922](https://github.com/jdx/aube/pull/922))
+
 ## [1.23.0](https://github.com/jdx/aube/compare/aube-resolver-v1.22.0...aube-resolver-v1.23.0) - 2026-06-21
 
 ### Other

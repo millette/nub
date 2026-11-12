@@ -7,6 +7,222 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.5](https://github.com/aubepkg/aube/compare/aube-lockfile-v2.2.4...aube-lockfile-v2.2.5) - 2026-09-03
+
+### Fixed
+
+- *(release)* avoid major bumps for lockfile error variants ([#1463](https://github.com/aubepkg/aube/pull/1463))
+- *(lockfile)* reject pre-v9 pnpm lockfiles instead of installing nothing ([#1456](https://github.com/aubepkg/aube/pull/1456))
+
+### Other
+
+- move routine workflows to GitHub-hosted runners ([#1469](https://github.com/aubepkg/aube/pull/1469))
+- move project to aubepkg and aube.sh ([#1460](https://github.com/aubepkg/aube/pull/1460))
+- refresh benchmarks for v2.2.4 ([#1434](https://github.com/aubepkg/aube/pull/1434))
+
+## [2.2.4](https://github.com/jdx/aube/compare/aube-lockfile-v2.2.3...aube-lockfile-v2.2.4) - 2026-08-31
+
+### Other
+
+- refresh benchmarks for v2.2.3 ([#1417](https://github.com/jdx/aube/pull/1417))
+
+## [2.2.1](https://github.com/jdx/aube/compare/aube-lockfile-v2.2.0...aube-lockfile-v2.2.1) - 2026-08-29
+
+### Fixed
+
+- *(lockfile)* accept retained importer peers ([#1402](https://github.com/jdx/aube/pull/1402))
+- *(resolver)* match pnpm importer peer semantics ([#1399](https://github.com/jdx/aube/pull/1399))
+
+### Other
+
+- refresh benchmarks for v2.2.0 ([#1384](https://github.com/jdx/aube/pull/1384))
+- *(sponsors)* replace 37signals with omacom foundation ([#1380](https://github.com/jdx/aube/pull/1380))
+
+## [2.2.0](https://github.com/jdx/aube/compare/aube-lockfile-v2.1.0...aube-lockfile-v2.2.0) - 2026-08-25
+
+### Other
+
+- refresh benchmarks for v2.1.0 ([#1372](https://github.com/jdx/aube/pull/1372))
+
+## [2.1.0](https://github.com/jdx/aube/compare/aube-lockfile-v2.0.1...aube-lockfile-v2.1.0) - 2026-08-23
+
+### Other
+
+- refresh benchmarks for v2.0.1 ([#1350](https://github.com/jdx/aube/pull/1350))
+
+## [2.0.1](https://github.com/jdx/aube/compare/aube-lockfile-v2.0.0...aube-lockfile-v2.0.1) - 2026-08-23
+
+### Added
+
+- *(resolver)* [**breaking**] expose lowest-direct resolution mode ([#1345](https://github.com/jdx/aube/pull/1345))
+
+## [1.41.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.40.0...aube-lockfile-v1.41.0) - 2026-08-16
+
+### Fixed
+
+- *(lockfile)* preserve existing npm hoist choices ([#1287](https://github.com/jdx/aube/pull/1287))
+
+### Other
+
+- refresh benchmarks for v1.40.0 ([#1290](https://github.com/jdx/aube/pull/1290))
+
+## [1.40.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.39.0...aube-lockfile-v1.40.0) - 2026-08-13
+
+### Other
+
+- refresh benchmarks for v1.39.0 ([#1285](https://github.com/jdx/aube/pull/1285))
+- Update Star History chart links with sealed tokens
+
+## [1.39.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.38.1...aube-lockfile-v1.39.0) - 2026-08-12
+
+### Fixed
+
+- *(lockfile)* preserve npm remote tarball sources ([#1277](https://github.com/jdx/aube/pull/1277))
+
+### Other
+
+- refresh benchmarks for v1.38.1 ([#1257](https://github.com/jdx/aube/pull/1257))
+
+## [1.38.1](https://github.com/jdx/aube/compare/aube-lockfile-v1.38.0...aube-lockfile-v1.38.1) - 2026-08-10
+
+### Other
+
+- refresh benchmarks for v1.38.0 ([#1244](https://github.com/jdx/aube/pull/1244))
+
+## [1.38.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.37.0...aube-lockfile-v1.38.0) - 2026-08-07
+
+### Fixed
+
+- *(lockfile)* reject unsupported named registry identities ([#1215](https://github.com/jdx/aube/pull/1215))
+
+### Other
+
+- refresh benchmarks for v1.37.0 ([#1211](https://github.com/jdx/aube/pull/1211))
+- refresh benchmarks for v1.37.0 ([#1206](https://github.com/jdx/aube/pull/1206))
+
+## [1.37.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.36.0...aube-lockfile-v1.37.0) - 2026-07-31
+
+### Added
+
+- *(scripts)* use pnpm trusted dependency list ([#1199](https://github.com/jdx/aube/pull/1199))
+
+### Other
+
+- refresh benchmarks for v1.36.0 ([#1185](https://github.com/jdx/aube/pull/1185))
+
+## [1.36.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.35.0...aube-lockfile-v1.36.0) - 2026-07-29
+
+### Other
+
+- refresh benchmarks for v1.35.0 ([#1172](https://github.com/jdx/aube/pull/1172))
+
+## [1.35.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.34.0...aube-lockfile-v1.35.0) - 2026-07-28
+
+### Other
+
+- refresh benchmarks for v1.34.0 ([#1124](https://github.com/jdx/aube/pull/1124))
+
+## [1.33.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.32.0...aube-lockfile-v1.33.0) - 2026-07-25
+
+### Fixed
+
+- *(linker)* apply registry-name patches to npm-aliased installs ([#1085](https://github.com/jdx/aube/pull/1085))
+
+### Other
+
+- refresh benchmarks for v1.32.0 ([#1080](https://github.com/jdx/aube/pull/1080))
+
+## [1.32.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.31.0...aube-lockfile-v1.32.0) - 2026-07-22
+
+### Other
+
+- refresh benchmarks for v1.31.0 ([#1072](https://github.com/jdx/aube/pull/1072))
+
+## [1.30.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.29.1...aube-lockfile-v1.30.0) - 2026-07-20
+
+### Other
+
+- satisfy nightly clippy (question_mark, fetch_update) ([#1066](https://github.com/jdx/aube/pull/1066))
+- refresh benchmarks for v1.29.1 ([#1060](https://github.com/jdx/aube/pull/1060))
+
+## [1.29.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.28.0...aube-lockfile-v1.29.0) - 2026-07-16
+
+### Other
+
+- refresh benchmarks for v1.28.0 ([#1050](https://github.com/jdx/aube/pull/1050))
+
+## [1.28.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.27.0...aube-lockfile-v1.28.0) - 2026-07-16
+
+### Fixed
+
+- *(deploy)* dedupe injected workspace dependencies ([#1038](https://github.com/jdx/aube/pull/1038))
+- *(lockfile)* preserve pnpm patch hashes on re-resolve ([#1035](https://github.com/jdx/aube/pull/1035))
+
+### Other
+
+- refresh benchmarks for v1.27.0 ([#1041](https://github.com/jdx/aube/pull/1041))
+- undo 7-day soak toolchain changes ([#1039](https://github.com/jdx/aube/pull/1039))
+
+## [1.27.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.26.0...aube-lockfile-v1.27.0) - 2026-07-13
+
+### Added
+
+- *(scripts)* allow git repository build approvals ([#1010](https://github.com/jdx/aube/pull/1010))
+
+### Other
+
+- 7-day soak across toolchain and deps, cold-path hints, pinned tooling ([#1020](https://github.com/jdx/aube/pull/1020))
+- refresh benchmarks for v1.26.0 ([#1002](https://github.com/jdx/aube/pull/1002))
+
+## [1.26.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.25.2...aube-lockfile-v1.26.0) - 2026-07-06
+
+### Fixed
+
+- *(import)* preserve custom registry tarball urls ([#997](https://github.com/jdx/aube/pull/997))
+- *(lockfile)* gate tarball integrity parse errors on strict mode ([#995](https://github.com/jdx/aube/pull/995))
+
+### Other
+
+- Update sponsor references for jdx.dev ([#978](https://github.com/jdx/aube/pull/978))
+- refresh benchmarks for v1.25.2 ([#975](https://github.com/jdx/aube/pull/975))
+
+## [1.25.2](https://github.com/jdx/aube/compare/aube-lockfile-v1.25.1...aube-lockfile-v1.25.2) - 2026-07-01
+
+### Fixed
+
+- *(lockfile)* handle yarn berry builtin compat flags & ~/ patch paths ([#963](https://github.com/jdx/aube/pull/963))
+- *(lockfile)* detect npm package-lock root drift ([#974](https://github.com/jdx/aube/pull/974))
+
+### Other
+
+- refresh benchmarks for v1.25.1 ([#962](https://github.com/jdx/aube/pull/962))
+- *(install)* overlap cold-install lockfile write with the link tail ([#961](https://github.com/jdx/aube/pull/961))
+- *(deps)* update rust crate criterion to 0.8 ([#955](https://github.com/jdx/aube/pull/955))
+
+## [1.25.1](https://github.com/jdx/aube/compare/aube-lockfile-v1.25.0...aube-lockfile-v1.25.1) - 2026-06-25
+
+### Other
+
+- refresh benchmarks for v1.25.0 ([#947](https://github.com/jdx/aube/pull/947))
+
+## [1.25.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.24.0...aube-lockfile-v1.25.0) - 2026-06-25
+
+### Added
+
+- *(runtime)* add shell-activated tool shims ([#945](https://github.com/jdx/aube/pull/945))
+
+### Other
+
+- *(linker)* hoist redundant per-package dep-path encode ([#943](https://github.com/jdx/aube/pull/943))
+- *(lockfile)* byte-cursor subset parser for pnpm-lock.yaml ([#912](https://github.com/jdx/aube/pull/912))
+- refresh benchmarks for v1.24.0 ([#937](https://github.com/jdx/aube/pull/937))
+
+## [1.24.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.23.0...aube-lockfile-v1.24.0) - 2026-06-23
+
+### Other
+
+- refresh benchmarks for v1.23.0 ([#922](https://github.com/jdx/aube/pull/922))
+
 ## [1.23.0](https://github.com/jdx/aube/compare/aube-lockfile-v1.22.0...aube-lockfile-v1.23.0) - 2026-06-21
 
 ### Other

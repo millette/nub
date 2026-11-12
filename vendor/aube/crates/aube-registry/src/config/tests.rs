@@ -4,6 +4,14 @@ use base64::Engine as _;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// The registry-client env mapping with the pnpm-v11 bare-key track OFF — the
+/// upstream-neutral path (`npm_config_*` + the `//`-auth `pnpm_config_*`
+/// carve-out). Keeps the long-standing `npm_config_*` mapping tests reading
+/// cleanly; the gated bare-`pnpm_config_*` behavior is exercised separately.
+fn translate_config_env_compat(name: &str, value: &str) -> Option<(String, String)> {
+    super::env::translate_config_env(name, value, false)
+}
+
 /// Serializes the auth.ini tests that touch the process-global
 /// `engine_context().read_branded_pnpm_config` gate, so the toggle test's
 /// disabled-window can't race a concurrent auth.ini read that assumes the
@@ -74,7 +82,7 @@ fn scoped_registry_lookup_is_case_insensitive() {
 }
 
 #[test]
-fn yarnrc_translates_registry_scope_auth_and_linker_subset() {
+fn yarnrc_translates_registry_and_scope_auth_but_never_the_layout_linker() {
     let entries = translate_yarnrc_content(
         r#"
 npmRegistryServer: "https://registry.yarn.example"
@@ -110,7 +118,10 @@ nodeLinker: node-modules
         "//npm.myorg.example/:_authToken".to_string(),
         "scope-token".to_string()
     )));
-    assert!(entries.contains(&("nodeLinker".to_string(), "hoisted".to_string())));
+    assert!(
+        entries.iter().all(|(k, _)| k != "nodeLinker"),
+        "node_modules layout is not translated out of a Yarn-branded file: {entries:?}"
+    );
 }
 
 #[test]
@@ -173,18 +184,17 @@ npmRegistries:
 }
 
 #[test]
-fn yarnrc_maps_pnpm_linker_to_existing_isolated_linker_and_leaves_pnp_untranslated() {
-    let entries = translate_yarnrc_content("nodeLinker: pnpm\n");
-    assert_eq!(
-        entries,
-        vec![("nodeLinker".to_string(), "isolated".to_string())]
-    );
-
-    let entries = translate_yarnrc_content("nodeLinker: pnp\n");
-    assert!(
-        entries.iter().all(|(k, _)| k != "nodeLinker"),
-        "PnP install generation is out of scope; the translator must leave it to nub's warning/refusal path"
-    );
+fn yarnrc_leaves_every_node_linker_value_untranslated() {
+    // Layout is not the guarantee (version resolution, module resolution, the
+    // lockfile are), so no Yarn linker value produces a setting. `pnp` in
+    // particular stays untranslated for the embedder's refusal path to see.
+    for value in ["node-modules", "pnpm", "pnp"] {
+        let entries = translate_yarnrc_content(&format!("nodeLinker: {value}\n"));
+        assert!(
+            entries.is_empty(),
+            "nodeLinker: {value} must translate to nothing, got {entries:?}"
+        );
+    }
 }
 
 #[test]
@@ -379,6 +389,55 @@ supportedArchitectures:
     assert_eq!(value["os"], serde_json::json!(["current", "linux"]));
     assert_eq!(value["cpu"], serde_json::json!(["arm64"]));
     assert_eq!(value["libc"], serde_json::json!(["glibc"]));
+}
+
+#[test]
+fn yarnrc_translates_min_age_gate_to_minimum_release_age() {
+    // Yarn's `npmMinimalAgeGate` is a DURATION declared in MINUTES. A unit
+    // suffix is converted to minutes the way Yarn's parseDuration does
+    // (`7d` = 7 * 1440 = 10080 min); a bare number is already minutes; a
+    // sub-minute value rounds UP so it never collapses to 0 (disabling the
+    // gate). `npmPreapprovedPackages` → `minimumReleaseAgeExclude`.
+    let entries = translate_yarnrc_content(
+        "npmMinimalAgeGate: 7d\nnpmPreapprovedPackages:\n  - \"@acme/internal\"\n  - left-pad\n",
+    );
+    let age = entries
+        .iter()
+        .find(|(k, _)| k == "minimumReleaseAge")
+        .map(|(_, v)| v.as_str())
+        .expect("npmMinimalAgeGate must map to minimumReleaseAge");
+    assert_eq!(age, "10080", "7d must convert to 10080 minutes");
+    let exclude = entries
+        .iter()
+        .find(|(k, _)| k == "minimumReleaseAgeExclude")
+        .map(|(_, v)| v.as_str())
+        .expect("npmPreapprovedPackages must map to minimumReleaseAgeExclude");
+    assert_eq!(exclude, "@acme/internal,left-pad");
+
+    // Bare number = minutes (unitless DURATION path).
+    let bare = translate_yarnrc_content("npmMinimalAgeGate: 1440\n");
+    assert_eq!(
+        bare.iter()
+            .find(|(k, _)| k == "minimumReleaseAge")
+            .map(|(_, v)| v.as_str()),
+        Some("1440")
+    );
+
+    // Sub-minute gate rounds up to 1, never 0.
+    let sub = translate_yarnrc_content("npmMinimalAgeGate: 30s\n");
+    assert_eq!(
+        sub.iter()
+            .find(|(k, _)| k == "minimumReleaseAge")
+            .map(|(_, v)| v.as_str()),
+        Some("1")
+    );
+
+    // Unset gate emits no entry (yarn's `1d` default is yarn's, not nub's).
+    let unset = translate_yarnrc_content("nodeLinker: node-modules\n");
+    assert!(
+        unset.iter().all(|(k, _)| k != "minimumReleaseAge"),
+        "an unset npmMinimalAgeGate must not synthesize a minimumReleaseAge entry"
+    );
 }
 
 #[test]
@@ -626,32 +685,77 @@ npmScopes:
 }
 
 #[test]
-fn yarnrc_node_linker_reaches_split_settings_sources_only_when_gated_on() {
+fn yarnrc_reaches_split_settings_sources_only_when_gated_on() {
+    const YARNRC: &str = "npmRegistryServer: https://from-yarnrc.example\n";
+    let expected = (
+        "registry".to_string(),
+        "https://from-yarnrc.example/".to_string(),
+    );
     let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let disabled_project = tempfile::tempdir().unwrap();
-    std::fs::write(
-        disabled_project.path().join(".yarnrc.yml"),
-        "nodeLinker: node-modules\n",
-    )
-    .unwrap();
+    std::fs::write(disabled_project.path().join(".yarnrc.yml"), YARNRC).unwrap();
     aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
     let disabled = load_npmrc_entries_split(disabled_project.path());
-    assert!(disabled.project.iter().all(|(key, _)| key != "nodeLinker"));
+    assert!(disabled.project.iter().all(|(key, _)| key != "registry"));
 
     let enabled_project = tempfile::tempdir().unwrap();
-    std::fs::write(
-        enabled_project.path().join(".yarnrc.yml"),
-        "nodeLinker: node-modules\n",
-    )
-    .unwrap();
+    std::fs::write(enabled_project.path().join(".yarnrc.yml"), YARNRC).unwrap();
     aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
     let enabled = load_npmrc_entries_split(enabled_project.path());
     aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
+    assert!(enabled.project.contains(&expected));
+}
+
+#[test]
+fn pnpm11_npmrc_allowlist_drops_layout_keys_but_keeps_auth_registry_network() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    // A project `.npmrc` mixing layout/behavior keys (dropped under pnpm 11)
+    // with auth/registry/network keys (kept). `no-proxy` (hyphen) is
+    // allowlisted; npm's `noproxy` spelling is NOT — the pnpm-11 quirk.
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "node-linker=hoisted\n\
+         ignore-scripts=true\n\
+         registry=https://example.test/\n\
+         @myorg:registry=https://npm.myorg.test/\n\
+         //example.test/:_authToken=TKN\n\
+         strict-ssl=false\n\
+         no-proxy=example.test\n\
+         noproxy=other.test\n",
+    )
+    .unwrap();
+
+    // Posture OFF (standalone-aube default / pnpm ≤10): open key space —
+    // the layout key survives.
+    aube_util::update_engine_context(|c| c.npmrc_settings_allowlist = false);
+    let open = load_npmrc_entries_split(project.path());
     assert!(
-        enabled
-            .project
-            .contains(&("nodeLinker".to_string(), "hoisted".to_string()))
+        open.project.iter().any(|(k, _)| k == "node-linker"),
+        "open key space must keep the layout key"
     );
+
+    // Posture ON (pnpm-11 incumbent): layout/behavior keys dropped;
+    // auth/registry/network keys kept.
+    aube_util::update_engine_context(|c| c.npmrc_settings_allowlist = true);
+    let gated = load_npmrc_entries_split(project.path());
+    aube_util::update_engine_context(|c| c.npmrc_settings_allowlist = false);
+
+    let has = |k: &str| gated.project.iter().any(|(key, _)| key == k);
+    assert!(!has("node-linker"), "layout key must be dropped");
+    assert!(!has("ignore-scripts"), "behavior key must be dropped");
+    assert!(
+        !has("noproxy"),
+        "npm's `noproxy` spelling is not allowlisted"
+    );
+    assert!(has("registry"), "registry must survive");
+    assert!(has("@myorg:registry"), "scoped registry must survive");
+    assert!(
+        has("//example.test/:_authToken"),
+        "URL-scoped auth token must survive"
+    );
+    assert!(has("strict-ssl"), "TLS key must survive");
+    assert!(has("no-proxy"), "`no-proxy` (hyphen) must survive");
 }
 
 #[test]
@@ -803,8 +907,8 @@ fn yarn_env_subset_is_translated_above_yarnrc_files() {
 
     assert_eq!(cfg.registry, "https://from-yarn-env.example/");
     assert!(
-        yarn_env_entries_from(&[("YARN_NODE_LINKER".to_string(), "pnpm".to_string())])
-            .contains(&("nodeLinker".to_string(), "isolated".to_string()))
+        yarn_env_entries_from(&[("YARN_NODE_LINKER".to_string(), "pnpm".to_string())]).is_empty(),
+        "the Yarn env alias for layout is gone alongside the file one"
     );
 }
 
@@ -895,22 +999,23 @@ fn split_loader_cache_is_sensitive_to_yarn_gate() {
     let project = tempfile::tempdir().unwrap();
     std::fs::write(
         project.path().join(".yarnrc.yml"),
-        "nodeLinker: node-modules\n",
+        "npmRegistryServer: https://from-yarnrc.example\n",
     )
     .unwrap();
 
     aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
     let disabled = load_npmrc_entries_split(project.path());
-    assert!(disabled.project.iter().all(|(key, _)| key != "nodeLinker"));
+    assert!(disabled.project.iter().all(|(key, _)| key != "registry"));
 
     aube_util::update_engine_context(|ctx| ctx.read_yarn_config = true);
     let enabled = load_npmrc_entries_split(project.path());
     aube_util::update_engine_context(|ctx| ctx.read_yarn_config = false);
 
     assert!(
-        enabled
-            .project
-            .contains(&("nodeLinker".to_string(), "hoisted".to_string())),
+        enabled.project.contains(&(
+            "registry".to_string(),
+            "https://from-yarnrc.example/".to_string()
+        )),
         "same project_dir must not reuse a gate-disabled cached split"
     );
 }
@@ -1007,7 +1112,7 @@ fn parse_npmrc_strips_surrounding_quotes() {
 
 #[test]
 fn parse_npmrc_expands_env_in_keys_for_per_uri_auth() {
-    // Regression for jdx/aube#519. Nexus / Artifactory setups
+    // Regression for aubepkg/aube#519. Nexus / Artifactory setups
     // commonly template the registry-prefix portion of per-URI
     // auth keys via env vars injected by sops/CI:
     //
@@ -1287,6 +1392,7 @@ fn npmrc_cascade_orders_builtin_global_user_project() {
     let tagged = load_npmrc_entries_tagged_with_globals(
         Some(home.path()),
         None,
+        Some(&test_local_app_data(home.path())),
         project.path(),
         None,
         &globals,
@@ -1366,6 +1472,7 @@ fn global_npmrc_may_set_token_helper_project_may_not() {
     config.apply_tagged(load_npmrc_entries_tagged_with_globals(
         Some(home.path()),
         None,
+        Some(&test_local_app_data(home.path())),
         project.path(),
         None,
         &globals,
@@ -2209,6 +2316,47 @@ fn test_explicit_https_proxy_wins_over_npmrc_proxy() {
 }
 
 #[test]
+fn test_legacy_proxy_false_disables_environment_fallback() {
+    let mut config = NpmConfig::default();
+    config.apply(vec![("proxy".to_string(), "false".to_string())]);
+    config.apply_proxy_env();
+
+    assert_eq!(config.npmrc_proxy.as_deref(), Some("false"));
+    assert!(config.https_proxy.is_none());
+    assert!(config.http_proxy.is_none());
+}
+
+#[test]
+fn test_scheme_specific_proxy_overrides_legacy_false() {
+    let mut config = NpmConfig::default();
+    config.apply(vec![
+        ("proxy".to_string(), "false".to_string()),
+        (
+            "https-proxy".to_string(),
+            "http://explicit:8080".to_string(),
+        ),
+    ]);
+    config.apply_proxy_env();
+
+    assert_eq!(config.https_proxy.as_deref(), Some("http://explicit:8080"));
+    assert_eq!(config.http_proxy.as_deref(), Some("http://explicit:8080"));
+}
+
+#[test]
+fn test_false_and_null_scheme_proxy_values_are_unset() {
+    let mut config = NpmConfig::default();
+    config.apply(vec![
+        ("https-proxy".to_string(), "false".to_string()),
+        ("http-proxy".to_string(), "null".to_string()),
+        ("no-proxy".to_string(), "false".to_string()),
+    ]);
+
+    assert!(config.https_proxy.is_none());
+    assert!(config.http_proxy.is_none());
+    assert!(config.no_proxy.is_none());
+}
+
+#[test]
 fn test_default_strict_ssl_is_true() {
     // Regression: `NpmConfig::default()` must not leave
     // `strict_ssl = false` (bool::default), because
@@ -2399,6 +2547,41 @@ fn test_load_npmrc_entries_orders_user_before_project() {
     );
 }
 
+// The cross-platform guard for nub#605. The Windows branch of pnpm's
+// config-dir resolver used to read `%LOCALAPPDATA%` env-direct, so an
+// injected tempdir home was discarded there and the `auth.ini` path landed
+// in the developer's real user profile: every fixture write clobbered their
+// pnpm credentials, and every sibling test that resolved a token then read
+// the leftover. Assert the containment rather than the escape, so this fails
+// on the platform that regresses instead of on the one that runs it.
+#[test]
+fn pnpm_auth_ini_path_stays_inside_the_injected_home() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let auth_ini = test_pnpm_global_auth_ini_path(home_dir.path());
+    assert!(
+        auth_ini.starts_with(home_dir.path()),
+        "auth.ini escaped its tempdir: {} is not under {}",
+        auth_ini.display(),
+        home_dir.path().display()
+    );
+    if cfg!(windows) {
+        assert_eq!(
+            auth_ini,
+            test_local_app_data(home_dir.path())
+                .join("pnpm")
+                .join("config")
+                .join("auth.ini"),
+            "the Windows branch must resolve against the injected local-app-data root"
+        );
+    }
+}
+
+// These three exercise pnpm's per-OS config-dir branch (no XDG override), so
+// they build the fixture through `test_pnpm_global_auth_ini_path` — the same
+// resolver the loader reads, pinned to the tempdir home on every platform
+// including Windows. Composing the path by hand is what let the fixture escape
+// into the real `%LOCALAPPDATA%\pnpm\config` and overwrite a developer's pnpm
+// credentials (nub#605).
 #[test]
 fn pnpm_global_auth_ini_loads_and_overrides_user_rc() {
     // `~/.config/pnpm/auth.ini` is pnpm's out-of-band credential
@@ -2418,10 +2601,8 @@ fn pnpm_global_auth_ini_loads_and_overrides_user_rc() {
     .unwrap();
     // Place auth.ini at pnpm's per-OS config dir (no XDG override), not a
     // flat `~/.config/pnpm` — the latter is correct only on Linux, so the
-    // file must land where `pnpm_config_dir_with` resolves on the test host.
-    let auth_ini = aube_util::env::pnpm_config_dir_with(Some(home_dir.path()), None)
-        .unwrap()
-        .join("auth.ini");
+    // file must land where the loader itself resolves it on the test host.
+    let auth_ini = test_pnpm_global_auth_ini_path(home_dir.path());
     std::fs::create_dir_all(auth_ini.parent().unwrap()).unwrap();
     std::fs::write(
         &auth_ini,
@@ -2482,6 +2663,30 @@ fn pnpm_global_auth_ini_honors_xdg_config_home_override() {
     );
 }
 
+// pnpm resolves its config dir from `XDG_CONFIG_HOME` (and, on Windows, from
+// `%LOCALAPPDATA%`) without ever calling `os.homedir()`, so a machine with no
+// home still has a global `auth.ini`. Guarding the read on the presence of a
+// home instead of on the resolved config dir made nub skip the user's real
+// credentials there.
+#[test]
+fn pnpm_global_auth_ini_is_read_without_a_home_when_xdg_resolves() {
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let proj_dir = tempfile::tempdir().unwrap();
+
+    let auth_ini = xdg_dir.path().join("pnpm/auth.ini");
+    std::fs::create_dir_all(auth_ini.parent().unwrap()).unwrap();
+    std::fs::write(&auth_ini, "//registry.example.com/:_authToken=xdg-token\n").unwrap();
+
+    let entries = load_npmrc_entries_with_home(None, Some(xdg_dir.path()), proj_dir.path(), None);
+    let mut cfg = NpmConfig::default();
+    cfg.apply(entries);
+    assert_eq!(
+        cfg.auth_token_for("https://registry.example.com/"),
+        Some("xdg-token"),
+    );
+}
+
 #[test]
 fn pnpm_global_auth_ini_loses_to_project_npmrc() {
     // Project `.npmrc` pins still win — per-repo configuration is
@@ -2491,9 +2696,7 @@ fn pnpm_global_auth_ini_loses_to_project_npmrc() {
     let home_dir = tempfile::tempdir().unwrap();
     let proj_dir = tempfile::tempdir().unwrap();
 
-    let auth_ini = aube_util::env::pnpm_config_dir_with(Some(home_dir.path()), None)
-        .unwrap()
-        .join("auth.ini");
+    let auth_ini = test_pnpm_global_auth_ini_path(home_dir.path());
     std::fs::create_dir_all(auth_ini.parent().unwrap()).unwrap();
     std::fs::write(
         &auth_ini,
@@ -2537,9 +2740,7 @@ fn pnpm_global_auth_ini_not_read_when_gate_disabled() {
     .unwrap();
     // Per-OS config dir (no XDG override), so the fixture matches where
     // `pnpm_global_auth_ini_path` looks on the test host.
-    let auth_ini = aube_util::env::pnpm_config_dir_with(Some(home_dir.path()), None)
-        .unwrap()
-        .join("auth.ini");
+    let auth_ini = test_pnpm_global_auth_ini_path(home_dir.path());
     std::fs::create_dir_all(auth_ini.parent().unwrap()).unwrap();
     std::fs::write(
         &auth_ini,
@@ -2853,10 +3054,15 @@ fn fetch_policy_default_matches_settings_toml_declared_defaults() {
     // `FetchPolicy::from_ctx` still get the same behavior.
     let p = FetchPolicy::default();
     assert_eq!(p.timeout_ms, 300_000);
+    assert_eq!(p.stall_timeout_ms, 60_000);
     assert_eq!(p.retries, 2);
     assert_eq!(p.retry_factor, 10);
     assert_eq!(p.retry_min_timeout_ms, 10_000);
     assert_eq!(p.retry_max_timeout_ms, 60_000);
+    assert!(
+        p.stall_timeout_ms < p.timeout_ms,
+        "the idle bound must trip before the whole-request budget, or it can never fire",
+    );
 }
 
 #[test]
@@ -2970,16 +3176,16 @@ fn translate_npm_config_env_maps_default_registry() {
     // `NPM_CONFIG_REGISTRY aube install` works; this is the hook
     // that makes it true.
     assert_eq!(
-        translate_npm_config_env("NPM_CONFIG_REGISTRY", "https://r.example/"),
+        translate_config_env_compat("NPM_CONFIG_REGISTRY", "https://r.example/"),
         Some(("registry".to_string(), "https://r.example/".to_string()))
     );
     assert_eq!(
-        translate_npm_config_env("npm_config_registry", "https://r.example/"),
+        translate_config_env_compat("npm_config_registry", "https://r.example/"),
         Some(("registry".to_string(), "https://r.example/".to_string()))
     );
     // Non-npm env vars are ignored so the entry list stays tight
     // and `apply` isn't fed noise.
-    assert_eq!(translate_npm_config_env("HOME", "/tmp"), None);
+    assert_eq!(translate_config_env_compat("HOME", "/tmp"), None);
 }
 
 #[test]
@@ -2999,7 +3205,7 @@ fn translate_npm_config_env_maps_proxy_and_tls_knobs() {
     ];
     for (name, value, expected_key) in cases {
         assert_eq!(
-            translate_npm_config_env(name, value),
+            translate_config_env_compat(name, value),
             Some((expected_key.to_string(), value.to_string())),
             "mapping failed for {name}"
         );
@@ -3012,14 +3218,14 @@ fn translate_npm_config_env_maps_scoped_registry() {
     // lowercase canonical `@myorg:registry` key that `apply`
     // matches via `strip_suffix(":registry")`.
     assert_eq!(
-        translate_npm_config_env("NPM_CONFIG_@MYORG:REGISTRY", "https://r.mycorp/"),
+        translate_config_env_compat("NPM_CONFIG_@MYORG:REGISTRY", "https://r.mycorp/"),
         Some((
             "@myorg:registry".to_string(),
             "https://r.mycorp/".to_string()
         ))
     );
     assert_eq!(
-        translate_npm_config_env("npm_config_@myorg:registry", "https://r.mycorp/"),
+        translate_config_env_compat("npm_config_@myorg:registry", "https://r.mycorp/"),
         Some((
             "@myorg:registry".to_string(),
             "https://r.mycorp/".to_string()
@@ -3033,7 +3239,7 @@ fn translate_npm_config_env_passes_uri_auth_through_verbatim() {
     // Passthrough preserves the `_authToken` casing that `apply`
     // matches inside its `starts_with("//")` branch.
     assert_eq!(
-        translate_npm_config_env(
+        translate_config_env_compat(
             "NPM_CONFIG_//registry.example.com/:_authToken",
             "secret-token"
         ),
@@ -3047,7 +3253,7 @@ fn translate_npm_config_env_passes_uri_auth_through_verbatim() {
 #[test]
 fn translate_npm_config_env_passes_pnpm_uri_auth_through_verbatim() {
     assert_eq!(
-        translate_npm_config_env(
+        translate_config_env_compat(
             "PNPM_CONFIG_//registry.example.com/:_authToken",
             "secret-token"
         ),
@@ -3081,12 +3287,149 @@ fn npm_config_env_entries_pnpm_uri_auth_wins_over_npm_uri_auth() {
 #[test]
 fn translate_npm_config_env_ignores_uri_token_helper() {
     assert_eq!(
-        translate_npm_config_env(
+        translate_config_env_compat(
             "pnpm_config_//registry.example.com/:tokenHelper",
             "/tmp/helper"
         ),
         None
     );
+}
+
+/// Serializes the tests that flip the process-global
+/// `engine_context().read_pnpm_config_env_registry` gate so a window can't race
+/// a concurrent load assuming the upstream default (off).
+static PNPM_CONFIG_ENV_GATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn translate_config_env_ignores_bare_pnpm_keys_when_gate_off() {
+    // Upstream / non-pnpm-v11 path: bare `pnpm_config_<key>` registry-client
+    // keys are another tool's convention and are NOT mapped. Only `npm_config_*`
+    // and the `//`-auth `pnpm_config_*` carve-out apply (covered above).
+    for name in [
+        "pnpm_config_registry",
+        "PNPM_CONFIG_REGISTRY",
+        "pnpm_config_strict_ssl",
+        "pnpm_config_https_proxy",
+    ] {
+        assert_eq!(
+            super::env::translate_config_env(name, "x", false),
+            None,
+            "{name} must be ignored when the pnpm-v11 gate is off"
+        );
+    }
+}
+
+#[test]
+fn translate_config_env_maps_bare_pnpm_keys_when_gate_on() {
+    // pnpm v11+ incumbent: bare `pnpm_config_<key>` / `PNPM_CONFIG_<KEY>` land
+    // on the same canonical `.npmrc` keys as their `npm_config_*` twins. The key
+    // set mirrors real pnpm 11.9 (`config/reader/src/env.ts` is generic over the
+    // settings schema; these are the registry-client members probed against it).
+    let cases = [
+        ("pnpm_config_registry", "https://r.ex/", "registry"),
+        ("PNPM_CONFIG_REGISTRY", "https://r.ex/", "registry"),
+        ("pnpm_config_proxy", "http://p:0", "proxy"),
+        ("pnpm_config_https_proxy", "http://p:8", "https-proxy"),
+        ("pnpm_config_http_proxy", "http://p:9", "http-proxy"),
+        ("pnpm_config_noproxy", "a.com,b.com", "noproxy"),
+        // pnpm 11 kebab-cases the suffix, so the underscored `no_proxy` spelling
+        // maps to the same `noproxy` key as the collapsed form.
+        ("pnpm_config_no_proxy", "c.com", "noproxy"),
+        ("pnpm_config_strict_ssl", "false", "strict-ssl"),
+        ("PNPM_CONFIG_STRICT_SSL", "false", "strict-ssl"),
+        ("pnpm_config_local_address", "1.2.3.4", "local-address"),
+        ("pnpm_config_maxsockets", "7", "maxsockets"),
+    ];
+    for (name, value, expected_key) in cases {
+        assert_eq!(
+            super::env::translate_config_env(name, value, true),
+            Some((expected_key.to_string(), value.to_string())),
+            "bare pnpm mapping failed for {name}"
+        );
+    }
+}
+
+#[test]
+fn translate_config_env_rejects_non_snake_pnpm_suffix() {
+    // pnpm 11's env reader requires a strictly snake_case suffix in a SINGLE
+    // case (`getEnvKeySuffix` → `isLowerSnakeCase`/`isUpperSnakeCase`). So a
+    // mixed-case suffix, and the `@scope:registry` / `//`-auth shapes (which
+    // carry `@`/`:`/`/`), are NOT readable via the bare `pnpm_config_` prefix —
+    // matching pnpm 11, which rejects them too. (`//`-auth still flows through
+    // the dedicated url-scoped carve-out, asserted separately above.)
+    for name in [
+        "PNPM_CONFIG_Strict_Ssl",      // mixed case
+        "pnpm_config_STRICT_SSL",      // upper suffix under lower prefix
+        "pnpm_config_@myorg:registry", // scoped registry: not snake
+        "pnpm_config_strict-ssl",      // hyphen, not underscore
+    ] {
+        assert_eq!(
+            super::env::translate_config_env(name, "false", true),
+            None,
+            "{name} must be rejected as non-snake under the pnpm prefix"
+        );
+    }
+}
+
+#[test]
+fn load_with_env_honors_bare_pnpm_config_registry_only_when_gate_on() {
+    let _guard = PNPM_CONFIG_ENV_GATE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        "registry=https://file.registry.example/\n",
+    )
+    .unwrap();
+    let env = vec![(
+        "pnpm_config_registry".to_string(),
+        "https://pnpm.registry.example/".to_string(),
+    )];
+
+    // Off (pnpm ≤10 / non-pnpm / unknown): `pnpm_config_registry` is ignored,
+    // the project `.npmrc` registry stands — matching real pnpm 10.
+    aube_util::update_engine_context(|c| c.read_pnpm_config_env_registry = false);
+    let disabled = NpmConfig::load_with_env(dir.path(), &env);
+    assert_eq!(disabled.registry, "https://file.registry.example/");
+
+    // On (pnpm v11+ incumbent): `pnpm_config_registry` wins over the project
+    // file (env beats file in pnpm) — matching real pnpm 11.9.
+    aube_util::update_engine_context(|c| c.read_pnpm_config_env_registry = true);
+    let enabled = NpmConfig::load_with_env(dir.path(), &env);
+    aube_util::update_engine_context(|c| c.read_pnpm_config_env_registry = false);
+    assert_eq!(enabled.registry, "https://pnpm.registry.example/");
+}
+
+#[test]
+fn npm_config_env_entries_pnpm_registry_deterministically_beats_npm_when_gate_on() {
+    let _guard = PNPM_CONFIG_ENV_GATE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // Both prefixes set the same non-auth key. Real pnpm 11 reads ONLY
+    // `pnpm_config_*` and ignores `npm_config_*`, so the pnpm value must win
+    // deterministically regardless of env iteration order. The entries are
+    // applied last-write-wins, so the pnpm-prefixed entry must come LAST.
+    let env = [
+        (
+            "npm_config_registry".to_string(),
+            "https://npm.example/".to_string(),
+        ),
+        (
+            "pnpm_config_registry".to_string(),
+            "https://pnpm.example/".to_string(),
+        ),
+    ];
+    aube_util::update_engine_context(|c| c.read_pnpm_config_env_registry = true);
+    let entries = super::env::npm_config_env_entries_from(&env);
+    aube_util::update_engine_context(|c| c.read_pnpm_config_env_registry = false);
+    // pnpm-prefixed registry is the last `registry` entry → wins on apply.
+    let last_registry = entries
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "registry")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(last_registry, Some("https://pnpm.example/"));
 }
 
 /// Serializes the tests that flip the process-global
@@ -3242,7 +3585,7 @@ fn env_registry_overrides_project_npmrc() {
     assert_eq!(config.registry, "https://file.registry/");
     // Emulate the `load_npm_config_env_entries` output for
     // `NPM_CONFIG_REGISTRY=https://env.registry/`.
-    let env = translate_npm_config_env("NPM_CONFIG_REGISTRY", "https://env.registry/")
+    let env = translate_config_env_compat("NPM_CONFIG_REGISTRY", "https://env.registry/")
         .map(|e| vec![e])
         .unwrap_or_default();
     config.apply(env);
@@ -3550,4 +3893,79 @@ fn genuine_committed_project_npmrc_in_nested_dir_stays_untrusted() {
         config.strict_ssl,
         "committed project .npmrc must not disable strict-ssl (untrusted)",
     );
+}
+
+#[test]
+fn workspace_member_reads_the_workspace_root_npmrc() {
+    // A command that targets a member (`add` inside it, `update -r`,
+    // `--filter`) hands the loader the member's directory. The workspace
+    // root's `.npmrc` must still supply the registry, scoped registries and
+    // auth, at the same untrusted project tier as any project file; whether
+    // the invoking member's own file layers on top is the per-PM model.
+    use aube_util::WorkspaceNpmrc::{RootBeneathMember, RootOnly};
+    let _gate = AUTH_INI_GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let env = isolated_npmrc_env(root.path());
+    std::fs::write(
+        root.path().join("package.json"),
+        r#"{"name":"root","workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".npmrc"),
+        "registry=https://root.example/\n\
+         @corp:registry=https://corp.example/\n\
+         //corp.example/:_authToken=root-token\n\
+         //corp.example/:tokenHelper=/bin/evil\n",
+    )
+    .unwrap();
+    let member = root.path().join("packages").join("a");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(member.join("package.json"), r#"{"name":"a"}"#).unwrap();
+    std::fs::write(member.join(".npmrc"), "registry=https://member.example/\n").unwrap();
+
+    // A caller outside the workspace that hands the engine the member path
+    // (`-C packages/a` from elsewhere) makes the member the invoking package.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let saved = aube_util::engine_context();
+    let cases = [
+        (
+            RootBeneathMember,
+            member.as_path(),
+            "https://member.example/",
+        ),
+        (RootBeneathMember, root.path(), "https://root.example/"),
+        (
+            RootBeneathMember,
+            elsewhere.path(),
+            "https://member.example/",
+        ),
+        (RootOnly, elsewhere.path(), "https://root.example/"),
+        (RootOnly, member.as_path(), "https://root.example/"),
+    ];
+    for (model, invoked_from, expected) in cases {
+        aube_util::update_engine_context(|c| {
+            c.workspace_npmrc = model;
+            c.invocation_dir = Some(invoked_from.to_path_buf());
+        });
+        let cfg = NpmConfig::load_with_env(&member, &env);
+        let invoked = invoked_from.display();
+        assert_eq!(cfg.registry, expected, "{model:?} invoked from {invoked}");
+        assert_eq!(
+            cfg.registry_for("@corp/pkg"),
+            "https://corp.example/",
+            "{model:?} invoked from {invoked}: root scoped registry"
+        );
+        assert_eq!(
+            cfg.auth_token_for("https://corp.example/"),
+            Some("root-token"),
+            "{model:?} invoked from {invoked}: root auth"
+        );
+        assert_eq!(
+            cfg.token_helper_for("https://corp.example/"),
+            None,
+            "{model:?} invoked from {invoked}: a tokenHelper in the root .npmrc is project-controlled"
+        );
+    }
+    aube_util::set_engine_context(saved);
 }

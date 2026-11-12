@@ -11,12 +11,14 @@ use std::path::Path;
 
 mod builder;
 mod clonedir;
+mod disk_materialize;
 mod error;
 mod hoisted;
 mod link;
 mod materialize;
 mod patches;
 mod pool;
+mod quarantine;
 mod sweep;
 pub mod sys;
 
@@ -25,6 +27,10 @@ mod public_hoist_tests;
 #[cfg(test)]
 mod tests;
 
+pub use disk_materialize::{
+    DiskMaterializePlan, PackageNameMatcher, expand_disk_materialize, package_name_matches,
+    set_disk_materialize_expand_hook,
+};
 pub use error::Error;
 pub use hoisted::HoistedPlacements;
 pub use link::build_nested_link_targets;
@@ -32,13 +38,17 @@ pub(crate) use materialize::{
     invalidate_stale_index_for_package, validate_index_key, validate_package_link_name,
 };
 pub use patches::Patches;
-pub(crate) use patches::apply_multi_file_patch;
+pub use patches::{apply_multi_file_patch, copy_package_from_store};
 pub use pool::default_linker_parallelism;
+pub use quarantine::strip_quarantine_from_tree;
 pub use sweep::{is_physical_importer, mkdirp, remove_dir_all_with_retry, sweep_stale_tmp_dirs};
 pub(crate) use sweep::{sweep_stale_top_level_entries, try_remove_entry};
+#[cfg(windows)]
+pub use sys::win_shim_paths;
 pub use sys::{
-    BinShimOptions, create_bin_shim, create_dir_link, normalize_path, parse_posix_shim_target,
-    remove_bin_shim, validate_bin_name, validate_bin_target,
+    BinShimOptions, create_bin_shim, create_dir_link, is_native_executable, normalize_path,
+    parse_posix_shim_target, parse_win_shim_target, remove_bin_shim, validate_bin_name,
+    validate_bin_target,
 };
 
 /// Strategy for arranging packages under `node_modules/`.
@@ -66,11 +76,15 @@ pub enum NodeLinker {
 /// Limit how far packages may be promoted in `NodeLinker::Hoisted`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum HoistingLimits {
-    /// Hoist as far as possible.
+    /// Hoist as far as possible. In a workspace this hoists across every
+    /// member into the single shared workspace-root `node_modules`, so a
+    /// dependency at one version lives once at the root and only conflicts
+    /// nest (real pnpm's `nodeLinker=hoisted` default).
     #[default]
     None,
-    /// Aube plans hoisted installs per physical importer, so this is
-    /// currently equivalent to `None`.
+    /// Hoist only as far as each workspace package: every member's
+    /// `node_modules` is planned independently, bordered at the member
+    /// root, so transitives never promote across the workspace.
     Workspaces,
     /// Do not hoist transitives above the direct dependency that
     /// introduced them.
@@ -98,6 +112,11 @@ pub struct Linker {
     /// `allowBuilds` entries flipped, engine version bumped).
     pub(crate) store: Store,
     use_global_virtual_store: bool,
+    /// Exact dep paths that must be materialized into the project's
+    /// `.aube/` tree even while the rest of the graph uses the global
+    /// virtual store. This is reserved for compatibility transforms
+    /// that need to mutate one package without touching shared bytes.
+    project_local_dep_paths: rustc_hash::FxHashSet<String>,
     strategy: LinkStrategy,
     /// Per-`name@version` patch contents applied at materialize
     /// time. Empty when the project has no `pnpm.patchedDependencies`.
@@ -227,20 +246,84 @@ pub struct Linker {
     /// `NodeLinker::Hoisted` — that layout *is* a flat top-level
     /// materialization, so "only the virtual store" doesn't apply.
     virtual_store_only: bool,
+    /// Per-project `<registry-name>@<version>` → computed-sha512
+    /// bindings for packages whose lockfile carries no integrity
+    /// (v1/legacy or an integrity-stripping proxy). Consulted ONLY by
+    /// the on-demand `load_index` fallback (a package the fetch driver
+    /// classified `AlreadyLinked` whose `.aube/<dep_path>` entry then
+    /// vanished or was invalidated). Without it, such a package's index
+    /// read would key by `None` and either miss or, in a shared store,
+    /// hit a content-free selector pointing at another project's bytes;
+    /// this binds the read to the sha512 THIS project computed, matching
+    /// the warm classifier. Empty for callers that don't supply it
+    /// (standalone-default and every existing test) → unchanged behavior.
+    no_integrity_read_keys: std::collections::BTreeMap<String, String>,
+    /// Optional shared counter bumped once per linked file during the
+    /// materialize pass. The install driver hands in the progress UI's
+    /// `files_linked` atomic (via [`with_link_progress`]) so the linking
+    /// phase can surface a live, ticking file count instead of appearing
+    /// wedged on a slow filesystem. `None` for standalone callers and
+    /// tests — [`note_files_linked`] then no-ops, so link behavior is
+    /// byte-for-byte unchanged.
+    ///
+    /// [`with_link_progress`]: Linker::with_link_progress
+    /// [`note_files_linked`]: Linker::note_files_linked
+    link_progress: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// Package names materialized as real project-local directories even when
+    /// the global virtual store is active — the per-package escape hatch for
+    /// subpath adapters that statically import a consumer-installed backend
+    /// they don't declare (`@hookform/resolvers/zod` → `zod`). Under GVS every
+    /// other package is a symlink into the shared store, whose realpath escapes
+    /// the project, so Node's upward `node_modules` walk from inside the adapter
+    /// can't reach the backend at the project root; materializing just the
+    /// adapter puts its realpath back inside the project and the walk succeeds.
+    /// Matched as package-name glob patterns against each graph package. Empty
+    /// for standalone callers and every existing test → the GVS pass is
+    /// byte-for-byte unchanged.
+    ///
+    /// Undeclared imports an ejected package makes are resolved by the collective
+    /// project-local hidden hoist tree the linker builds over this whole set under
+    /// GVS (see [`Linker::link_hidden_hoist`]) — each ejected package's realpath is
+    /// project-local, so Node's upward walk from inside it passes through
+    /// `.aube/node_modules/`, a blanket alias for every graph package. That
+    /// replaced the former per-importer phantom-target hoist.
+    disk_materialize: PackageNameMatcher,
+    /// Dep paths the CALLER vouches are already correctly placed on disk, so
+    /// the hoisted pass may leave their directories alone instead of wiping
+    /// and refilling them.
+    ///
+    /// The vouch has to come from the driver, not from this crate: the only
+    /// trustworthy answer combines the package's content fingerprint against
+    /// the last install's with proof that the last link ran to completion,
+    /// and the linker sees neither. Empty for standalone callers and every
+    /// existing test → the hoisted pass is byte-for-byte unchanged.
+    reusable_hoisted: std::collections::HashSet<String>,
 }
 
 /// Strategy for linking files from the store to node_modules.
 #[derive(Debug, Clone, Copy)]
 pub enum LinkStrategy {
-    /// Copy-on-write clone (APFS clonefile, btrfs/xfs FICLONE). The
-    /// `auto` probe selects this whenever the destination filesystem
-    /// supports it (every non-Windows CoW filesystem) — a clone is
-    /// ~2.5x cheaper than a hard link on node_modules' small-file
-    /// profile and gives each materialized file an independent inode,
-    /// so an in-place patch can't corrupt the shared store entry. Also
-    /// reachable via explicit `packageImportMethod = clone` /
-    /// `clone-or-copy`.
+    /// Copy-on-write (APFS clonefile, btrfs reflink). Selected only by
+    /// explicit `packageImportMethod = clone` / `clone-or-copy`, whose
+    /// documented contract is reflink with a plain **copy** fallback.
     Reflink,
+    /// Copy-on-write chosen by `auto` on a same-filesystem macOS target,
+    /// where APFS clonefile benchmarks faster than hardlink. (On Linux
+    /// and other targets `auto` picks [`Hardlink`].) Distinct from
+    /// [`Reflink`] because `auto` owns a stronger reflink-failure fallback:
+    /// the same-FS probe already proved the target shares a mount, so on a
+    /// non-APFS same-FS volume (HFS+) — where `clonefile` is unsupported but
+    /// hardlinks are not — `auto` degrades to a hardlink before copy,
+    /// keeping the link zero-cost where explicit `clone` / `clone-or-copy`
+    /// would copy. (Small macOS files copy outright before any reflink or
+    /// hardlink attempt; the hardlink step is the reflink-*failure* fallback,
+    /// not an unconditional same-FS guarantee.) Explicit `clone` /
+    /// `clone-or-copy` keep their documented copy fallback and never take
+    /// this hardlink step.
+    ///
+    /// [`Reflink`]: LinkStrategy::Reflink
+    /// [`Hardlink`]: LinkStrategy::Hardlink
+    ReflinkAuto,
     /// Hard link (ext4, NTFS)
     Hardlink,
     /// Full copy (fallback)

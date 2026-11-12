@@ -1,6 +1,6 @@
 ---
 title: "Introducing Nub: an all-in-one toolkit for Node.js"
-description: A Rust CLI that augments the Node you already have — TypeScript that just runs, a faster script runner, and a fast bin runner. It augments Node.js instead of trying to replace it.
+description: The all-in-one Node.js toolkit — a Rust CLI that augments stock Node with TypeScript that just runs, a faster script runner, and a fast bin runner.
 author: The Nub Team
 date: 2026-06-15
 ---
@@ -8,7 +8,7 @@ date: 2026-06-15
 Nub is an all-in-one toolkit powered by Node.js that **modernizes** the developer experience of the Node.js ecosystem. Use it instead of `node`, `npm run`, and `npx` (or the equivalents in your preferred package manager).
 
 ```console
-$ npm install -g --ignore-scripts=false @nubjs/nub
+$ npm install -g @nubjs/nub
 $ nub index.ts             # run a TypeScript file
 $ nub run dev              # run a package.json script
 $ nub watch src/server.ts  # restart on file changes
@@ -33,7 +33,7 @@ Bun and Deno proved there's enormous appetite for an all-in-one toolkit that rep
 
 ## Introducing Nub
 
-Nub embraces it instead. It's a single Rust binary that transpiles your code and executes it on the stock `node` your project pins — so the runtime underneath *is* Node. On Deno's own cross-runtime Node-compatibility corpus it clears 98.8% of what real Node passes, versus 77.4% for Deno and 40.5% for Bun. It combines:
+Nub embraces it instead. It's a single Rust binary that transpiles your code and executes it on the stock `node` your project pins — so the runtime underneath *is* Node. On Node 26.7's own test suite, scored the way Deno's compatibility corpus scores it, it clears 98.4% of what real Node passes, versus 72.4% for Deno 2.9 and 68.5% for Bun 1.4. It combines:
 
 ```console
 $ nub index.ts             # file runner — full TypeScript, on stock Node
@@ -41,10 +41,10 @@ $ nub run build            # script runner — 24× faster than pnpm run
 $ nubx prisma generate     # bin runner — 19× faster than npx
 $ nub watch src/server.ts  # watcher — driven by the dependency graph
 $ nub install              # package manager — pnpm-compatible, your lockfile
-$ nub node install {{NODE_MAJOR}}      # version manager — installs Node on demand
+$ nub node install {{NODE_MAJOR}}    # version manager — installs Node on demand
 ```
 
-## `nub <file>`: a TypeScript-first Node.js
+## `nub <file>` — a TypeScript-first Node.js
 
 The top-level command runs files. It's a true drop-in replacement for `node` — same flags, same argv, same runtime behavior:
 
@@ -134,7 +134,7 @@ class API {
 
 ### Explicit resource management
 
-The `using` and `await using` declarations work on every supported Node: native where V8 has shipped it, safely down-transpiled otherwise.
+The `using` and `await using` declarations work on every supported Node. Nub down-transpiles the syntax before Node sees it, so the same code runs on a V8 that cannot parse it. `DisposableStack`, `AsyncDisposableStack`, and `SuppressedError` are native on Node 24 and above, and polyfilled below.
 
 ```ts
 await using db = await connect()  // disposed at scope end
@@ -166,7 +166,7 @@ const { host, port } = config        // destructure the default
 
 ### Environment files
 
-Nub loads `.env`, `.env.local`, `.env.<NODE_ENV>`, and `.env.<NODE_ENV>.local` automatically — Vite/Bun precedence rules, `${VAR}` expansion included — and injects them before Node starts. One deliberate exception: `.env.local` is skipped under `NODE_ENV=test`, following the Next.js convention, so local secrets don't leak into your test suite.
+Nub loads `.env`, `.env.local`, `.env.<NODE_ENV>`, and `.env.<NODE_ENV>.local` automatically — Next.js/Bun precedence rules, `${VAR}` expansion included — and injects them before Node starts. One deliberate exception: `.env.local` is skipped under `NODE_ENV=test`, following the Next.js convention, so local secrets don't leak into your test suite.
 
 ```console
 # .env
@@ -241,7 +241,8 @@ The TC39 date/time API. Native in Node 26+; older Nodes get the reference [`@js-
 ```ts
 const now = Temporal.Now.plainDateTimeISO();
 const tomorrow = now.add({ days: 1 });
-const meeting = Temporal.ZonedDateTime.from("2026-06-01T09:00[America/New_York]");
+const tz = "2026-06-01T09:00[America/New_York]";
+const meeting = Temporal.ZonedDateTime.from(tz);
 ```
 
 ### `URLPattern`
@@ -318,7 +319,7 @@ Finished TC39 methods — native on Node 24+, polyfilled on older lines, each on
 - [`Promise.try`](https://github.com/tc39/proposal-promise-try) — start a chain from a sync-or-async function.
 - [`Float16Array`](https://github.com/tc39/proposal-float16array) — plus `DataView.getFloat16` / `setFloat16` and `Math.f16round`. One real caveat: the polyfill is ~3× slower than V8's hardware-FP16 path, so pin Node 24+ for ML-inference hot loops.
 
-## `nub watch`: built-in watch mode
+## `nub watch` — built-in watch mode
 
 Restart on change — driven by the actual dependency graph, not a glob list:
 
@@ -334,7 +335,7 @@ The watch set is the resolved dependency graph of your entry file, plus the file
 
 The engine underneath is Node's own `--watch`. Nub's preload reports every file the load hook touches — including `.ts` files transpiled in memory, which Node never sees on disk — to Node's watcher over its dependency-report IPC channel. That report is what makes `--watch` work for TypeScript at all.
 
-## `nub run`: a 24× faster `pnpm run`
+## `nub run` — a 24× faster `pnpm run`
 
 A drop-in replacement for `npm run` and `pnpm run`, minus the JS startup these Node-based tools pay on every invocation:
 
@@ -393,7 +394,7 @@ When `nub run` executes a script, `nub` is aliased as `node` for the duration �
 nub run --node test
 ```
 
-## `nubx`: a 19× faster `npx`
+## `nubx` — a 19× faster `npx`
 
 Run any CLI your dependencies ship into `node_modules/.bin`, no matter which package manager put it there:
 
@@ -438,33 +439,39 @@ Second, on a pnpm project, support is complete: Nub reads and honors every confi
 
 ### Performance
 
-Like pnpm, Nub keeps package files in a global content-addressed store and links them into `node_modules` with reflinks or hardlinks when the filesystem supports them. The benchmark below is the warm path for [`create-t3-app`](https://create.t3.gg/): packages are already on disk, `node_modules` is removed, and the installer rebuilds the project layout.
+Like pnpm, Nub keeps package files in a global content-addressed store and links them into `node_modules`. The default layout goes further: a warm install relinks one symlink per package instead of one hardlink per file, so the work scales with package count rather than file count.
+
+The benchmark below is the warm path on a large tree — 1,168 packages, 81,398 files: frozen lockfile, packages already in each tool's store, `node_modules` wiped between runs, no network. It runs on Linux because Linux is the shared primitive — Bun and Nub's hoisted mode both link with per-file hardlinks there, so the comparison is syscall-for-syscall (macOS pushes both onto clonefile). There are two Nub rows because they isolate two different claims: with `--node-linker hoisted`, Nub produces Bun's exact flat layout with the same per-file hardlink calls — the apples-to-apples row. The default row is the same install with the per-package relink.
 
 <Bench
-  label="warm frozen install · create-t3-app · 222 deps · macOS"
+  label="warm frozen install · 1168 packages · Linux (ubuntu-latest)"
   source="https://github.com/nubjs/nub/tree/main/tests/bench/install"
   accent="pink"
-  max={4163}
+  max={12945}
+  caption="hyperfine, 25 runs / 6 warmup, near-idle ubuntu-latest runner · bun 1.3.14, pnpm 10.34.4, npm on Node 24."
   rows={[
-    { cmd: 'nub', ms: 1122, us: true },
-    { cmd: 'bun', ms: 1444, ratio: 1.29 },
-    { cmd: 'pnpm', ms: 2847, ratio: 2.5 },
-    { cmd: 'npm', ms: 4163, ratio: 3.7 },
+    { cmd: 'nub', ms: 346, us: true },
+    { cmd: 'nub (hoisted)', ms: 1461, ratio: 4.2 },
+    { cmd: 'bun', ms: 1896, ratio: 5.5 },
+    { cmd: 'pnpm', ms: 3453, ratio: 10 },
+    { cmd: 'npm', ms: 12945, ratio: 37.4 },
   ]}
 />
+
+The ordering holds on thinner trees with a smaller lead — 1.7× over Bun on a 313-package TanStack Start app. The per-package relink pays off more as dependency trees get larger.
 
 ### Secure by default
 
 Nub install ships the strongest default security posture of any Node package manager — every protection below is on out of the box:
 
-- **Lifecycle scripts are deny-by-default.** A dependency's `postinstall` won't run unless you approve that package, so a compromised transitive dep can't execute code just because you installed it. A curated set of well-known native packages (esbuild, sharp, and the like) is the one exception — it builds automatically, but only when registry provenance, an advisory check, and a release-age cooling window all pass. See [the security posture](/docs/install#security) for the gates.
+- **Lifecycle scripts are deny-by-default.** A dependency's `postinstall` won't run unless you approve that package, so a compromised transitive dep can't execute code just because you installed it. A curated set of well-known native packages (esbuild, sharp, and the like) is the one exception — it builds automatically, but only when registry provenance, an advisory check, and a release-age cooling window all pass. See [lifecycle scripts](/docs/install#lifecycle-scripts) for the gates.
 - **Non-registry transitive deps are blocked.** A dependency-of-a-dependency that resolves to a `git+`, `file:`, or raw-tarball URL — a classic supply-chain vector — is refused rather than silently fetched.
 - **New releases have to age.** A default `minimumReleaseAge` of 24 hours keeps a just-published version out of your tree until it's sat in the registry a day — the simplest defense against the now-common "publish a malicious patch, hijack installs for an hour" attack.
 - **Provenance can't silently downgrade.** A version that loses its trusted-publisher or provenance evidence fails at resolve instead of installing quietly.
 
-One `paranoid: true` line turns every soft gate into a hard failure and adds a build-script jail — approved scripts then run sandboxed, with no network and a scoped filesystem.
+One `paranoid: true` line turns every soft gate into a hard failure.
 
-## `nub pm`: a baked-in, native-speed Corepack
+## `nub pm` — a baked-in, native-speed Corepack
 
 Run `nub pm shim` once and it drops `npm`, `pnpm`, `yarn`, and `bun` onto your PATH as shims. From then on, running `pnpm install` in a project reads the version that project pins in `packageManager`, provisions that exact version (fetched and verified from the registry), and execs it — corepack's job, but in Rust, with none of the per-call Node bootstrap corepack pays:
 
@@ -505,7 +512,7 @@ Remove Nub tomorrow and your code keeps working, unchanged.
 ## FAQ
 
 - [Is it faster than Node.js?](/docs/faq#is-it-faster-than-nodejs)
-- [Why not just use Node's built-in TypeScript support?](/docs/faq#why-not-just-use-nodes-built-in-typescript-support)
+- [Why not Node's built-in TypeScript support?](/docs/faq#why-not-nodes-built-in-typescript-support)
 - [Why hasn't anyone else done this?](/docs/faq#why-hasnt-anyone-else-done-this)
 - [Is Nub a replacement for Node?](/docs/faq#is-nub-a-replacement-for-node)
 - [What can I stop using once I install Nub?](/docs/faq#what-npm-packages-can-i-stop-using-once-i-install-nub)
@@ -527,4 +534,4 @@ Remove Nub tomorrow and your code keeps working, unchanged.
 
 Nub is open-source and MIT-licensed.
 
-<InstallTabs />
+<GetStarted />

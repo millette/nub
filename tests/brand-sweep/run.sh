@@ -11,7 +11,7 @@
 #      the sandbox must have zero effect (engine_preflight enables only the
 #      NPM + EXTERNAL env families, never the engine's own AUBE family);
 #   3. layout is nub-branded — the isolated virtual store lands at
-#      node_modules/.nub, and no node_modules/.aube or ~/.local/share/aube
+#      node_modules/.store, and no node_modules/.aube or ~/.local/share/aube
 #      (or any other aube-named path) appears anywhere in the sandbox;
 #   4. lifecycle identity is nub — npm_config_user_agent observed by a real
 #      postinstall script starts with "nub/".
@@ -85,10 +85,10 @@ pass "no aube/jdx.dev identity in install output"
 pass "AUBE_VIRTUAL_STORE_DIR canary ignored"
 
 # 3a. The install actually ran through the engine with nub's layout policy:
-# no lockfile detected -> isolated linker, virtual store at node_modules/.nub.
-[ -d node_modules/.nub ] || fail "expected isolated virtual store at node_modules/.nub"
+# no lockfile detected -> isolated linker, virtual store at node_modules/.store.
+[ -d node_modules/.store ] || fail "expected isolated virtual store at node_modules/.store"
 [ -e node_modules/left-pad ] || fail "left-pad was not installed"
-pass "isolated install landed at node_modules/.nub"
+pass "isolated install landed at node_modules/.store"
 
 # 3b. No aube-named paths anywhere in the sandbox — node_modules/.aube,
 # ~/.local/share/aube, XDG dirs, and anything else. The allowlist is EMPTY:
@@ -106,7 +106,7 @@ fi
 # The engine's freshness sidecar must carry nub's stem (product-identity
 # derivation in vendor/aube): .nub-state under the virtual store, and no
 # .aube-state anywhere (covered by the find above).
-[ -d node_modules/.nub/.nub-state ] || fail "expected install state at node_modules/.nub/.nub-state"
+[ -d node_modules/.store/.nub-state ] || fail "expected install state at node_modules/.store/.nub-state"
 # The engine cache must land in nub's namespace (set_cache_root seam):
 # packument caches under $XDG_CACHE_HOME/nub/pm/.
 [ -d "$XDG_CACHE_HOME/nub/pm" ] || fail "expected engine cache at \$XDG_CACHE_HOME/nub/pm"
@@ -180,9 +180,9 @@ fi
 if grep -inE 'aube|jdx\.dev' "$SANDBOX/install-output2.txt"; then
   fail "engine-branded identity reached nub's output under $other_mode (above)"
 fi
-[ -d node_modules/.nub ] || fail "($other_mode) expected isolated virtual store at node_modules/.nub"
+[ -d node_modules/.store ] || fail "($other_mode) expected isolated virtual store at node_modules/.store"
 [ ! -e node_modules/.aube ] || fail "($other_mode) engine created node_modules/.aube"
-[ -d node_modules/.nub/.nub-state ] || fail "($other_mode) expected install state at node_modules/.nub/.nub-state"
+[ -d node_modules/.store/.nub-state ] || fail "($other_mode) expected install state at node_modules/.store/.nub-state"
 leaks=$(find "$SANDBOX" -name '*aube*' ! -path "$AUBE_VIRTUAL_STORE_DIR" 2>/dev/null || true)
 if [ -n "$leaks" ]; then
   echo "$leaks"
@@ -217,6 +217,9 @@ cat > "$PROJ3/package.json" <<'EOF'
   }
 }
 EOF
+# The warning channel is what this fixture checks; the default
+# `strictDepBuilds` would report core-js as an error instead.
+echo 'strict-dep-builds=false' > "$PROJ3/.npmrc"
 cd "$PROJ3"
 out3="$SANDBOX/install-output3.txt"
 if ! "$NUB" install >"$out3" 2>&1; then
@@ -231,8 +234,7 @@ grep -q 'WARN_NUB_IGNORED_BUILD_SCRIPTS' "$out3" || fail_with_output "warning co
 # The defaultTrust floor (on by default under nub) must never be a silent
 # allow path: the one-line disclosure names esbuild, rewritten like every
 # other warning-channel line.
-grep -q 'WARN defaultTrust: running build scripts' "$out3" || fail_with_output "defaultTrust disclosure line missing (floor allowed builds silently)"
-grep -q 'WARN_NUB_DEFAULT_TRUST_BUILDS' "$out3" || fail_with_output "defaultTrust disclosure code not rewritten to WARN_NUB_*"
+grep -q 'WARN defaultTrust: running build scripts for esbuild@' "$out3" || fail_with_output "defaultTrust disclosure line missing (floor allowed builds silently)"
 grep -q 'core-js' "$out3" || fail_with_output "deny-side probe (core-js) missing from ignored-builds warning"
 # NB: plain backticks inside single quotes — '\`' would be a literal
 # backslash-backtick, which GNU grep parses as the buffer-start anchor

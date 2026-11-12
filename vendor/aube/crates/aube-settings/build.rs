@@ -49,6 +49,12 @@ struct SettingDef {
     /// (`~/.config/aube/config.toml`).
     #[serde(default, rename = "npmShared")]
     npm_shared: bool,
+    /// Marks a setting that shapes how `node_modules` is physically arranged
+    /// rather than what resolves. Gates the workspace-YAML source family at
+    /// runtime via `read_layout_from_workspace_yaml`; see `settings.toml`'s
+    /// schema header and `values.rs`.
+    #[serde(default)]
+    layout: bool,
     /// Source precedence for the generated accessor, high-to-low.
     /// Valid entries: scope-qualified leaves `"projectAubeConfig"`,
     /// `"projectNpmrc"`, `"userAubeConfig"`, `"userNpmrc"`,
@@ -63,6 +69,24 @@ struct SettingDef {
     /// `["workspaceYaml", "npmrc"]`.
     #[serde(default)]
     precedence: Vec<String>,
+    /// Managed hardening merge policy. Empty means this setting is not
+    /// enforceable through managed config. Supported values are interpreted by
+    /// `values.rs`: `max`, `trueWins`, `falseWins`, `managedWins`, and ranked
+    /// strings such as `ranked:off<on<required`.
+    #[serde(default, rename = "managedPolicy")]
+    managed_policy: String,
+    /// When `true`, emit a companion `<fn_name>_explicit(ctx) -> Option<T>`
+    /// accessor alongside the normal one. It resolves the setting through the
+    /// same source chain and managed-config finalizer but WITHOUT folding in the
+    /// built-in default, so the caller can distinguish "explicitly set at some
+    /// tier (cli/env/npmrc/yaml/embedderDefaults)" from "left at the built-in
+    /// default." Only meaningful for settings whose default is a concrete value
+    /// (the normal accessor returns `T`, not `Option<T>`); a setting with an
+    /// undefined default already exposes that distinction. Currently used by
+    /// `hoist`, whose default `true` otherwise hides whether the user (or an
+    /// embedder tier) asked for hoisting.
+    #[serde(default, rename = "explicitAccessor")]
+    explicit_accessor: bool,
     #[serde(default)]
     examples: Vec<String>,
 }
@@ -79,14 +103,30 @@ struct Sources {
     workspace_yaml: Vec<String>,
 }
 
+/// Cargo's `CARGO_MANIFEST_DIR`, read at RUN time rather than baked in by
+/// `env!`. A build-script binary is cached per target dir, so an `env!` path
+/// survives into any other checkout sharing that dir — reading the first
+/// checkout's `settings.toml`, or failing outright once it is gone. Reading the
+/// variable resolves per invocation instead.
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("cargo always sets CARGO_MANIFEST_DIR for build scripts"),
+    )
+}
+
 fn main() {
     // `settings.toml` lives inside this crate so it ships in the
     // published tarball — `cargo publish --verify` runs the build
     // script from `target/package/aube-settings-<ver>/`, which can
-    // only see files under the crate root.
-    let settings_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("settings.toml");
+    // only see files under the crate root. That property comes from
+    // where the file lives, not from how the path is resolved.
+    let settings_path = manifest_dir().join("settings.toml");
 
     println!("cargo:rerun-if-changed={}", settings_path.display());
+    // The path above is absolute, so a shared target dir would otherwise keep a
+    // sibling worktree's generated settings without rerunning this script.
+    println!("cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR");
 
     let raw = fs::read_to_string(&settings_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", settings_path.display()));
@@ -131,6 +171,8 @@ fn main() {
         )
         .unwrap();
         writeln!(out, "        npm_shared: {},", def.npm_shared).unwrap();
+        writeln!(out, "        layout: {},", def.layout).unwrap();
+        writeln!(out, "        managed_policy: {},", lit(&def.managed_policy)).unwrap();
         writeln!(out, "    }},").unwrap();
     }
 
@@ -242,6 +284,17 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
             Some(_) => value_ty.clone(),
             None => format!("Option<{value_ty}>"),
         };
+        if def.explicit_accessor {
+            assert!(
+                default_expr.is_some(),
+                "{name}: explicitAccessor is redundant when the default is undefined — the \
+                 normal accessor already returns Option<T>"
+            );
+            assert!(
+                kind != Kind::Enum,
+                "{name}: explicitAccessor is not supported for enum settings"
+            );
+        }
         let (npmrc_call, ws_call, env_call, cli_call) = match kind {
             Kind::Bool => (
                 "bool_from_npmrc",
@@ -293,10 +346,12 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
         // string first preserves "first source with a value wins" and
         // surfaces the parse failure as `None` so the caller's default
         // applies instead of a silently-overridden value.
-        for (i, src) in order.iter().enumerate() {
+        let mut source_exprs = Vec::new();
+        for src in &order {
             let (call, arg) = match src.as_str() {
                 "cli" => (cli_call, "ctx.cli"),
                 "env" => (env_call, "ctx.env"),
+                "projectConfig" => (npmrc_call, "ctx.project_config"),
                 "projectAubeConfig" => (npmrc_call, "ctx.project_aube_config"),
                 "projectNpmrc" => (npmrc_call, "ctx.project_npmrc"),
                 "userAubeConfig" => (npmrc_call, "ctx.user_aube_config"),
@@ -310,54 +365,124 @@ fn generate_resolved_accessors(settings: &BTreeMap<String, SettingDef>) -> Strin
                 "embedderDefaults" => (npmrc_call, "ctx.embedder_defaults"),
                 other => panic!("{name}: unknown source `{other}` in precedence"),
             };
-            let is_last = i + 1 == order.len();
-            let expr = format!("super::{call}({name:?}, {arg})");
-            let suffix = if kind == Kind::Enum && is_last {
-                format!(".and_then(|s| {value_ty}::from_str_normalized(&s))")
-            } else {
-                String::new()
-            };
-            if is_last {
-                let value_expr = format!("{expr}{suffix}");
-                match &default_expr {
-                    Some(default) => {
-                        if default == "vec![]" {
-                            writeln!(out, "    {value_expr}.unwrap_or_default()").unwrap()
-                        } else {
-                            writeln!(out, "    {value_expr}.unwrap_or({default})").unwrap()
-                        }
-                    }
-                    None => writeln!(out, "    {value_expr}").unwrap(),
+            source_exprs.push(format!("super::{call}({name:?}, {arg})"));
+        }
+        if kind == Kind::Enum {
+            emit_raw_resolution(&mut out, &source_exprs);
+            match &default_expr {
+                Some(default) => {
+                    let default_raw =
+                        parse_toml_string_literal(def.default.trim()).unwrap_or_else(|| {
+                            panic!("{name}: enum default expression exists but raw default did not parse")
+                        });
+                    writeln!(
+                        out,
+                        "    let raw = raw.or_else(|| Some({default_raw:?}.to_string()));"
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "    let raw = super::apply_managed_string({name:?}, raw, ctx.managed_aube_config);"
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "    raw.and_then(|s| {value_ty}::from_str_normalized(&s)).unwrap_or({default})"
+                    )
+                    .unwrap();
                 }
-            } else {
-                writeln!(out, "    if let Some(v) = {expr} {{").unwrap();
-                if kind == Kind::Enum {
-                    match &default_expr {
-                        Some(default) => {
-                            writeln!(
-                                out,
-                                "        return {value_ty}::from_str_normalized(&v).unwrap_or({default});"
-                            )
-                            .unwrap();
-                        }
-                        None => {
-                            writeln!(out, "        return {value_ty}::from_str_normalized(&v);")
-                                .unwrap();
-                        }
-                    }
-                } else {
-                    match &default_expr {
-                        Some(_) => writeln!(out, "        return v;").unwrap(),
-                        None => writeln!(out, "        return Some(v);").unwrap(),
-                    }
+                None => {
+                    writeln!(
+                        out,
+                        "    super::apply_managed_string({name:?}, raw, ctx.managed_aube_config).and_then(|s| {value_ty}::from_str_normalized(&s))"
+                    )
+                    .unwrap();
                 }
-                writeln!(out, "    }}").unwrap();
             }
+            writeln!(out, "}}\n").unwrap();
+            continue;
+        }
+
+        emit_resolution(&mut out, &source_exprs);
+        let finalizer = match kind {
+            Kind::Bool => "apply_managed_bool",
+            Kind::String => "apply_managed_string",
+            Kind::U64 => "apply_managed_u64",
+            Kind::VecString => "apply_managed_string_list",
+            Kind::Enum => unreachable!(),
+        };
+        match &default_expr {
+            Some(default) => {
+                writeln!(out, "    let value = value.or(Some({default}));").unwrap();
+                if default == "vec![]" {
+                    writeln!(
+                        out,
+                        "    super::{finalizer}({name:?}, value, ctx.managed_aube_config).unwrap_or_default()"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        out,
+                        "    super::{finalizer}({name:?}, value, ctx.managed_aube_config).unwrap_or({default})"
+                    )
+                    .unwrap();
+                }
+            }
+            None => writeln!(
+                out,
+                "    super::{finalizer}({name:?}, value, ctx.managed_aube_config)"
+            )
+            .unwrap(),
         }
         writeln!(out, "}}\n").unwrap();
+
+        // Companion `<fn_name>_explicit` accessor: the same source walk +
+        // managed finalizer, but WITHOUT `.or(Some(default))`, so it returns
+        // `None` when only the built-in default would apply. Lets a caller tell
+        // "explicitly configured (cli/env/npmrc/yaml/embedderDefaults)" from
+        // "defaulted." Guarded above to non-enum settings with a concrete
+        // default.
+        if def.explicit_accessor {
+            writeln!(
+                out,
+                "/// Resolved `{name}` WITHOUT the built-in default folded in —\n\
+                 /// `Some` iff set at some source tier, else `None`. Companion to\n\
+                 /// [`{fn_name}`] (see `explicitAccessor` in settings.toml).\n\
+                 pub fn {fn_name}_explicit(ctx: &ResolveCtx<'_>) -> Option<{value_ty}> {{"
+            )
+            .unwrap();
+            emit_resolution(&mut out, &source_exprs);
+            writeln!(
+                out,
+                "    super::{finalizer}({name:?}, value, ctx.managed_aube_config)"
+            )
+            .unwrap();
+            writeln!(out, "}}\n").unwrap();
+        }
     }
 
     out
+}
+
+fn emit_resolution(out: &mut String, source_exprs: &[String]) {
+    writeln!(out, "    let value = (|| {{").unwrap();
+    emit_raw_resolution_body(out, source_exprs);
+    writeln!(out, "    }})();").unwrap();
+}
+
+fn emit_raw_resolution(out: &mut String, source_exprs: &[String]) {
+    writeln!(out, "    let raw = (|| {{").unwrap();
+    emit_raw_resolution_body(out, source_exprs);
+    writeln!(out, "    }})();").unwrap();
+}
+
+fn emit_raw_resolution_body(out: &mut String, source_exprs: &[String]) {
+    for expr in source_exprs {
+        writeln!(out, "        if let Some(v) = {expr} {{").unwrap();
+        writeln!(out, "            return Some(v);").unwrap();
+        writeln!(out, "        }}").unwrap();
+    }
+    writeln!(out, "        None").unwrap();
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -374,7 +499,10 @@ fn default_expr(name: &str, def: &SettingDef, kind: Kind, rust_ty: &str) -> Opti
     // in aube or routed through a crate-specific helper so callers
     // still need to distinguish "not configured" from "configured to
     // this literal value".
-    if matches!(name, "preferFrozenLockfile" | "storeDir" | "nodeVersion") {
+    if matches!(
+        name,
+        "preferFrozenLockfile" | "storeDir" | "cacheDir" | "nodeVersion" | "catalogPrune"
+    ) {
         return None;
     }
     let raw = def.default.trim();
@@ -554,7 +682,8 @@ fn pascal_case(name: &str) -> String {
 /// didn't mention in the default order so every source is still
 /// consulted.
 fn resolve_precedence(declared: &[String]) -> Vec<String> {
-    // CLI and env are always highest-precedence, in that order. The
+    // CLI, env, and embedder project config are always highest-precedence, in
+    // that order. The
     // per-setting `precedence` override only reorders the file-based
     // sources. Anyone who declares `cli` or `env` in their precedence
     // list gets it silently dropped because it's already pinned on top.
@@ -591,14 +720,15 @@ fn resolve_precedence(declared: &[String]) -> Vec<String> {
         // applies instead.
         "embedderDefaults",
     ];
-    let mut files: Vec<String> = Vec::with_capacity(file_default.len());
+    let mut files: Vec<String> = Vec::with_capacity(file_default.len() + 1);
+    files.push("projectConfig".to_string());
     for src in declared {
         // Convenience aliases: bare `npmrc` / `aubeConfig` expand to
         // their project+user pair (project first). Older
         // `settings.toml` overrides that predate the scope split can
         // keep using the short names.
         let expansion: &[&str] = match src.as_str() {
-            "cli" | "env" => continue,
+            "cli" | "env" | "projectConfig" => continue,
             "npmrc" => &["projectNpmrc", "userNpmrc"],
             "aubeConfig" => &["projectAubeConfig", "userAubeConfig"],
             other => &[other],

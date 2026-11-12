@@ -1,0 +1,646 @@
+---
+title: Config reference
+description: The project file that configures Nub's runtime, dependency installs, and temporary package runs.
+---
+
+Put `nub.jsonc` at the project root, or the workspace root in a monorepo. Every project field it takes, with its full value set:
+
+```jsonc title="nub.jsonc" full
+{
+  "$schema": "https://nubjs.com/schema/latest.json",
+
+  // ── runtime — file runs, scripts, and watch mode ──
+  "preload": ["./setup.ts", "tsx/esm"],    // paths or bare specifiers
+  "nodeOptions": ["--enable-source-maps"], // any flag NODE_OPTIONS accepts
+  "v8Flags": ["--stack-size=2000"],        // the full V8 set
+  "nodeCompat": false,                     // true = no augmentation
+  "prefix": "dotenvx run --",              // wraps runs, scripts, watch
+  // true = discover | false = none | "varlock"
+  "envFile": [".env", ".env.local"],
+
+  // text | jsonc | json5 | toml | yaml | ts | tsx | jsx
+  "loader": { ".graphql": "text" },
+  "verifyDeps": "warn",                    // warn | error | true | false
+  // paths, conditions, transform defaults; no type checking
+  "tsconfig": "./tsconfig.runtime.json",
+  "conditions": ["development"],           // matched before "default"
+  // react | react-jsx | react-jsxdev
+  "jsx": "react-jsx",
+  "jsxImportSource": "preact",             // automatic runtime package
+  "jsxFactory": "createElement",           // classic runtime factory
+  "jsxFragmentFactory": "Fragment",        // classic fragment factory
+  "decorators": "legacy",                  // legacy TS semantics
+  "emitDecoratorMetadata": true,           // design-type metadata
+
+  // ── installs — layout everywhere; release gates under Nub identity ──
+  "install": {
+    // global-virtual-store | isolated | hoisted
+    "linker": "global-virtual-store",
+    "publicHoist": ["@types/*"],           // name patterns; ["*"] for all
+    "minimumReleaseAge": "3d",             // default 24h, "0s" off
+    "minimumReleaseAgeExclude": ["@company/*"]
+  }
+}
+```
+
+Nub reads the nearest file, walking up from the working directory. The file is JSON with comments and trailing commas, and an unknown key or invalid value stops the command with an error. Edit it by hand or with [`nub config`](#nub-config).
+
+## Precedence
+
+Every setting resolves through the same chain, most specific first:
+
+- **Command-line option** — `nub --node app.ts`
+- **Environment variable** — `NODE_COMPAT=1`
+- **Project `nub.jsonc`**
+- **Global `nub.jsonc`** — personal defaults for every project
+- **Built-in default**
+
+The global file lives at `~/.config/nub/nub.jsonc`, or under `$XDG_CONFIG_HOME` when that is set; `nub config path` prints it. It takes the same fields as the project file, plus the global-only [`dlx`](#dlx) block.
+
+Because the global file applies to every project on your machine, Nub reads it leniently. An unrecognized section is ignored, and a bad value skips the whole file instead of failing the command.
+
+## Relative paths
+
+Five fields take paths: [`preload`](#preload), [`envFile`](#envfile), [`tsconfig`](#tsconfig), and the path forms of [`nodeExecutable`](#nodeexecutable) and [`prefix`](#prefix). A relative path resolves against the directory of the file that set it, not your working directory.
+
+In the global file, that directory is your config directory. Use an absolute or `~/` path there:
+
+```jsonc title="~/.config/nub/nub.jsonc"
+{
+  // ...
+  "envFile": [
+    ".env.shared",     // ~/.config/nub/.env.shared
+    "~/secrets/.env"   // from your home directory
+  ]
+}
+```
+
+A path relative to each project's own directory belongs in the project file.
+
+## JSON Schema
+
+Nub publishes a JSON Schema for `nub.jsonc`, both project and global. Point the `$schema` key at it for editor completion and validation; Nub itself ignores the key.
+
+```jsonc title="nub.jsonc"
+{
+  "$schema": "https://nubjs.com/schema/latest.json",
+  // ...
+}
+```
+
+| URL | Role |
+| --- | --- |
+| [`latest.json`](https://nubjs.com/schema/latest.json) | Rolling — matches the newest release |
+| `https://nubjs.com/schema/v0.7.json` | Pinned to the `0.7` minor series |
+
+Each minor series has its own file. The [schema index](/schema) lists them all.
+
+## Runtime
+
+The top-level fields configure file runs, package scripts, and watch mode.
+
+### `preload`
+
+Load one or more modules before the entry file. An entry is a path or a bare package specifier, resolved the way an import in your project would be.
+
+Packages your tsconfig lists under [`contentMappers`](/docs/runtime/loaders#content-mappers) load without an entry here. An entry here loads after them and takes precedence.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "preload": [
+    "./instrumentation.ts",
+    "@company/telemetry/register"
+  ]
+}
+```
+
+A bare specifier resolves through the package's `exports` map, so [`conditions`](#conditions) steer which file it loads.
+
+### `nodeOptions`
+
+Pass Node options to runtime commands.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "nodeOptions": [
+    "--enable-source-maps",
+    "--stack-trace-limit=50"
+  ]
+}
+```
+
+The config command addresses this field as `runtime.nodeOptions`. The bare `nodeOptions` key is pnpm's `.npmrc` setting of the same name.
+
+```bash
+nub config set runtime.nodeOptions '["--enable-source-maps"]'
+```
+
+### `v8Flags`
+
+Pass V8 flags to every Node process Nub starts, including the ones your package scripts launch as `node`.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "v8Flags": [
+    "--expose-gc",
+    "--stack-size=2000"
+  ]
+}
+```
+
+These flags reach Node on its command line, so the whole V8 set is available, including flags `NODE_OPTIONS` rejects such as `--stack-size` and `--no-opt`. Use [`nodeOptions`](#nodeoptions) for Node's own options.
+
+### `nodeCompat`
+
+Use plain Node behavior while keeping Nub's Node version selection. This is the project-wide form of the `--node` flag.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "nodeCompat": true
+}
+```
+
+Nub then loads none of its runtime hooks, environment files, preloads, custom loaders, or conditions.
+
+### `nodeExecutable`
+
+Name the Node binary to run, instead of letting Nub resolve a version. The `$(...)` form runs a command that prints the path:
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "nodeExecutable": "$(mise which node)"
+}
+```
+
+The command runs through the platform shell (`sh -c`, or `cmd /C` on Windows) in your working directory, so a directory-aware tool such as mise, asdf, fnm, or Volta resolves the version for that directory. Nub reads the first line of output. A non-zero exit stops the run with that tool's error. To skip the project's pins and take the first Node on `PATH`, use `"$(which node)"`, or `"$(where node)"` on Windows.
+
+A path works too:
+
+```jsonc
+{
+  // ...
+  // one of:
+  "nodeExecutable": "/opt/homebrew/bin/node",  // absolute
+  "nodeExecutable": "~/.local/bin/node",       // from home
+  "nodeExecutable": "./tools/node",            // from this file's dir
+
+  // windows: forward slashes or \\
+  "nodeExecutable": "C:/Program Files/nodejs/node.exe"
+}
+```
+
+An absolute path exists only on your machine, so it usually belongs in the global file. A relative path suits a binary checked into the repository. On Windows the `.exe` extension is optional.
+
+Either form bypasses the [pin sources](/docs/node#pin-sources), Nub's cache, and any download. The binary's version is still detected, so the [floor and tier selection](/docs/runtime#supported-versions-and-tiers) still apply, and Nub warns when that version contradicts a pin the project declares. The `NODE_EXECUTABLE` environment variable is the per-shell form of this field and outranks it.
+
+### `prefix`
+
+Put a command in front of everything Nub runs for the project.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  // split like a shell; the array form takes exact arguments
+  "prefix": "dotenvx run --"
+}
+```
+
+The prefix applies to a file run, a `package.json` script, and `nub watch`:
+
+```bash
+nub server.ts        # dotenvx run -- node server.ts
+nub run build        # dotenvx run -- sh -c "<the build script>"
+nub watch server.ts  # dotenvx run -- node --watch server.ts
+```
+
+- A script is wrapped as a whole, so a script that starts no Node process still runs behind the prefix.
+- A nested `nub run` inside a script does not wrap the same project again.
+- The `nubx` and [`nub dlx`](/docs/nubx#nub-dlx) commands, which run someone else's CLI, take no prefix; neither does compatibility mode (`--node`).
+
+The program resolves from the project's `node_modules/.bin`, then `PATH`, so a wrapper installed as a devDependency needs no global install. A path works too, absolute or relative to the file. Use the array form for a Windows path, because the string form treats a backslash as an escape.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "prefix": ["./tools/wrap", "--quiet"]
+}
+```
+
+Nub still loads [environment files](/docs/runtime/env) for the Node process, and on a file run the wrapper sees them too. A wrapper that manages the environment itself pairs the prefix with `"envFile": false`.
+
+### `envFile`
+
+Choose which environment files Nub loads.
+
+| Value | Effect |
+| --- | --- |
+| `true` | [Automatic discovery](/docs/runtime/env#file-precedence) |
+| `false` | No environment files, and no [Varlock](/docs/runtime/varlock) |
+| `[".env", ".env.local"]` | Exactly these files, in order; later values win |
+| `"varlock"` | Hand the environment to Varlock |
+
+A path always goes in an array, even a single one. Paths expand `${VAR}` and `$VAR` from the environment, and resolve as described under [relative paths](#relative-paths).
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "envFile": [".env", ".env.${APP_ENV}"]
+}
+```
+
+```bash
+APP_ENV=staging nub app.ts   # reads .env and .env.staging
+```
+
+A `.env.schema` file selects Varlock only when nothing else decides. Any explicit `envFile` value outranks it, at every scope including your global config, and so do the `--env-file` and `--no-env-file` flags. A project keeps Varlock under a global `"envFile": false` by setting `"envFile": "varlock"`.
+
+### `loader`
+
+Map an extension onto one of Nub's loaders.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "loader": {
+    ".graphql": "text",   // import a schema as a string
+    ".rules": "yaml",     // a project file that happens to be YAML
+    ".view": "tsx"        // project source under a name of your own
+  }
+}
+```
+
+The loader names:
+
+```text
+text
+jsonc
+json5
+toml
+yaml
+ts
+tsx
+jsx
+```
+
+Nub already imports `.txt`, `.jsonc`, `.json5`, `.toml`, `.yaml`, and `.yml`, along with the TypeScript and JSX extensions. An entry can also override one of those: `".ts": "text"` imports TypeScript sources as strings, and `".ts": "tsx"` turns JSX on for them.
+
+### `verifyDeps`
+
+Check whether installed dependencies may be stale before a run.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "verifyDeps": "error"
+}
+```
+
+| Value | Effect |
+| --- | --- |
+| `"warn"`, `true` | Warn and run (the default) |
+| `"error"` | Stop instead of running |
+| `false` | Skip the check |
+
+### `tsconfig`
+
+Choose the TypeScript config Nub's runtime reads. Nub uses it for [path mapping](https://www.typescriptlang.org/tsconfig/#paths), [custom conditions](#conditions), and JSX and decorator settings, not for type checking.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "tsconfig": "./tsconfig.runtime.json"
+}
+```
+
+```jsonc title="tsconfig.runtime.json"
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+```
+
+The JSX and decorator fields below override their `compilerOptions` counterparts. In a TypeScript project, prefer setting them in the tsconfig.
+
+### `conditions`
+
+Add package export conditions. Nub passes each to Node as `--conditions`, alongside Node's built-in ones, and your names are matched before `default`.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "conditions": [
+    "development",
+    "react-server"
+  ]
+}
+```
+
+```json title="node_modules/example/package.json"
+{
+  "exports": {
+    ".": {
+      "development": "./development.js",
+      "default": "./production.js"
+    }
+  }
+}
+```
+
+Nub also applies the [`customConditions`](https://www.typescriptlang.org/tsconfig/#customConditions) in your TypeScript config, including one inherited through `extends`. The file the type checker followed is then the file that runs.
+
+```jsonc title="tsconfig.json"
+{
+  "compilerOptions": {
+    // types resolve through the package's "source" export
+    "customConditions": ["source"]
+  }
+}
+```
+
+### `jsx`
+
+Configure JSX without a TypeScript config. The modes are `react`, `react-jsx`, and `react-jsxdev`.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "jsx": "react-jsx",
+  "jsxImportSource": "preact"   // automatic runtime package
+}
+```
+
+The classic runtime takes `jsxFactory` as its element function and `jsxFragmentFactory` as its fragment value:
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "jsx": "react",
+  "jsxFactory": "h",
+  "jsxFragmentFactory": "Fragment"
+}
+```
+
+### `decorators`
+
+Enable TypeScript's legacy decorator transform, the equivalent of `experimentalDecorators`.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "decorators": "legacy"
+}
+```
+
+### `emitDecoratorMetadata`
+
+Emit the design-type metadata that decorator-based dependency injection and ORM libraries read. It takes effect with legacy decorators enabled.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "decorators": "legacy",
+  "emitDecoratorMetadata": true
+}
+```
+
+## `install`
+
+The install block takes four fields. The layout fields apply in every project; the release-age fields apply only when Nub is the project's package manager.
+
+| Behavior | Fields | Applies to |
+| --- | --- | --- |
+| `node_modules` layout | `linker`, `publicHoist` | Every project, including npm, pnpm, Yarn, and Bun incumbents |
+| Version cooling window | `minimumReleaseAge`, `minimumReleaseAgeExclude` | Nub-identity projects |
+
+Under another incumbent, Nub names each release-age field it skipped:
+
+```text
+nub: `install.minimumReleaseAge` ignored — it is nub-native install config,
+and this project resolves as pnpm. Run `nub pm use nub` to make nub the
+project's package manager.
+```
+
+### `install.linker`
+
+Pick the dependency layout. A string names a strategy with its defaults.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "install": {
+    "linker": "hoisted"
+  }
+}
+```
+
+| Strategy | Layout |
+| --- | --- |
+| `global-virtual-store` | One machine-shared store, symlinked into each project. The default outside CI; see [shared vs per-project store](/docs/install/virtual-store#shared-vs-per-project-store). |
+| `isolated` | A store inside the project, still symlinked. |
+| `hoisted` | Flat real directories, the npm and Yarn shape. |
+
+<Callout>
+Read the [full docs](https://pnpm.io/settings/node-modules#nodelinker) on pnpm.io.
+</Callout>
+
+In the object form, two strategies take an extra key: `eject` under `global-virtual-store`, and `hoist` under `isolated`. A key under the wrong strategy is an error that names the strategy it belongs to.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "install": {
+    "linker": {
+      "strategy": "global-virtual-store",
+      "eject": ["electron", "@company/native-*"]
+    }
+  }
+}
+```
+
+Ejected packages are written into the project as real directories instead of linked from the shared store. Use it for a package that resolves paths relative to its own location on disk, as native builds and self-extracting binaries do. The list adds to the packages Nub already ejects, so `"eject": []` leaves the built-in list in force.
+
+Under `isolated`, `hoist` fills the hidden fallback tree that dependencies reach when they import something they never declared. It takes `true` (everything, pnpm's default), `false` (an undeclared import fails), or a list of patterns.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "install": {
+    "linker": {
+      "strategy": "isolated",
+      "hoist": ["*eslint*", "@types/*"]
+    }
+  }
+}
+```
+
+The `"pnp"` strategy is reserved, and an install that names it is rejected with `ERR_NUB_CONFIG_UNSUPPORTED`.
+
+### `install.publicHoist`
+
+Put packages in the project's top-level `node_modules` without declaring them. Use it for tools that resolve from the project root, such as TypeScript finding `@types/*` or a linter loading its plugins.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "install": {
+    "publicHoist": ["@types/*", "*eslint*"]
+  }
+}
+```
+
+<Callout>
+Read the [full docs](https://pnpm.io/settings/node-modules#publichoistpattern) on pnpm.io.
+</Callout>
+
+A single `"*"` lifts everything, like pnpm's `shamefully-hoist`. Every package can then resolve every other one, so the layout is no longer isolated.
+
+### `install.minimumReleaseAge`
+
+Reject versions published too recently. Nub enforces a 24-hour [cooling window](/docs/install#cooling-window) by default, so this field changes its length; `"0s"` turns it off.
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "install": {
+    "minimumReleaseAge": "3d"
+  }
+}
+```
+
+<Callout>
+Read the [full docs](https://pnpm.io/settings/dependency-resolution#minimumreleaseage) on pnpm.io.
+</Callout>
+
+A duration is an integer plus one unit:
+
+```text
+30s  # seconds
+20m  # minutes
+12h  # hours
+3d   # days
+2w   # weeks
+```
+
+When no version in a range is old enough, the install stops.
+
+Exclude packages that must update immediately with `minimumReleaseAgeExclude`:
+
+```jsonc title="nub.jsonc"
+{
+  // ...
+  "install": {
+    "minimumReleaseAge": "3d",
+    "minimumReleaseAgeExclude": [
+      "@company/*",
+      "typescript"
+    ]
+  }
+}
+```
+
+## `dlx`
+
+The dlx block configures temporary package runs through `nubx`, `nub dlx`, and `nub x`. It is read from the global file only, and a project `nub.jsonc` carrying a `dlx` block stops the command.
+
+The `consent` field governs an implicit `nubx` registry fetch. An explicit `nub dlx` run supplies its own consent and is unaffected.
+
+```jsonc title="~/.config/nub/nub.jsonc"
+{
+  // ...
+  "dlx": {
+    "consent": "prompt"   // ask first; "never" disables implicit fetches
+  }
+}
+```
+
+## `nub config`
+
+The `nub config` commands create the file and read or write single fields.
+
+```bash
+nub config init                               # commented project file
+nub config set install.linker hoisted         # writes ./nub.jsonc
+nub config get install.linker                 # hoisted
+nub config delete install.minimumReleaseAge
+nub config path                               # the global file's location
+```
+
+### Creating the file
+
+The `init` command writes a project file with every field commented out except `$schema`. Run from anywhere in a workspace, it writes the file at the workspace root, which every member reads. It refuses to replace an existing file.
+
+```bash
+nub config init --global   # the global file, including dlx.consent
+nub global config init     # equivalent prefix form
+```
+
+### Writing a field
+
+Writes go to the project file, and `--global` sends them to the global one. Fields under [`dlx`](#dlx) always go to the global file.
+
+```bash
+nub config set --global envFile false       # personal default, everywhere
+nub global config set envFile false         # equivalent prefix form
+nub config set dlx.consent never            # global; selector redundant
+```
+
+Each field is written whole. Pass an array or object as one shell-quoted JSON argument; a scalar needs no JSON quoting.
+
+```bash
+nub config set preload '["./setup.ts","tsx/esm"]'
+nub config set loader '{".graphql":"text",".rules":"yaml"}'
+nub config set install.linker \
+  '{"strategy":"isolated","hoist":["@types/*"]}'
+```
+
+A value is checked against the same rules that read the file, so a rejected write leaves the file untouched. An accepted write keeps comments, blank lines, and key order.
+
+```text
+$ nub config set install.minimumReleaseAge 3
+nub: `install.minimumReleaseAge` in /app/nub.jsonc: invalid duration `3` —
+expected an integer followed by a unit s|m|h|d|w (e.g. "3d")
+```
+
+### Reading a field
+
+Reads take the project file first and fall back to the global one. Structured values print as compact JSON that `set` accepts back, scalar strings print unquoted, and an unset field prints `undefined`.
+
+```bash
+nub config get --local nodeCompat   # project file only
+nub config get preload --json       # the exact stored value
+```
+
+### Keys outside `nub.jsonc`
+
+A key that is not a field of `nub.jsonc` reads and writes `.npmrc`, where npm, Yarn, and pnpm see it too. Under a pnpm 11 project, the settings pnpm moved out of `.npmrc` go to `pnpm-workspace.yaml` instead. Registry and auth keys stay in `.npmrc` on every project.
+
+Nub refuses a key that nothing would read back, and names what works instead:
+
+```text
+$ nub config set updateNotifier false
+Error: nub config set updateNotifier: `updateNotifier` is not a nub setting
+  nub does not check for its own updates while running a command. Run
+  `nub upgrade` when you want a new version.
+```
+
+Refused keys are absent from `nub config list --all` too.
+
+A `nub.jsonc` field outranks the `.npmrc` spelling of the same setting. When the project sets one, writing the other spelling is refused:
+
+```text
+$ nub config set nodeLinker isolated
+Error: nub config set nodeLinker: this project sets `install.linker` in
+nub.jsonc, which outranks .npmrc, so the value written here would never be
+read
+  run `nub config set install.linker <value>` instead, or remove
+  `install.linker` from nub.jsonc
+```

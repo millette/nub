@@ -169,8 +169,15 @@ fn detect_linux_libc() -> &'static str {
 /// Apply npm's `os`/`cpu`/`libc` rules to a single (pkg_field, host)
 /// pair. An empty pkg array is unconstrained; negations reject; at
 /// least one positive entry means one must match.
+///
+/// `host` is the value being selected FOR — the host's own triple, or an
+/// entry the caller configured. The literal `*` there accepts any package
+/// value on this axis, which is what `--os='*'` selects. pnpm has no such
+/// spelling (it silently installs nothing), so this is additive: no config
+/// that works under pnpm changes meaning, and the shape users reach for
+/// first now does what it looks like.
 fn field_matches(pkg_field: &[String], host: &str) -> bool {
-    if pkg_field.is_empty() {
+    if pkg_field.is_empty() || host == "*" {
         return true;
     }
     let mut has_positive = false;
@@ -289,8 +296,46 @@ pub fn filter_graph(
         }
     }
 
+    // 2b. Sever `bundleDependencies` edges. A bundled dep ships *inside*
+    //     its parent's tarball along with that dep's entire closure, so
+    //     it is materialized from the parent's extracted tree — never
+    //     fetched or linked as a standalone node (this is exactly what
+    //     npm records `inBundle` for). But npm's lockfile still
+    //     enumerates the bundled subtree with live `dependencies` edges,
+    //     so without cutting the parent→bundle edge the GC walk below
+    //     keeps the whole closure and the fetch/link path promotes it to
+    //     first-class nodes: redundant standalone copies online, and a
+    //     fatal `--offline` miss on any bundled child not in cache.
+    //     Cutting the edge per the parent's own `bundled_dependencies`
+    //     is context-correct (a legitimate non-bundled consumer of the
+    //     same name keeps its edge) and lets the GC prune the now-
+    //     unreachable closure — the same shape as the optional-edge
+    //     pruning above. The fresh-resolve path already skips these via
+    //     the packument's `bundledDependencies`; this is its frozen-
+    //     restore counterpart. (v1 lockfiles carry no parent-level
+    //     `bundleDependencies`; the npm reader reconstructs it from the
+    //     nested `bundled:true` children so this edge cut fires there
+    //     too.)
+    for pkg in graph.packages.values_mut() {
+        if pkg.bundled_dependencies.is_empty() {
+            continue;
+        }
+        let bundled = pkg.bundled_dependencies.clone();
+        for name in &bundled {
+            pkg.dependencies.remove(name);
+            pkg.optional_dependencies.remove(name);
+        }
+    }
+
     // 3. Garbage-collect unreachable packages by walking from the
     //    surviving roots.
+    prune_unreachable(graph);
+}
+
+/// Drop every package no importer reaches.
+pub(crate) fn prune_unreachable(graph: &mut aube_lockfile::LockfileGraph) {
+    use crate::FxHashSet;
+
     let mut reachable: FxHashSet<String> = FxHashSet::default();
     let mut stack: Vec<String> = Vec::new();
     for deps in graph.importers.values() {
@@ -303,7 +348,13 @@ pub fn filter_graph(
             continue;
         }
         if let Some(pkg) = graph.packages.get(&dep_path) {
-            for (name, tail) in &pkg.dependencies {
+            // pnpm mirrors active optional edges into `dependencies`, but
+            // Yarn Berry records them only in `optional_dependencies`.
+            for (name, tail) in pkg
+                .dependencies
+                .iter()
+                .chain(pkg.optional_dependencies.iter())
+            {
                 // Resolve the edge through every reader convention,
                 // including the git/remote-tarball `name@url+<hash>` form
                 // — otherwise a canonically-keyed git/tarball child (and
@@ -326,16 +377,35 @@ pub fn filter_graph(
 /// `optionalDependencies`). pnpm derives this during resolution; aube
 /// recomputes it as a post-resolve pass so freshly resolved lockfiles
 /// carry the same markers pnpm writes instead of an empty `{}` snapshot.
-///
-/// Algorithm: seed a `required` set from every non-optional direct
-/// dependency of every importer, then walk each required package's
-/// *non-optional* edges. A package's non-optional edges are its
-/// `dependencies` minus its `optional_dependencies`, because the pnpm
-/// parser mirrors active optional edges into `dependencies`. Any package
-/// not reached this way is optional. A single fully-required path keeps a
-/// package required even when other paths to it are optional, matching
-/// pnpm.
 pub fn mark_optional_packages(graph: &mut aube_lockfile::LockfileGraph) {
+    let optional = optional_only_packages(graph);
+    for (dep_path, pkg) in graph.packages.iter_mut() {
+        pkg.optional = optional.contains(dep_path);
+    }
+}
+
+/// The dep_paths [`mark_optional_packages`] would mark `optional: true`,
+/// derived from the graph's own edges without mutating it.
+///
+/// Exists because `LockedPackage::optional` is only populated on two paths —
+/// the pnpm reader and the fresh-resolve pass above — so a frozen install off
+/// an npm / bun / yarn lockfile carries `optional: false` on every package even
+/// though the graph still describes the optional edges. A consumer whose
+/// behavior must not silently vary by incumbent lockfile format asks here
+/// instead of reading the field.
+///
+/// Algorithm: seed a `required` set from every non-optional direct dependency of
+/// every importer, then walk each required package's *non-optional* edges. A
+/// package's non-optional edges are its `dependencies` minus its
+/// `optional_dependencies`, because the pnpm parser mirrors active optional
+/// edges into `dependencies`. Any package not reached this way is optional. A
+/// single fully-required path keeps a package required even when other paths to
+/// it are optional, matching pnpm and npm (whose `calcDepFlags` states the same
+/// invariant: "a node still flagged optional must only be reachable via optional
+/// edges").
+pub fn optional_only_packages(
+    graph: &aube_lockfile::LockfileGraph,
+) -> aube_util::collections::FxSet<String> {
     use crate::FxHashSet;
     use aube_lockfile::DepType;
 
@@ -372,9 +442,12 @@ pub fn mark_optional_packages(graph: &mut aube_lockfile::LockfileGraph) {
             }
         }
     }
-    for (dep_path, pkg) in graph.packages.iter_mut() {
-        pkg.optional = !required.contains(dep_path);
-    }
+    graph
+        .packages
+        .keys()
+        .filter(|dep_path| !required.contains(*dep_path))
+        .cloned()
+        .collect()
 }
 
 /// Populate each package's `transitive_peer_dependencies` the way pnpm
@@ -636,6 +709,52 @@ mod tests {
         assert!(!graph.packages.contains_key("native-linux@1.0.0"));
     }
 
+    #[test]
+    fn filter_graph_keeps_supported_yarn_berry_optional_children() {
+        let supported = SupportedArchitectures {
+            os: s(&["darwin"]),
+            cpu: s(&["arm64"]),
+            ..Default::default()
+        };
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph.importers.insert(
+            ".".to_string(),
+            vec![aube_lockfile::DirectDep {
+                name: "host".to_string(),
+                dep_path: "host@1.0.0".to_string(),
+                dep_type: aube_lockfile::DepType::Production,
+                specifier: Some("1.0.0".to_string()),
+            }],
+        );
+        graph.packages.insert(
+            "host@1.0.0".to_string(),
+            aube_lockfile::LockedPackage {
+                name: "host".to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: "host@1.0.0".to_string(),
+                // Yarn Berry does not mirror optional edges here.
+                dependencies: Default::default(),
+                optional_dependencies: [("native-darwin".to_string(), "1.0.0".to_string())].into(),
+                ..Default::default()
+            },
+        );
+        graph.packages.insert(
+            "native-darwin@1.0.0".to_string(),
+            aube_lockfile::LockedPackage {
+                name: "native-darwin".to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: "native-darwin@1.0.0".to_string(),
+                os: s(&["darwin"]).into(),
+                cpu: s(&["arm64"]).into(),
+                ..Default::default()
+            },
+        );
+
+        filter_graph(&mut graph, &supported, &Default::default());
+
+        assert!(graph.packages.contains_key("native-darwin@1.0.0"));
+    }
+
     fn dep(name: &str, dep_type: aube_lockfile::DepType) -> aube_lockfile::DirectDep {
         aube_lockfile::DirectDep {
             name: name.to_string(),
@@ -710,6 +829,48 @@ mod tests {
         assert!(is_opt("native-linux@1.0.0"));
         // Direct optional importer dep with no required path → optional.
         assert!(is_opt("opt-root@1.0.0"));
+    }
+
+    // The install's build-failure classification reads this set directly rather
+    // than `LockedPackage::optional`, so the graph — not the stamped field — has
+    // to be what decides. Every package here is left `optional: false` (the
+    // state a frozen install off an npm / bun / yarn lockfile arrives in): if
+    // the classification ever regressed to reading the field, this test would
+    // find nothing optional at all.
+    #[test]
+    fn optional_only_packages_reads_edges_not_the_stamped_flag() {
+        use aube_lockfile::DepType;
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph.importers.insert(
+            ".".to_string(),
+            vec![
+                dep("host", DepType::Production),
+                dep("also-required", DepType::Production),
+            ],
+        );
+        graph.packages.extend([
+            pkg("host", &["native", "dual"], &["native", "dual"]),
+            pkg("also-required", &["dual"], &[]),
+            pkg("native", &["native-child"], &[]),
+            pkg("native-child", &[], &[]),
+            pkg("dual", &[], &[]),
+        ]);
+        assert!(
+            graph.packages.values().all(|p| !p.optional),
+            "fixture must leave the stamped flag unset"
+        );
+
+        let optional = optional_only_packages(&graph);
+
+        // Reachable only under `host`'s optional edge — and so is its own child.
+        assert!(optional.contains("native@1.0.0"));
+        assert!(optional.contains("native-child@1.0.0"));
+        // The control that proves this can't swallow a required package's build
+        // failure: `dual` hangs off an optional edge from `host` AND a required
+        // edge from `also-required`, so one fully-required path keeps it required.
+        assert!(!optional.contains("dual@1.0.0"));
+        assert!(!optional.contains("host@1.0.0"));
+        assert!(!optional.contains("also-required@1.0.0"));
     }
 
     fn pkg_with_peers(
@@ -812,7 +973,8 @@ mod tests {
         }"#;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), content).unwrap();
-        let mut graph = aube_lockfile::npm::parse(tmp.path()).unwrap();
+        let mut graph =
+            aube_lockfile::npm::parse(tmp.path(), &aube_manifest::PackageJson::default()).unwrap();
 
         let host_dep_path = graph.importers["."][0].dep_path.clone();
         assert!(
@@ -842,6 +1004,234 @@ mod tests {
         assert!(!host.optional_dependencies.contains_key("native-win"));
     }
 
+    /// The Linux side of a darwin-only optional peer: `consumer` is required
+    /// and peers optionally on `fsevents`, which only the importer's
+    /// `optionalDependencies` provides. The peer edge must be optional,
+    /// so `fsevents` stays optional-only and a Linux filter drops it,
+    /// as pnpm does.
+    fn assert_darwin_only_optional_peer_is_dropped_on_linux(
+        mut graph: aube_lockfile::LockfileGraph,
+        consumer_key: &str,
+    ) {
+        let consumer = &graph.packages[consumer_key];
+        assert_eq!(
+            consumer.dependencies.get("fsevents").map(String::as_str),
+            Some("2.3.3"),
+            "the optional peer is linked"
+        );
+        assert!(
+            consumer.optional_dependencies.contains_key("fsevents"),
+            "an optional peer's edge is an optional edge"
+        );
+        assert!(
+            optional_only_packages(&graph).contains("fsevents@2.3.3"),
+            "a provider reached only through optional edges stays optional"
+        );
+
+        let linux = SupportedArchitectures {
+            os: s(&["linux"]),
+            cpu: s(&["x64"]),
+            ..Default::default()
+        };
+        filter_graph(&mut graph, &linux, &Default::default());
+        assert!(!graph.packages.contains_key("fsevents@2.3.3"));
+        assert!(
+            !graph.packages[consumer_key]
+                .dependencies
+                .contains_key("fsevents")
+        );
+    }
+
+    #[test]
+    fn optional_peer_edge_keeps_its_optional_provider_platform_filterable() {
+        use aube_lockfile::{DepType, DirectDep, LockedPackage, PeerDepMeta};
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph.importers.insert(
+            ".".to_string(),
+            vec![
+                DirectDep {
+                    name: "consumer".to_string(),
+                    dep_path: "consumer@1.0.0".to_string(),
+                    dep_type: DepType::Production,
+                    specifier: Some("1.0.0".to_string()),
+                },
+                DirectDep {
+                    name: "fsevents".to_string(),
+                    dep_path: "fsevents@2.3.3".to_string(),
+                    dep_type: DepType::Optional,
+                    specifier: Some("2.3.3".to_string()),
+                },
+            ],
+        );
+        let mut consumer = LockedPackage {
+            name: "consumer".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: "consumer@1.0.0".to_string(),
+            ..Default::default()
+        };
+        consumer
+            .peer_dependencies
+            .insert("fsevents".to_string(), "^2.0.0".to_string());
+        consumer
+            .peer_dependencies_meta
+            .insert("fsevents".to_string(), PeerDepMeta { optional: true });
+        let fsevents = LockedPackage {
+            name: "fsevents".to_string(),
+            version: "2.3.3".to_string(),
+            dep_path: "fsevents@2.3.3".to_string(),
+            os: ["darwin".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        for pkg in [consumer, fsevents] {
+            graph.packages.insert(pkg.dep_path.clone(), pkg);
+        }
+
+        let graph = crate::apply_peer_contexts(graph, &Default::default()).expect("peer pass");
+        assert_darwin_only_optional_peer_is_dropped_on_linux(
+            graph,
+            "consumer@1.0.0(fsevents@2.3.3)",
+        );
+    }
+
+    /// The same shape read from a lockfile whose snapshot names the peer in
+    /// its key but omits the edge: the reader restores it as optional.
+    #[test]
+    fn restored_optional_peer_edge_keeps_its_provider_platform_filterable() {
+        let content = r#"
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      consumer:
+        specifier: 1.0.0
+        version: 1.0.0(fsevents@2.3.3)
+    optionalDependencies:
+      fsevents:
+        specifier: 2.3.3
+        version: 2.3.3
+
+packages:
+  consumer@1.0.0:
+    resolution: {integrity: sha512-consumer}
+    peerDependencies:
+      fsevents: ^2.0.0
+    peerDependenciesMeta:
+      fsevents:
+        optional: true
+
+  fsevents@2.3.3:
+    resolution: {integrity: sha512-fsevents}
+    os: [darwin]
+
+snapshots:
+  consumer@1.0.0(fsevents@2.3.3): {}
+
+  fsevents@2.3.3:
+    optional: true
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pnpm-lock.yaml");
+        std::fs::write(&path, content).unwrap();
+        let graph = aube_lockfile::pnpm::parse(&path).unwrap();
+        assert_darwin_only_optional_peer_is_dropped_on_linux(
+            graph,
+            "consumer@1.0.0(fsevents@2.3.3)",
+        );
+    }
+
+    /// `bundleDependencies` are transitive: the parent's tarball ships
+    /// the bundled dep AND its whole closure, so on the frozen-restore
+    /// path the parent→bundle edge must be cut and the now-unreachable
+    /// closure GC'd — otherwise it is promoted to standalone fetch/link
+    /// nodes (redundant online, fatal offline).
+    #[test]
+    fn filter_graph_severs_bundled_edges_and_gcs_closure() {
+        use aube_lockfile::DepType;
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph
+            .importers
+            .insert(".".to_string(), vec![dep("host", DepType::Production)]);
+        // `host` bundles `gyp` (which drags in `gyp-dep`) and also has a
+        // normal, non-bundled `plain` dep that must survive.
+        let (host_key, mut host) = pkg("host", &["gyp", "gyp-dep", "plain"], &[]);
+        host.bundled_dependencies = vec!["gyp".to_string(), "gyp-dep".to_string()];
+        graph.packages.extend([
+            (host_key.clone(), host),
+            pkg("gyp", &["gyp-dep"], &[]),
+            pkg("gyp-dep", &[], &[]),
+            pkg("plain", &[], &[]),
+        ]);
+
+        filter_graph(
+            &mut graph,
+            &SupportedArchitectures::default(),
+            &Default::default(),
+        );
+
+        let host = &graph.packages[&host_key];
+        assert!(
+            !host.dependencies.contains_key("gyp"),
+            "bundled edge severed"
+        );
+        assert!(
+            !host.dependencies.contains_key("gyp-dep"),
+            "bundled edge severed"
+        );
+        assert!(
+            host.dependencies.contains_key("plain"),
+            "non-bundled edge kept"
+        );
+        // The bundled closure is unreachable after the cut → GC'd.
+        assert!(!graph.packages.contains_key("gyp@1.0.0"));
+        assert!(!graph.packages.contains_key("gyp-dep@1.0.0"));
+        assert!(graph.packages.contains_key("plain@1.0.0"));
+        assert!(graph.packages.contains_key(&host_key));
+    }
+
+    /// Cutting a bundled edge is scoped to the declaring parent: a
+    /// package the parent bundles can ALSO be a legitimate standalone
+    /// dep of another package, and that consumer's edge (and the shared
+    /// node) must survive.
+    #[test]
+    fn filter_graph_keeps_bundled_name_for_non_bundled_consumer() {
+        use aube_lockfile::DepType;
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph.importers.insert(
+            ".".to_string(),
+            vec![
+                dep("host", DepType::Production),
+                dep("app", DepType::Production),
+            ],
+        );
+        let (host_key, mut host) = pkg("host", &["gyp"], &[]);
+        host.bundled_dependencies = vec!["gyp".to_string()];
+        graph.packages.extend([
+            (host_key.clone(), host),
+            pkg("app", &["gyp"], &[]), // legit, non-bundled consumer
+            pkg("gyp", &[], &[]),
+        ]);
+
+        filter_graph(
+            &mut graph,
+            &SupportedArchitectures::default(),
+            &Default::default(),
+        );
+
+        assert!(
+            !graph.packages[&host_key].dependencies.contains_key("gyp"),
+            "host's bundled edge cut"
+        );
+        assert!(
+            graph.packages["app@1.0.0"].dependencies.contains_key("gyp"),
+            "app's legit edge kept"
+        );
+        assert!(
+            graph.packages.contains_key("gyp@1.0.0"),
+            "shared node survives via app"
+        );
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn libc_ignored_off_linux() {
@@ -863,5 +1253,149 @@ mod tests {
         }
         let sup = SupportedArchitectures::default();
         assert!(!is_supported(&[], &[], &s(&["musl"]), &sup));
+    }
+
+    // --- GVS prewarm/link graph-hash agreement (parcel worker-farm regression) ---
+
+    // A parcel-worker-farm-shaped graph: `@parcel/core` peers with
+    // `@parcel/workers`, and pulls in `@parcel/watcher`, whose subtree
+    // carries a platform-specific optional native variant per OS — exactly
+    // the shape (`@parcel/watcher-<platform>`, `@swc/core-<platform>`, lmdb,
+    // `@next/swc-<platform>`) that made the resolver widen the graph for a
+    // portable lockfile. Built with `optional_dependencies` set so
+    // `filter_graph` drops the host-mismatched leaf.
+    fn parcel_worker_farm_graph() -> aube_lockfile::LockfileGraph {
+        use aube_lockfile::{DirectDep, LockedPackage, LockfileGraph};
+        let mk = |name: &str, dep_path: &str| LockedPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            integrity: Some(format!("sha512-{name}")),
+            dep_path: dep_path.to_string(),
+            ..Default::default()
+        };
+        let mut graph = LockfileGraph::default();
+        graph.importers.insert(
+            ".".to_string(),
+            vec![DirectDep {
+                name: "parcel".to_string(),
+                dep_path: "parcel@2.12.0".to_string(),
+                dep_type: aube_lockfile::DepType::Production,
+                specifier: Some("2.12.0".to_string()),
+            }],
+        );
+
+        let mut parcel = mk("parcel", "parcel@2.12.0");
+        parcel.dependencies = [
+            ("@parcel/core".to_string(), "2.12.0".to_string()),
+            (
+                "@parcel/workers".to_string(),
+                "2.12.0(@parcel/core@2.12.0)".to_string(),
+            ),
+        ]
+        .into();
+        graph.packages.insert("parcel@2.12.0".to_string(), parcel);
+
+        let mut core = mk("@parcel/core", "@parcel/core@2.12.0");
+        core.dependencies = [
+            (
+                "@parcel/workers".to_string(),
+                "2.12.0(@parcel/core@2.12.0)".to_string(),
+            ),
+            ("@parcel/watcher".to_string(), "2.5.6".to_string()),
+        ]
+        .into();
+        graph
+            .packages
+            .insert("@parcel/core@2.12.0".to_string(), core);
+
+        let mut workers = mk(
+            "@parcel/workers",
+            "@parcel/workers@2.12.0(@parcel/core@2.12.0)",
+        );
+        workers.dependencies = [("@parcel/core".to_string(), "2.12.0".to_string())].into();
+        graph.packages.insert(
+            "@parcel/workers@2.12.0(@parcel/core@2.12.0)".to_string(),
+            workers,
+        );
+
+        // The native package with per-OS optional variants — the widening
+        // source. `watcher-linux` is host-mismatched on the darwin target
+        // the test filters against, so `filter_graph` prunes it and the
+        // parent `watcher` (and everything above it) re-hashes.
+        let mut watcher = mk("@parcel/watcher", "@parcel/watcher@2.5.6");
+        watcher.dependencies = [
+            ("@parcel/watcher-darwin".to_string(), "2.5.6".to_string()),
+            ("@parcel/watcher-linux".to_string(), "2.5.6".to_string()),
+        ]
+        .into();
+        watcher.optional_dependencies = watcher.dependencies.clone();
+        graph
+            .packages
+            .insert("@parcel/watcher@2.5.6".to_string(), watcher);
+
+        let mut darwin = mk("@parcel/watcher-darwin", "@parcel/watcher-darwin@2.5.6");
+        darwin.os = s(&["darwin"]).into();
+        darwin.cpu = s(&["arm64"]).into();
+        graph
+            .packages
+            .insert("@parcel/watcher-darwin@2.5.6".to_string(), darwin);
+
+        let mut linux = mk("@parcel/watcher-linux", "@parcel/watcher-linux@2.5.6");
+        linux.os = s(&["linux"]).into();
+        linux.cpu = s(&["x64"]).into();
+        graph
+            .packages
+            .insert("@parcel/watcher-linux@2.5.6".to_string(), linux);
+
+        graph
+    }
+
+    #[test]
+    fn gvs_prewarm_and_link_agree_only_after_host_filtering_the_widened_graph() {
+        // The GVS prewarm materializes into the shared store while hashing the
+        // resolver's WIDENED (all-platform) graph; the link phase hashes the
+        // host-FILTERED graph. Any package whose subtree contains a
+        // platform-specific optional native dep then recursively hashes
+        // differently in the two phases, so the SAME dep_path lands at two
+        // byte-identical global store dirs — and symlink-shared consumers split
+        // across the copies (for parcel: two `@parcel/core` instances, two
+        // serializer registries, `DataCloneError` at worker-farm startup). The
+        // fix host-filters the prewarm graph so both phases hash the same graph.
+        // This pins BOTH halves: a widened-vs-filtered hash genuinely diverges
+        // (why the bug existed), and filtering both sides makes every node hash
+        // agree (one store dir per dep_path).
+        use aube_lockfile::graph_hash::compute_graph_hashes;
+
+        let widened = parcel_worker_farm_graph();
+        let host = SupportedArchitectures {
+            os: s(&["darwin"]),
+            cpu: s(&["arm64"]),
+            ..Default::default()
+        };
+        let core = "@parcel/core@2.12.0";
+
+        let prewarm_widened = compute_graph_hashes(&widened, &|_| false, None);
+        let mut filtered = widened.clone();
+        filter_graph(&mut filtered, &host, &Default::default());
+        let link = compute_graph_hashes(&filtered, &|_| false, None);
+
+        assert!(
+            !filtered
+                .packages
+                .contains_key("@parcel/watcher-linux@2.5.6"),
+            "host filter must drop the linux-only native leaf"
+        );
+        assert_ne!(
+            prewarm_widened.node_hash[core], link.node_hash[core],
+            "hashing the widened graph must diverge from the host-filtered graph \
+             — that divergence is what split @parcel/core into two store dirs"
+        );
+
+        let prewarm_fixed = compute_graph_hashes(&filtered, &|_| false, None);
+        assert_eq!(
+            prewarm_fixed.node_hash, link.node_hash,
+            "with the prewarm host-filtering its graph, prewarm and link must \
+             agree on every node hash so no dep_path materializes at two dirs"
+        );
     }
 }

@@ -12,11 +12,14 @@
 //! which runs under the default profile in a different binary.
 
 use aube_util::Embedder;
-use aube_util::env::{config_env, embedder_env};
+use aube_util::env::{config_env, diag_env, embedder_env};
 
-/// A nub-shaped embedder: hides the branded debug-toggle family
-/// (`env_prefix = None`) but owns the first-class config knobs under its own
-/// brand (`config_env_prefix = Some("NUB")`).
+/// A nub-shaped embedder: hides the broad branded debug-toggle family
+/// (`env_prefix = None`) but owns the first-class config knobs
+/// (`config_env_prefix = Some("NUB")`) AND the diagnostics layer
+/// (`diag_env_prefix = Some("NUB")`) under its own brand — matching nub's real
+/// profile, where the `DIAG_*` knobs are reachable as `NUB_DIAG_*` while the
+/// rest of the `AUBE_*` toggle family stays unreadable.
 static NUBLIKE: Embedder = Embedder {
     name: "nublike",
     display_name: "nublike",
@@ -26,20 +29,34 @@ static NUBLIKE: Embedder = Embedder {
     self_names: &["nublike"],
     compatible_names: &["pnpm"],
     lockfile_basename: "lock.yaml",
+    lockfile_legacy_basenames: &[],
     workspace_yaml: None,
     manifest_namespace: "",
     env_prefix: None,
     config_env_prefix: Some("NUB"),
+    diag_env_prefix: Some("NUB"),
     cache_namespace: "nublike",
     data_namespace: "nublike",
+    virtual_store_subdir: "virtual-store",
+    managed_config_system_dir: Some("nublike"),
+    config_namespace: Some("nublike"),
     canonical_lockfile_always_wins: false,
     runtime_switching: false,
     self_engines_check: false,
     self_update_enabled: false,
     warm_store_verify: false,
     read_branded_settings_env: false,
+    gvs_incompatible_warning: true,
+    gvs_over_default_hoist: false,
     no_churn_lockfile_write: true,
     primer_ttl: None,
+    cpu_budget: None,
+    tty_progress: false,
+    rich_update_picker: false,
+    strict_unsupported_source: false,
+    trust_policy_ignore_after_default: None,
+    extra_settings_fingerprint: None,
+    unsupported_settings: &[],
 };
 
 /// Restore the previous value of an env var around a closure. Integration-test
@@ -91,6 +108,44 @@ fn nub_profile_hides_debug_toggles_and_reads_nub_config() {
         assert!(
             config_env("CONCURRENCY").is_none(),
             "AUBE_CONCURRENCY must be ignored under config_env_prefix = Some(\"NUB\")"
+        );
+    });
+
+    // Diagnostics layer (`diag_env_prefix = Some("NUB")`): the `NUB_DIAG_*`
+    // surface is reachable while the branded `AUBE_DIAG_*` form is NOT — only
+    // nub's own brand wins, even with both set.
+    with_var("NUB_DIAG_FILE", "/nub/diag.jsonl", || {
+        with_var("AUBE_DIAG_FILE", "/aube/diag.jsonl", || {
+            assert_eq!(
+                diag_env("DIAG_FILE").as_deref(),
+                Some(std::ffi::OsStr::new("/nub/diag.jsonl")),
+                "diag_env must read NUB_DIAG_FILE and ignore AUBE_DIAG_FILE under nub"
+            );
+        });
+    });
+
+    // The diag knobs ride `diag_env_prefix`, NOT the broad `env_prefix` family:
+    // with only the branded `AUBE_DIAG_*` form set, the diag read is empty (the
+    // AUBE brand is off nub's diag surface) and the broad `embedder_env` family
+    // stays unreadable (env_prefix = None) so no diag toggle leaks through it.
+    with_var("AUBE_DIAG_KERNEL", "1", || {
+        assert!(
+            diag_env("DIAG_KERNEL").is_none(),
+            "AUBE_DIAG_KERNEL must be ignored under diag_env_prefix = Some(\"NUB\")"
+        );
+        assert!(
+            embedder_env("DIAG_KERNEL").is_none(),
+            "the DIAG_* knobs never ride the broad env_prefix family (None under nub)"
+        );
+    });
+
+    // BENCH_PHASES_FILE rides the diag prefix too — `NUB_BENCH_PHASES_FILE` is
+    // read, the branded `AUBE_*` form is not.
+    with_var("NUB_BENCH_PHASES_FILE", "/nub/phases.json", || {
+        assert_eq!(
+            diag_env("BENCH_PHASES_FILE").as_deref(),
+            Some(std::ffi::OsStr::new("/nub/phases.json")),
+            "diag_env must read NUB_BENCH_PHASES_FILE under nub"
         );
     });
 }

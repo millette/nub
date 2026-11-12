@@ -78,6 +78,17 @@ pub struct Embedder {
     /// lockfile indistinguishable from the incumbent's in the
     /// lockfile-candidate set (`io.rs` / `clean.rs` / `pack.rs`).
     pub lockfile_basename: &'static str,
+    /// Former canonical lockfile basenames still RECOGNIZED ON READ during a
+    /// rename transition, but never written. The lockfile-candidate machinery
+    /// appends these as [`LockfileKind::Aube`](crate) read-candidates *after*
+    /// the primary [`lockfile_basename`](Self::lockfile_basename), so an
+    /// existing legacy file keeps resolving while every fresh write targets the
+    /// new name. Same per-name invariant as `lockfile_basename` (must contain a
+    /// `.`, must not alias a foreign lockfile). Standalone aube: `&[]` (no
+    /// legacy names — its name has never changed); an embedder mid-rename lists
+    /// the prior name(s) here (nub: `&["lock.yaml"]`, superseded by
+    /// `package.lock`). Additive and no-op for the empty default.
+    pub lockfile_legacy_basenames: &'static [&'static str],
     /// The *branded* workspace-config YAML this tool reads and writes, e.g.
     /// `"aube-workspace.yaml"`. `None` disables the tool's own branded YAML
     /// entirely (the shared `pnpm-workspace.yaml` compatibility surface is
@@ -111,11 +122,63 @@ pub struct Embedder {
     /// the host wants under its own brand, whereas the debug toggles vanish
     /// under an embedder that hides them. `None` reads no first-class config env.
     pub config_env_prefix: Option<&'static str>,
+    /// Env-var prefix for the diagnostics layer's small toggle set — the
+    /// `DIAG_*` knobs (`DIAG_FILE`/`DIAG_PRINT`/`DIAG_SUMMARY`/`DIAG_CRITPATH`/
+    /// `DIAG_THRESHOLD_MS`/`DIAG_KERNEL`) plus `BENCH_PHASES_FILE` — read through
+    /// [`diag_env`](crate::env::diag_env), e.g. `Some("AUBE")` → `AUBE_DIAG_FILE`,
+    /// `Some("NUB")` → `NUB_DIAG_FILE`. `None` reads none of them.
+    ///
+    /// Carved out from [`env_prefix`](Self::env_prefix) so a host can expose the
+    /// rich diagnostics layer under its OWN brand WITHOUT also inheriting aube's
+    /// ~30 other internal `{env_prefix}_*` debug toggles (`DISABLE_*`, `CAS_*`,
+    /// `INTERNAL_*`, …): those stay on `env_prefix`, the diag knobs follow this.
+    /// Standalone aube sets it to its `env_prefix` value (`Some("AUBE")`), so the
+    /// `AUBE_DIAG_*` surface is byte-for-byte unchanged; an embedder that hides
+    /// the general toggle family (`env_prefix = None`) can still opt the
+    /// diagnostics layer in by setting this to its own brand.
+    pub diag_env_prefix: Option<&'static str>,
     /// Leaf directory name under the OS cache root, e.g. `"aube"` →
     /// `<XDG_CACHE_HOME>/aube`.
     pub cache_namespace: &'static str,
     /// Leaf directory name under the OS data/state root, e.g. `"aube"`.
     pub data_namespace: &'static str,
+    /// Leaf directory name of the machine-global virtual store under the cache
+    /// root, e.g. `"virtual-store"` → `<cache_namespace>/virtual-store`. This is
+    /// the shared, content-materialized dep tree [`Store::virtual_store_dir`](crate)
+    /// symlinks project `node_modules` into — distinct from the *per-project*
+    /// virtual store leaf (`node_modules/.<name>`), which is a resolved setting,
+    /// not an embedder constant. An embedder renames it for a cleaner name (nub:
+    /// `"store"` → `<cache>/store`; it's the actual store, only "virtual" in that
+    /// callers symlink out of it). Default-preserving: standalone aube keeps
+    /// `"virtual-store"` byte-for-byte.
+    pub virtual_store_subdir: &'static str,
+    /// Leaf directory under the system config root (`/etc`) for the admin-managed
+    /// config file (`/etc/<dir>/managed.toml`), e.g. `Some("aube")` →
+    /// `/etc/aube/managed.toml`. `None` skips the system-managed read entirely —
+    /// the tool consults only the env-overridden managed path
+    /// (`{config_env_prefix}_MANAGED_CONFIG_PATH`) and never a system file.
+    ///
+    /// This is a *system* path an admin (or a co-installed tool) populates, so
+    /// it must follow the active brand: a host must not silently inherit another
+    /// tool's `/etc/<other>/managed.toml`. Distinct from the env-overridden
+    /// managed path, which already follows [`config_env_prefix`](Self::config_env_prefix).
+    pub managed_config_system_dir: Option<&'static str>,
+    /// Leaf directory under the XDG config root for the tool's OWN *user/project*
+    /// config file — `~/.config/<dir>/config.toml` at user scope and
+    /// `<cwd>/.config/<dir>/config.toml` at project scope, e.g. `Some("aube")` →
+    /// `~/.config/aube/config.toml`. `None` disables the branded user/project
+    /// config file ENTIRELY: the tool reads no such file (settings come only from
+    /// `.npmrc` + env + the per-setting defaults) and writes none, so a host
+    /// never reads another tool's `~/.config/<other>/config.toml` and never
+    /// authors a branded config file under its own name.
+    ///
+    /// This is a *user-authored* public config surface, so it follows the brand
+    /// boundary the same way [`managed_config_system_dir`](Self::managed_config_system_dir)
+    /// does for the system path: an embedder that keeps its settings on the
+    /// neutral `.npmrc`/env surface (nub) sets `None` rather than substituting a
+    /// `~/.config/<host>/` home. Standalone aube: `Some("aube")`, byte-for-byte
+    /// its prior `~/.config/aube/config.toml` path.
+    pub config_namespace: Option<&'static str>,
 
     // --- embedder-fixed behavior toggles (not user-tunable) ---
     /// When `true` (aube's default), this tool's canonical lockfile
@@ -137,7 +200,7 @@ pub struct Embedder {
     /// unaffected. Embedder-fixed.
     pub self_engines_check: bool,
     /// When `true` (aube's default), this tool owns its own self-update:
-    /// the update notifier (and its `aube.jdx.dev` endpoints) runs. An
+    /// the update notifier (and its `aube.sh` endpoints) runs. An
     /// embedder that owns its own upgrade path sets this `false` so those
     /// code paths never run. Embedder-fixed.
     pub self_update_enabled: bool,
@@ -187,6 +250,36 @@ pub struct Embedder {
     ///
     /// [`read_branded_pnpm_config`]: crate::engine_context::EngineContext::read_branded_pnpm_config
     pub read_branded_settings_env: bool,
+    /// When `true` (aube's default), the global-virtual-store *incompatible
+    /// package* auto-fallback emits a user-facing `WARN_AUBE_GVS_INCOMPATIBLE`
+    /// warning: an incompatible dep (e.g. Next.js) was detected, so the install
+    /// silently dropped to per-project materialization instead of the shared
+    /// store. An embedder sets this `false` to demote that notice to
+    /// `debug`-level — it is unactionable by the end user (the only fix is an
+    /// upstream change in the offending package), so a host that owns its own
+    /// UX hides it at default verbosity while keeping it reachable when the
+    /// engine log level is raised to `debug`. Gates ONLY the notice's level;
+    /// the per-project fallback BEHAVIOR is identical either way. Embedder-fixed.
+    pub gvs_incompatible_warning: bool,
+    /// When `false` (aube's default), a *default* `hoist` (the built-in
+    /// `hoist=true`, nobody set it) vetoes the global virtual store exactly as
+    /// upstream: `effective_gvs = planned && !hoist && Isolated`, so the shared
+    /// store engages only when `hoist` is off. When `true`, only an
+    /// *explicitly-set* `hoist=true` vetoes GVS; a DEFAULT hoist lets GVS engage
+    /// (`effective_gvs = planned && Isolated && !explicit_hoist`), and the hidden
+    /// hoist tree (`node_modules/.<store>/node_modules/`) is built only where GVS
+    /// does NOT engage (CI, per-project, an incompatible-package trigger, an
+    /// explicit `enableGlobalVirtualStore=false`, dlx).
+    ///
+    /// The embedder that pushes an isolated layout as its default (nub) needs
+    /// this so the hidden hoist tree — pnpm-parity for `hoistPattern:['*']`, which
+    /// restores ambient `@types/*` resolution for store-resident packages —
+    /// still gets built wherever the shared store isn't active, instead of being
+    /// lost for zero GVS benefit. Standalone aube keeps `false`, so its coupling
+    /// (`gvs.rs::Materialization::resolve` and the linker's
+    /// `use_global_virtual_store && hoist` fallback) is byte-for-byte unchanged.
+    /// Embedder-fixed: the host's layout posture, not a per-project knob.
+    pub gvs_over_default_hoist: bool,
     /// How long after the bundled primer's build date (`generated_at`) the
     /// offline metadata primer is consulted at all. `None` = unlimited (the
     /// primer never expires); `Some(d)` = consult the primer only while
@@ -212,6 +305,115 @@ pub struct Embedder {
     /// fixed: it's the host's call, not the user's, and it doesn't vary per
     /// project.
     pub primer_ttl: Option<std::time::Duration>,
+    /// Optional hook returning an effective CPU-count budget that caps the tool's
+    /// CPU-bound thread pools (the linker rayon pool, the tokio worker seed) below
+    /// the host's logical core count. `None` (aube's default) → no embedder cap,
+    /// so every pool sizes off `available_parallelism()` exactly as before
+    /// (byte-for-byte standalone behavior). An embedder running under a cgroup CPU
+    /// quota (a 0.5-CPU container) sets `Some(fn)` returning the real budget so the
+    /// pools don't over-subscribe the quota (CFS throttling) or feed thread/PID
+    /// exhaustion. The hook itself returns `None` when IT detects no constraint, so
+    /// even with a hook installed an unconstrained box keeps full-core pools.
+    /// Embedder-fixed pluggability (same shape as the other profile hooks); read
+    /// through [`effective_cpu_cap`](crate::effective_cpu_cap).
+    pub cpu_budget: Option<fn() -> Option<usize>>,
+    /// When `true`, the install progress UI uses the in-place single-line
+    /// animated bar by default on an interactive, non-CI terminal; when
+    /// `false` (aube's default), it stays append-only there unless
+    /// `AUBE_TTY_PROGRESS` opts the animated renderer in. CI / piped / non-TTY
+    /// output is append-only under either setting (cursor-control escapes must
+    /// never land in a log). Embedder-fixed: an embedder that wants the
+    /// animated bar as its first-class install UX flips this on; standalone
+    /// aube keeps append-only-by-default so its output is unchanged on the
+    /// default path. The progress→summary transition polish (a single clean
+    /// repaint, no leftover frame, no flash) is unconditional — only *whether
+    /// the animated renderer is the default* is gated here.
+    pub tty_progress: bool,
+    /// When `true`, `update --interactive` uses the tri-state table picker:
+    /// one row per outdated direct dep, with horizontal radio cells cycling
+    /// keep → in-range target → dist-tag latest, every row defaulting to
+    /// "keep" so an update is an explicit opt-in. When `false` (aube's
+    /// default), the original `demand::MultiSelect` picker (flat labels,
+    /// everything pre-selected) is used, so standalone aube's interactive
+    /// output and selection semantics are byte-for-byte unchanged.
+    /// Embedder-fixed: the host's interactive UX call, not a user knob.
+    pub rich_update_picker: bool,
+    /// When `false` (aube's default), a lockfile entry whose dependency
+    /// source the reader can't resolve (a `git`/`jsr`/unknown protocol in a
+    /// yarn.lock or bun.lock) keeps aube's prior best-effort behavior:
+    /// yarn-berry `warn!`s and drops the block; yarn-classic / bun reclassify
+    /// it to a registry `name@version` (which 404s at fetch). When `true`,
+    /// the reader instead raises [`crate`-external `Error::UnsupportedSource`]
+    /// at parse time for a NON-optional such entry (so the install aborts
+    /// eagerly, before any `node_modules` write, instead of producing a tree
+    /// that silently diverges from the incumbent's), and `warn!`s + drops an
+    /// OPTIONAL one (recording it as a skipped optional so a frozen install
+    /// still verifies). An embedder that guarantees "the installed tree
+    /// equals the incumbent PM's, or an eager precise refusal" (nub) sets
+    /// this `true`. Embedder-fixed: it's the host's call, not the user's.
+    pub strict_unsupported_source: bool,
+    /// Embedder-fixed default (in **minutes**) for `trustPolicyIgnoreAfter`
+    /// when the user leaves that setting unset: a picked version whose registry
+    /// publish time is older than this window is exempted from the `trustPolicy`
+    /// downgrade check. `None` (aube's default) leaves the knob unset so every
+    /// version is checked — byte-for-byte standalone behavior. An explicit user
+    /// `trustPolicyIgnoreAfter` (including `0`, which re-enables the full check)
+    /// always wins over this default via `.or()` at the resolve site.
+    ///
+    /// A finite window is the principled fix for the aged-backport false
+    /// positive (a legitimate maintenance release on an old major, published
+    /// later in wall-clock than a newer major that adopted OIDC provenance,
+    /// trips the date-ordered downgrade scan): once such a version has sat
+    /// un-yanked past the window it is overwhelmingly legitimate, so it clears
+    /// the check, while a freshly published weak-evidence version is still
+    /// scanned against the full history. The attack this guards is
+    /// time-sensitive — compromised publishes are detected and yanked within
+    /// hours-to-days — so the window trades no meaningful protection for the FP
+    /// relief, the same quarantine logic as `minimumReleaseAge`, mirrored.
+    /// Embedder-fixed: the host's supply-chain posture, not a per-project knob.
+    pub trust_policy_ignore_after_default: Option<u64>,
+    /// Optional hook contributing extra bytes to the install-state
+    /// `settings_hash` (see `crate::state::hash_settings` in the `aube` crate)
+    /// for a host that shapes the installed tree through an input aube's
+    /// resolved settings don't capture. `None` (aube's default) ⇒ the fold is
+    /// skipped entirely, so the hash is byte-for-byte unchanged for standalone
+    /// aube. A host returns a stable token for its own install-shape input so
+    /// flipping that input invalidates the warm tree and forces a re-link
+    /// instead of trusting a now-stale `node_modules`. nub folds in its
+    /// phantom-eject flag here — it shapes which packages materialize but rides
+    /// no aube setting. Same function-pointer hook shape as
+    /// [`cpu_budget`](Self::cpu_budget); embedder-fixed pluggability.
+    pub extra_settings_fingerprint: Option<fn() -> String>,
+    /// Canonical names of settings this host does NOT consume, because it does
+    /// not route the command that reads them. The engine treats each as absent
+    /// from the table: `meta::find` misses it, `meta::all` skips it, every
+    /// generated `resolved::*` accessor falls through to the default, and
+    /// `config set` refuses to write it.
+    ///
+    /// The engine's verb surface is a superset of any given host's. A host that
+    /// reimplements `run`/`exec` in its own frontend never reaches the engine's
+    /// auto-install gate, so `aubeNoAutoInstall` — the setting that gate reads —
+    /// is inert under it. Left in the table an inert setting still shows up in
+    /// `config list --all` and still WRITES through `config set`, which for a
+    /// brand-named one means the host puts the ENGINE's brand into the user's
+    /// `.npmrc` under a key nothing will ever read.
+    ///
+    /// Scope it to settings that are both inert here AND misleading to offer —
+    /// a brand-named one above all. A neutrally-named setting the host happens
+    /// not to read is better left visible: the name costs nothing, and hiding it
+    /// breaks the pnpm-surface parity a user expects. A name that is not in the
+    /// table is a silent no-op, so a host that populates this pins each entry
+    /// with a test.
+    ///
+    /// Each entry pairs the canonical name with the one line `config set` prints
+    /// to send the user somewhere real — the host's own equivalent knob, or why
+    /// there isn't one. A bare refusal would leave them with no next step, and
+    /// the engine cannot name the replacement because the replacement is the
+    /// HOST's surface.
+    ///
+    /// Standalone aube consumes its own whole table, so `&[]` — every lookup and
+    /// enumeration is byte-for-byte unchanged.
+    pub unsupported_settings: &'static [(&'static str, &'static str)],
 }
 
 /// Standalone aube's embedder profile. Reproduces every hardcoded branding
@@ -226,12 +428,20 @@ pub const AUBE: Embedder = Embedder {
     self_names: &["aube"],
     compatible_names: &["pnpm"],
     lockfile_basename: "aube-lock.yaml",
+    // aube's name has never changed — no legacy lockfile names to honor.
+    lockfile_legacy_basenames: &[],
     workspace_yaml: Some("aube-workspace.yaml"),
     manifest_namespace: "aube",
     env_prefix: Some("AUBE"),
     config_env_prefix: Some("AUBE"),
+    // Defaults to `env_prefix` so the `AUBE_DIAG_*` / `AUBE_BENCH_PHASES_FILE`
+    // surface is byte-for-byte unchanged for standalone aube.
+    diag_env_prefix: Some("AUBE"),
     cache_namespace: "aube",
     data_namespace: "aube",
+    virtual_store_subdir: "virtual-store",
+    managed_config_system_dir: Some("aube"),
+    config_namespace: Some("aube"),
     canonical_lockfile_always_wins: true,
     runtime_switching: true,
     self_engines_check: true,
@@ -239,7 +449,32 @@ pub const AUBE: Embedder = Embedder {
     warm_store_verify: true,
     no_churn_lockfile_write: false,
     read_branded_settings_env: true,
+    gvs_incompatible_warning: true,
+    // Standalone aube keeps the stock GVS↔hoist coupling: a default hoist=true
+    // vetoes the shared store, so its install layout is byte-for-byte unchanged.
+    gvs_over_default_hoist: false,
     primer_ttl: None,
+    cpu_budget: None,
+    // Append-only by default on a TTY; the animated renderer stays an
+    // `AUBE_TTY_PROGRESS` opt-in for standalone aube, so default output is
+    // unchanged.
+    tty_progress: false,
+    // Standalone aube keeps the demand::MultiSelect update picker, so its
+    // `update -i` UX is unchanged on the default path.
+    rich_update_picker: false,
+    // Standalone aube keeps its prior best-effort source handling
+    // (warn+drop for berry, reclassify-to-registry for classic/bun) so its
+    // default install behavior is byte-identical.
+    strict_unsupported_source: false,
+    // Standalone aube leaves `trustPolicyIgnoreAfter` unset, so the downgrade
+    // check applies to every version — behavior byte-for-byte unchanged.
+    trust_policy_ignore_after_default: None,
+    // No extra settings-fingerprint fold: standalone aube's `settings_hash` is
+    // byte-for-byte unchanged (the hook block is skipped when `None`).
+    extra_settings_fingerprint: None,
+    // Standalone aube routes every verb in its own table, so nothing in it is
+    // inert — the settings surface is unchanged.
+    unsupported_settings: &[],
 };
 
 static ACTIVE: OnceLock<&'static Embedder> = OnceLock::new();
@@ -275,6 +510,19 @@ pub fn set_embedder(embedder: &'static Embedder) {
          pick a distinct name so aube's lockfile stays distinguishable in the candidate set",
         embedder.lockfile_basename,
     );
+    // Legacy read-only basenames follow the same invariants as the primary:
+    // they ride the same candidate machinery, so a missing extension or a
+    // foreign-name alias would corrupt the candidate set just as badly.
+    for legacy in embedder.lockfile_legacy_basenames {
+        debug_assert!(
+            legacy.contains('.'),
+            "embedder lockfile_legacy_basenames entry {legacy:?} must contain a `.`",
+        );
+        debug_assert!(
+            !FOREIGN_LOCKFILE_NAMES.contains(legacy),
+            "embedder lockfile_legacy_basenames entry {legacy:?} aliases a foreign package manager's lockfile",
+        );
+    }
     let _ = ACTIVE.set(embedder);
 }
 
@@ -395,12 +643,17 @@ mod tests {
         assert_eq!(id.self_names, &["aube"]);
         assert_eq!(id.compatible_names, &["pnpm"]);
         assert_eq!(id.lockfile_basename, "aube-lock.yaml");
+        assert!(id.lockfile_legacy_basenames.is_empty());
         assert_eq!(id.workspace_yaml, Some("aube-workspace.yaml"));
         assert_eq!(id.manifest_namespace, "aube");
         assert_eq!(id.env_prefix, Some("AUBE"));
         assert_eq!(id.config_env_prefix, Some("AUBE"));
+        assert_eq!(id.diag_env_prefix, Some("AUBE"));
         assert_eq!(id.cache_namespace, "aube");
         assert_eq!(id.data_namespace, "aube");
+        assert_eq!(id.virtual_store_subdir, "virtual-store");
+        assert_eq!(id.managed_config_system_dir, Some("aube"));
+        assert_eq!(id.config_namespace, Some("aube"));
         assert!(id.canonical_lockfile_always_wins);
         assert!(id.runtime_switching);
         assert!(id.self_engines_check);
@@ -408,8 +661,13 @@ mod tests {
         assert!(id.warm_store_verify);
         assert!(!id.no_churn_lockfile_write);
         assert!(id.read_branded_settings_env);
+        assert!(!id.gvs_over_default_hoist);
         assert_eq!(id.config_env_prefix, Some("AUBE"));
         assert_eq!(id.primer_ttl, None);
+        assert!(!id.tty_progress);
+        assert!(!id.rich_update_picker);
+        assert_eq!(id.trust_policy_ignore_after_default, None);
+        assert!(id.extra_settings_fingerprint.is_none());
     }
 
     /// Under the default (AUBE) profile the source-branding helpers reproduce

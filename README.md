@@ -2,15 +2,8 @@
   <img src="https://nubjs.com/icon-border.svg" width="200px" align="center" alt="Nub logo" />
   <h1 align="center">Nub</h1>
   <p align="center">
-    A fast all-in-one toolkit that augments Node.js instead of replacing it
+    The all-in-one Node.js toolkit
   </p>
-</p>
-<br/>
-
-<p align="center">
-<a href="https://opensource.org/licenses/MIT" rel="nofollow"><img src="https://img.shields.io/github/license/nubjs/nub" alt="License"></a>
-<a href="https://www.npmjs.com/package/@nubjs/nub" rel="nofollow"><img src="https://img.shields.io/npm/dw/@nubjs/nub.svg" alt="npm"></a>
-<a href="https://github.com/nubjs/nub" rel="nofollow"><img src="https://img.shields.io/github/stars/nubjs/nub" alt="stars"></a>
 </p>
 
 <div align="center">
@@ -19,8 +12,14 @@
   <a href="https://github.com/nubjs/nub">GitHub</a>
   <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
   <a href="https://x.com/colinhacks">𝕏</a>
-  <br />
+  <br/><br/>
 </div>
+
+<p align="center">
+<a href="https://github.com/nubjs/nub" rel="nofollow"><img src="https://nubjs.com/stars.svg" alt="stars"></a>
+</p>
+
+
 
 <br/>
 <br/>
@@ -32,7 +31,7 @@ A Bun-like DX on top of stock `node`, written in Rust.
 nub index.ts             # TypeScript-first Node.js runtime
 nub run dev              # 24× faster pnpm run
 nubx prisma generate     # 19× faster npx
-nub install              # 2.5× faster pnpm install
+nub install              # 18× faster pnpm install
 nub watch src/server.ts  # native watch mode
 nub pm shim              # built-in Corepack-style shims
 nub node install 26      # Node version manager
@@ -62,9 +61,28 @@ curl -fsSL https://nubjs.com/install.sh | bash
 # Windows (PowerShell)
 irm https://nubjs.com/install.ps1 | iex
 
+# Windows (winget)
+winget install Nub.Nub
+
+# Homebrew (macOS / Linux)
+brew install nub
+
+# Nix (flakes)
+nix run github:nubjs/nub
+
+# mise
+mise use -g nub
+
 # Or via npm (pnpm / yarn global add work too)
-npm install -g --ignore-scripts=false @nubjs/nub
+npm install -g @nubjs/nub
 ```
+
+> [!NOTE]
+> Switching an existing `nubjs/tap` install over to the core formula takes an uninstall first:
+>
+> ```sh
+> brew uninstall nubjs/tap/nub && brew untap nubjs/tap && brew install nub
+> ```
 
 For GitHub Actions, use [`nubjs/setup-nub`](https://github.com/nubjs/setup-nub) in place of `actions/setup-node`. It's one-to-one compatible.
 
@@ -139,7 +157,6 @@ Modern API work out of the box under Nub. Node.js experimental APIs are unflagge
 | [`navigator.locks`](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) | polyfilled below Node 24.5, native above |
 | [`reportError`](https://developer.mozilla.org/en-US/docs/Web/API/Window/reportError) | polyfilled |
 | [`vm.Module`](https://nodejs.org/api/vm.html#class-vmmodule) | unflagged |
-| [`ShadowRealm`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/ShadowRealm) | unflagged |
 | [`Wasm module imports`](https://nodejs.org/api/esm.html#wasm-modules) | unflagged below Node 24.5 (22.19 on the 22.x line), native above |
 | [`WebSocket`](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) | unflagged from Node 20.10, native from Node 22 |
 | [`EventSource`](https://developer.mozilla.org/en-US/docs/Web/API/EventSource) | unflagged from Node 20.18, native above |
@@ -217,6 +234,18 @@ nubx -y cowsay@1.5.0 "hi"   # fetched from the registry (auto-approved via -y)
 
 View the [full package runner docs 👉](https://nubjs.com/docs/nubx).
 
+## Unified runner — `nubr`
+
+One name for the three runners above: a file, a `package.json` script, or an installed bin, resolved most-specific-first. The installer puts it on `PATH` beside `nub`, and [`@nubjs/runner`](https://www.npmjs.com/package/@nubjs/runner) ships the same command for a project that cannot install the binary.
+
+```sh
+nubr app.ts        # a file
+nubr build         # a package.json script
+nubr vitest run    # an installed node_modules/.bin entry
+```
+
+View the [unified runner docs 👉](https://nubjs.com/docs/standalone).
+
 <br/>
 
 ## Package manager — `nub install`
@@ -236,19 +265,19 @@ It's fast — avoids the per-command Node.js bootstrap lag incurred by JS-based 
 
 | Tool | Time | Relative |
 |---|---|---|
-| `nub` | 1122 ms | — |
-| `bun` | 1444 ms | 29% slower |
-| `pnpm` | 2847 ms | 2.5× |
-| `npm` | 4163 ms | 3.7× |
+| `nub` | 171 ms | — |
+| `bun` | 686 ms | 4.0× |
+| `pnpm` | 3193 ms | 18.7× |
+| `npm` | 5316 ms | 31.1× |
 
-> warm frozen install · create-t3-app · 222 deps · macOS — [view benchmark](https://github.com/nubjs/nub/tree/main/tests/bench/install)
+> warm frozen install · TanStack Start · 313 deps · macOS — [view benchmark](https://github.com/nubjs/nub/tree/main/tests/bench/install)
 
 ### Security
 
 - 🛡️ Blocks postinstall by default
 - 🦠 Checks [osv.dev](https://osv.dev) for known-malicious package versions during resolution by default
 - 🔻 Refuses provenance downgrades by default
-- ⏳ 24-hour `minimumReleaseAge` by default
+- ⏳ Strict 24-hour `minimumReleaseAge` by default
 
 ### Compatibility
 
@@ -313,3 +342,7 @@ View the [full `nub node` docs 👉](https://nubjs.com/docs/node).
 ## License
 
 MIT
+
+> <p align="center">
+>  <em>⭐️ If you read this far, consider starring the repo :) ⭐️</em>
+> </p>

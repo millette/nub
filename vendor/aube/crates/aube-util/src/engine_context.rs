@@ -29,6 +29,44 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
+/// Command-line platform selection, one entry per axis.
+///
+/// `None` means the axis was not named on the command line and keeps whatever
+/// the config sources resolved. `Some(list)` REPLACES that axis outright —
+/// naming `--os` does not disturb `--cpu`. A list may carry `current` (the
+/// host's own value) and `*` (accept any value on this axis); both are
+/// interpreted downstream by `aube_resolver::platform`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CliSupportedArchitectures {
+    pub os: Option<Vec<String>>,
+    pub cpu: Option<Vec<String>>,
+    pub libc: Option<Vec<String>>,
+}
+
+impl CliSupportedArchitectures {
+    /// Whether any axis was named. Call sites use this to skip the override
+    /// entirely rather than reasoning about three `None`s.
+    pub fn is_empty(&self) -> bool {
+        self.os.is_none() && self.cpu.is_none() && self.libc.is_none()
+    }
+}
+
+/// Which project `.npmrc` files a command inside a workspace reads. Every
+/// package manager reads the workspace root's `.npmrc`, whichever member a
+/// command targets; they disagree on whether the `.npmrc` of the package the
+/// command was RUN from also counts (measured on pnpm 10.34, pnpm 11.28, npm
+/// 11.20, Yarn 1.22 and Bun 1.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WorkspaceNpmrc {
+    /// The root `.npmrc`, then the invoking package's own on top: pnpm 10 and
+    /// earlier, Yarn 1.
+    #[default]
+    RootBeneathMember,
+    /// The root `.npmrc` alone; a member `.npmrc` is never read: pnpm 11, npm,
+    /// Bun.
+    RootOnly,
+}
+
 /// Per-invocation values an embedder computes and hands to aube.
 ///
 /// Every field defaults to aube's upstream behavior, so an unset context is
@@ -81,9 +119,9 @@ pub struct EngineContext {
     /// workspace yaml + the `pnpm` package.json namespace). The GLOBAL /
     /// user-scope pnpm-named files (`<configDir>/config.yaml` and
     /// `<configDir>/auth.ini`) are gated by the separate
-    /// [`read_pnpm_global_config`](Self::read_pnpm_global_config) posture —
-    /// they must NOT ride a project-derived (cwd-dependent) gate, since global
-    /// config has no project incumbent.
+    /// [`read_pnpm_global_config`](Self::read_pnpm_global_config) posture. The
+    /// two gates are separate because the files are loaded through different
+    /// paths; an embedder may still derive both from the active project identity.
     pub read_branded_pnpm_config: bool,
 
     /// Whether aube reads pnpm's GLOBAL / user-scope pnpm-named config files:
@@ -92,21 +130,94 @@ pub struct EngineContext {
     /// preserves upstream behavior — standalone aube IS a pnpm-compatible PM
     /// and reads pnpm's global config unconditionally.
     ///
-    /// This is DELIBERATELY SEPARATE from
+    /// This is deliberately separate from
     /// [`read_branded_pnpm_config`](Self::read_branded_pnpm_config). That
-    /// posture is derived from the project's incumbent PM (a cwd-scoped
-    /// concept) and correctly gates the PROJECT-scoped pnpm surfaces. Global
-    /// config, by contrast, has no project and no incumbent — gating it on the
-    /// cwd's incumbent would mean "read pnpm's global config only when you
-    /// happen to be standing in a pnpm project", which is incoherent. This
-    /// separate posture lets an embedder read the global pnpm-named files
-    /// UNGATED by the cwd. nub sets this `true` unconditionally: it honors
-    /// whatever global config the user already has from any tool (npm's
-    /// `~/.npmrc`, pnpm's global `config.yaml` / `auth.ini`), independent of
-    /// the cwd. (nub keeps global WRITES neutral — never writing back a
-    /// pnpm-branded global file — but that is the embedder's write-path
-    /// concern, not this read gate.)
+    /// posture gates the PROJECT-scoped pnpm surfaces, while this one gates
+    /// pnpm-named user files loaded by the global readers. An embedder can keep
+    /// the upstream unconditional behavior or set this from its own identity
+    /// policy. Nub enables it only for a provable pnpm-v11+ incumbent; its
+    /// global writes remain neutral and are a separate write-path concern.
     pub read_pnpm_global_config: bool,
+
+    /// Whether LAYOUT settings — the ones flagged `layout = true` in
+    /// `settings.toml`: `nodeLinker`, the hoisting family, `modulesDir`, and
+    /// the virtual-store directories — may resolve from the workspace-YAML
+    /// source family (the project workspace yaml and pnpm's global
+    /// `config.yaml`). `true` (default) preserves upstream aube behavior:
+    /// every declared source applies to every setting.
+    ///
+    /// DISTINCT from [`read_branded_pnpm_config`](Self::read_branded_pnpm_config),
+    /// which decides whether those pnpm-named FILES are read at all. This one
+    /// is per-AXIS rather than per-file: an embedder whose compatibility
+    /// guarantee covers version resolution, module resolution, and the
+    /// lockfile — but NOT how `node_modules` is physically arranged — sets
+    /// this `false` so a mirrored PM's YAML still supplies resolution config
+    /// while layout stays the embedder's own axis. Every other source
+    /// (`.npmrc`, env, CLI, embedder defaults, project config) is unaffected,
+    /// so the same keys keep working from the neutral surfaces.
+    pub read_layout_from_workspace_yaml: bool,
+
+    /// Whether aube honors bare `pnpm_config_<registry-client-key>` /
+    /// `PNPM_CONFIG_<REGISTRY_CLIENT_KEY>` environment variables on the
+    /// registry-client config track — the default `registry`, the proxies,
+    /// the TLS knobs, `maxsockets`, `local-address`. `false` (default)
+    /// preserves upstream aube behavior: only `npm_config_*` / `NPM_CONFIG_*`
+    /// set these registry-client keys, and the `pnpm_config_` prefix is
+    /// stripped solely for `//`-scoped per-URI auth keys.
+    ///
+    /// pnpm REVERSED its env-var convention at v11: pnpm ≤10 reads
+    /// `npm_config_*` and ignores `pnpm_config_*`; pnpm 11 reads
+    /// `pnpm_config_*` / `PNPM_CONFIG_*` (its general settings env, see
+    /// pnpm's `config/reader/src/env.ts`) and ignores `npm_config_*`. An
+    /// embedder whose active PM is provably **pnpm v11+** sets this `true`
+    /// so the registry-client track mirrors pnpm 11; under any earlier pnpm,
+    /// any other PM, nub identity, or standalone aube it stays `false`.
+    ///
+    /// Scope note: this gates ONLY the registry-client track in
+    /// `aube-registry`. The GENERIC settings family (`aube-settings`, e.g.
+    /// `pnpm_config_auto_install_peers`) has its own `pnpm_config_*` aliases
+    /// gated separately by [`read_branded_pnpm_config`](Self::read_branded_pnpm_config).
+    /// pnpm 11's env reader requires a strictly snake_case suffix, so the
+    /// `//`-auth and `@scope:registry` forms are NOT readable via
+    /// `pnpm_config_*` on pnpm 11 — only the bare single/`_`-joined keys are.
+    pub read_pnpm_config_env_registry: bool,
+
+    /// Whether project/user `.npmrc` files are read for *settings* only through
+    /// pnpm 11's auth/registry/network allowlist, dropping every
+    /// layout/behavior key. `false` (default) preserves upstream behavior — the
+    /// open key space, where any setting is readable from `.npmrc` (pnpm ≤10 /
+    /// npm semantics, which standalone aube mirrors).
+    ///
+    /// pnpm reversed how it reads a project `.npmrc` at v11: v9/v10 read every
+    /// setting from `.npmrc`; v11 reads ONLY the auth/registry/network allowlist
+    /// (`isNpmrcReadableKey`, pnpm `config/reader/src/localConfig.ts:189-198`:
+    /// `@…`/`//…`-scoped keys, the npm-auth family, and the proxy/TLS keys) from
+    /// `.npmrc` and takes every layout/behavior setting from
+    /// `pnpm-workspace.yaml`/`config.yaml` instead. An embedder whose active PM
+    /// is provably **pnpm v11+** sets this `true` so the *settings* view of
+    /// `.npmrc` matches pnpm 11; under any earlier pnpm, any other PM, nub
+    /// identity, or standalone aube it stays `false`.
+    ///
+    /// Scope note: this gates ONLY the settings-facing `.npmrc` readers
+    /// (`load_npmrc_entries` / `load_npmrc_entries_split`, feeding
+    /// `aube_settings`). The registry-client auth track
+    /// (`NpmConfig::load`) walks `.npmrc` on its own path and is unaffected —
+    /// it already extracts only auth/registry/network keys, which are exactly
+    /// the keys the allowlist keeps, so auth resolution is identical with the
+    /// posture on or off.
+    pub npmrc_settings_allowlist: bool,
+
+    /// Whether the invoking package's `.npmrc` layers over the workspace
+    /// root's; see [`WorkspaceNpmrc`]. Both layers are project-scope, so both
+    /// keep the project trust tier.
+    pub workspace_npmrc: WorkspaceNpmrc,
+
+    /// The directory the command was invoked from, after `--dir`/`-C`, which
+    /// decides the invoking package for [`WorkspaceNpmrc::RootBeneathMember`].
+    /// Recorded once by the embedder because filtered and recursive commands
+    /// later chdir into each member they visit. `None` falls back to the
+    /// process cwd at read time.
+    pub invocation_dir: Option<std::path::PathBuf>,
 
     /// Whether aube reads Yarn Berry's `.yarnrc.yml` config surface and
     /// translates the subset that maps cleanly onto the existing npmrc-shaped
@@ -174,6 +285,27 @@ pub struct EngineContext {
     /// `.npmrc`, preserving explicit project npm config precedence.
     pub synthetic_project_npmrc_entries: Vec<(String, String)>,
 
+    /// Project-scoped settings supplied directly by an embedder. Unlike
+    /// [`synthetic_project_npmrc_entries`](Self::synthetic_project_npmrc_entries),
+    /// these feed only the typed settings resolver, never the registry client.
+    /// They occupy the project-config tier below CLI/environment and above file
+    /// and global sources. Empty by default, preserving standalone behavior.
+    pub project_config_settings: Vec<(String, String)>,
+
+    /// Per-axis platform selection supplied on the command line
+    /// (`--os` / `--cpu` / `--libc`). An axis set here REPLACES whatever the
+    /// config sources resolved for that axis; an axis left `None` keeps the
+    /// config value. This is an override rather than another source in the
+    /// union because the two answer different questions: the config homes say
+    /// what a project supports, the flags say what THIS invocation should
+    /// fetch — and a union can only ever widen. Never written back to a config
+    /// file; a flagged install leaves the project's files untouched. Reaches
+    /// every filter site through
+    /// `commands::install::settings::effective_supported_architectures`, which
+    /// is the single funnel they all share. Default-empty preserves standalone
+    /// behavior.
+    pub cli_supported_architectures: CliSupportedArchitectures,
+
     /// PATH entries prepended (in order, ahead of the existing PATH) to every
     /// lifecycle spawn. An embedder places a runtime shim dir first so a bare
     /// `node` in a build script resolves to the augmented runtime. Default
@@ -189,6 +321,43 @@ pub struct EngineContext {
     /// pin `npm_node_execpath`, inject a preload via `NODE_OPTIONS`). Default
     /// empty = behavior-preserving.
     pub env_overlay: Vec<(OsString, OsString)>,
+
+    /// A directory holding a resolvable `node`, supplied by an embedder that
+    /// owns Node provisioning itself (`Embedder::runtime_switching = false`) and
+    /// therefore leaves aube's runtime resolver inert. When the resolver
+    /// produced no switch, [`crate::runtime`]'s spawn helpers fall back to this
+    /// so a fetched-bin `exec node` shebang, a dlx/create child, and node-program
+    /// spawns still resolve `node` on a machine with no system `node` on PATH.
+    ///
+    /// Distinct from [`path_prepends`](Self::path_prepends): that reaches only
+    /// the LIFECYCLE-script overlay, which the transient bin-exec paths (dlx /
+    /// create / `nubx <tool>`) never touch. This reaches those paths through the
+    /// runtime helpers instead. `None` (default) = upstream behavior — the
+    /// resolver owns node discovery — byte-identical for standalone aube.
+    pub runtime_node_dir: Option<PathBuf>,
+
+    /// The node executable the embedder provisioned. Pins `NODE` /
+    /// `npm_node_execpath` on runtime-spawned children when the resolver didn't
+    /// switch, so those stay the embedder's provisioned node instead of falling
+    /// back to an ambient PATH `node` (absent on a node-less machine). `None`
+    /// (default) keeps the ambient-`node` fallback — upstream behavior.
+    pub runtime_node_bin: Option<PathBuf>,
+
+    /// The version of that node, bare (`22.15.0`, no `v`). Same provenance as
+    /// [`runtime_node_bin`](Self::runtime_node_bin) — an embedder that owns Node
+    /// provisioning already holds it, so aube neither probes nor re-derives it.
+    /// `engines::effective_node_version` consults this at the resolver's tier:
+    /// below an explicit `node-version` `.npmrc` override (pnpm's
+    /// validation-only knob), above the ambient `node --version` PATH probe.
+    ///
+    /// Load-bearing beyond the `engines.node` check: this version's major is the
+    /// GVS engine fingerprint (`<os>-<arch>-node<major>`) folded into the
+    /// virtual-store path of every subtree containing a build-allowed package.
+    /// Under `runtime_switching = false` the resolver is inert, so without this
+    /// the fingerprint would record the ambient shell node while lifecycle
+    /// scripts compiled against the embedder's — two majors sharing one store
+    /// entry. `None` (default) keeps the PATH probe — upstream behavior.
+    pub runtime_node_version: Option<String>,
 
     /// Replacement lifecycle `npm_config_user_agent` product token. `None`
     /// (default) falls back to the compile-time [`Embedder::user_agent`] —
@@ -222,6 +391,104 @@ pub struct EngineContext {
     /// incumbent PM, exactly like [`read_branded_pnpm_config`](Self::read_branded_pnpm_config)
     /// and the other incumbent-keyed read postures. aube assigns no policy.
     pub npm_save_prefix_on_bare_exact: bool,
+
+    /// Whether pnpm's `namedRegistries` alias→URL routing is active — a dep
+    /// spec like `"@work/constants": "work:1.x.x"` resolves from the aliased
+    /// registry declared in a `namedRegistries` map (plus the built-in `gh:`
+    /// alias → GitHub Packages). `false` (default) preserves upstream aube
+    /// behavior: the alias→URL map is never populated, so every `<alias>:`
+    /// spec falls through to its existing resolver exactly as today — the
+    /// resolver logic is a no-op on an empty map. An embedder mirroring a pnpm
+    /// incumbent sets this `true` to opt into the feature; standalone aube
+    /// (default `false`) stays byte-identical on the resolve path.
+    ///
+    /// DELIBERATELY separate from [`read_branded_pnpm_config`](Self::read_branded_pnpm_config)
+    /// (which defaults `true`): that posture cannot gate this feature without
+    /// activating it for standalone aube, breaking default-preservation. nub
+    /// sets this to the same value it computes for `read_branded_pnpm_config`
+    /// (pnpm incumbent or fresh nub-as-pnpm-drop-in).
+    pub named_registries_enabled: bool,
+
+    /// Replacement `packageExtensions` source. `Some(map)` makes the supplied
+    /// map the manifest's *sole* packageExtensions contribution —
+    /// `PackageJson::package_extensions` returns it verbatim instead of
+    /// walking the manifest's `pnpm.packageExtensions` / `aube.packageExtensions`
+    /// / top-level `packageExtensions` sources. `None` (default) leaves upstream
+    /// behavior untouched (walk every source).
+    ///
+    /// The embedder seam for tools that scope which packageExtensions home
+    /// applies per active PM — top-level `packageExtensions` is a nub-identity
+    /// neutral field (no PM reads it except through a branded home), so nub
+    /// honors it only under its own identity and drops it under an npm/pnpm/
+    /// yarn/bun compat role. Same shape and contract as [`embedder_overrides`].
+    ///
+    /// [`embedder_overrides`]: Self::embedder_overrides
+    pub embedder_package_extensions: Option<BTreeMap<String, serde_json::Value>>,
+
+    /// Bundled ecosystem `packageExtensions` defaults an embedder supplies,
+    /// applied as the LOWEST-precedence layer on top of the user/project
+    /// extensions. Additive only — `apply_package_extensions` uses
+    /// `extend_missing`, so a dependency a package already declares is never
+    /// overwritten, and user extensions (parsed first in
+    /// `resolve_dependency_policy`) win per-key over bundled ones.
+    ///
+    /// Deliberately SEPARATE from [`embedder_package_extensions`]: that seam
+    /// is a *replacement* source that also feeds the lockfile
+    /// `packageExtensionsChecksum` (via `effective_package_extensions`). Routing
+    /// bundled defaults through it would make every bundled-list bump change
+    /// the checksum, drift every existing lockfile, and abort
+    /// `--frozen-lockfile` under `enforce_package_extensions_checksum`. This
+    /// field is read ONLY by `resolve_dependency_policy`, never by the checksum
+    /// path — so a bundled-list update is a no-op for existing lockfiles (it
+    /// only affects freshly-resolved packages). Same shape as the replacement
+    /// seam (`selector -> body`, npm/yarn camelCase bodies).
+    ///
+    /// [`embedder_package_extensions`]: Self::embedder_package_extensions
+    pub bundled_package_extensions: Option<BTreeMap<String, serde_json::Value>>,
+
+    /// Whether the embedder treats `packageExtensions` as a checksummed,
+    /// drift-enforced config like pnpm does. `false` (default) preserves
+    /// upstream behavior: aube stamps `packageExtensionsChecksum` only onto
+    /// `pnpm-lock.yaml` (registry byte-parity with pnpm) and never validates
+    /// it, so a packageExtensions edit never re-resolves or frozen-fails.
+    ///
+    /// When `true` (nub), the embedder additionally (1) stamps the checksum
+    /// onto its own generic lockfile (the `Aube` kind = `nub.lock`, pnpm-v9
+    /// bytes) so the drift check reaches a fixpoint, and (2) treats a
+    /// stored-vs-computed checksum mismatch as lockfile drift — a normal
+    /// install re-resolves, a `--frozen-lockfile` install aborts — mirroring
+    /// pnpm's `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`. Harmless under lockfile
+    /// kinds that carry no checksum (npm/yarn/bun): stored and computed both
+    /// resolve to `None`, so the check is a no-op.
+    pub enforce_package_extensions_checksum: bool,
+
+    /// Replacement DEFAULT shell for every lifecycle-script spawn, used only
+    /// when the user configured no `script-shell` (which still wins). `None`
+    /// (default) keeps aube's platform default — `sh -c` on Unix, `cmd.exe
+    /// /d /s /c` on Windows.
+    ///
+    /// Exists for the Windows default specifically: an embedder that runs the
+    /// same POSIX script bodies through its own surfaces wants ONE shell, and
+    /// a POSIX shell is the more robust choice under an OS sandbox because it
+    /// needs no filesystem-ancestor repair to behave correctly. aube itself
+    /// takes no position — it consumes whatever the embedder resolved.
+    pub default_script_shell: Option<ScriptShell>,
+}
+
+/// A shell invocation: the program plus the leading args that precede the
+/// script body. Two args are needed because a multi-call binary dispatches on
+/// an applet name — busybox is spawned as `busybox.exe sh -c <body>`, where a
+/// plain shell takes `<shell> -c <body>`.
+#[derive(Clone, Debug)]
+pub struct ScriptShell {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    /// The shell up-cases environment names when it loads the Windows
+    /// environment, as busybox-w32 does, so a body would see `NPM_PACKAGE_NAME`
+    /// and `$npm_package_name` would expand to nothing. When set, the spawn
+    /// re-binds the lowercase names it set at the head of the body
+    /// (`aube_scripts::lowercase_env_prologue`).
+    pub restore_env_casing: bool,
 }
 
 impl Default for EngineContext {
@@ -233,6 +500,11 @@ impl Default for EngineContext {
             trusted_dependencies_honored: true,
             read_branded_pnpm_config: true,
             read_pnpm_global_config: true,
+            read_layout_from_workspace_yaml: true,
+            read_pnpm_config_env_registry: false,
+            npmrc_settings_allowlist: false,
+            workspace_npmrc: WorkspaceNpmrc::RootBeneathMember,
+            invocation_dir: None,
             read_yarn_config: false,
             yarn_is_classic: false,
             read_bun_config: false,
@@ -240,10 +512,20 @@ impl Default for EngineContext {
             pnpmfile_default_enabled: true,
             synthetic_user_npmrc_entries: Vec::new(),
             synthetic_project_npmrc_entries: Vec::new(),
+            project_config_settings: Vec::new(),
+            cli_supported_architectures: CliSupportedArchitectures::default(),
             path_prepends: Vec::new(),
             env_overlay: Vec::new(),
+            runtime_node_dir: None,
+            runtime_node_bin: None,
+            runtime_node_version: None,
             lifecycle_user_agent_product: None,
             npm_save_prefix_on_bare_exact: false,
+            named_registries_enabled: false,
+            embedder_package_extensions: None,
+            bundled_package_extensions: None,
+            enforce_package_extensions_checksum: false,
+            default_script_shell: None,
         }
     }
 }
@@ -297,6 +579,7 @@ mod tests {
         assert!(ctx.trusted_dependencies_honored);
         assert!(ctx.read_branded_pnpm_config);
         assert!(ctx.read_pnpm_global_config);
+        assert!(!ctx.read_pnpm_config_env_registry);
         assert!(!ctx.read_yarn_config);
         assert!(!ctx.yarn_is_classic);
         assert!(!ctx.read_bun_config);
@@ -304,9 +587,17 @@ mod tests {
         assert!(ctx.pnpmfile_default_enabled);
         assert!(ctx.synthetic_user_npmrc_entries.is_empty());
         assert!(ctx.synthetic_project_npmrc_entries.is_empty());
+        assert!(ctx.project_config_settings.is_empty());
         assert!(ctx.path_prepends.is_empty());
         assert!(ctx.env_overlay.is_empty());
+        assert_eq!(ctx.runtime_node_dir, None);
+        assert_eq!(ctx.runtime_node_bin, None);
+        assert_eq!(ctx.runtime_node_version, None);
         assert_eq!(ctx.lifecycle_user_agent_product, None);
         assert!(!ctx.npm_save_prefix_on_bare_exact);
+        assert!(!ctx.named_registries_enabled);
+        assert_eq!(ctx.embedder_package_extensions, None);
+        assert_eq!(ctx.bundled_package_extensions, None);
+        assert!(!ctx.enforce_package_extensions_checksum);
     }
 }

@@ -19,13 +19,21 @@
 //      submodule-init step is needed.
 //   3. Apply `.worktreeinclude` — copy/symlink the listed gitignored entries
 //      INTO the worktree (things `git worktree` won't bring, e.g. `.repos/`).
-//   4. Print the stable per-worktree CARGO_TARGET_DIR convention (it does NOT
-//      seed/copy a target dir — cargo's incremental fingerprints are keyed to
-//      the absolute target path, so a stable dedicated dir is the fast loop).
+//   4. Print the build convention: use `scripts/rust-build.sh` instead of bare
+//      `cargo`. Worktrees SHARE one target dir (~/.cache/nub/shared-target) so a
+//      fresh worktree reuses the crates.io DEP artifacts a sibling compiled and
+//      only recompiles the workspace crates — the fast path. But sharing clobbers
+//      when two worktrees diverge the SAME depended-on crate (e.g. vendor/aube on
+//      different branches), so rust-build.sh shares by default and auto-isolates
+//      to a private target dir the moment THIS worktree diverges such a crate.
+//      See .claude/skills/rust-build/SKILL.md. (Bare `cargo` + a hardcoded shared
+//      CARGO_TARGET_DIR still works but risks that contamination — prefer the
+//      wrapper.)
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, mkdirSync, cpSync, symlinkSync, lstatSync } from "node:fs";
 import { dirname, join, resolve, isAbsolute } from "node:path";
+import { homedir } from "node:os";
 
 const HELP = `new-worktree — create an isolated git worktree off origin/main
 
@@ -35,21 +43,20 @@ Usage:
 
 Arguments:
   <slug>              Branch name and default path suffix (worktree lands at
-                     /tmp/nub-wt-<slug>, branch <slug>).
+                     ~/.cache/nub/worktrees/<slug>, branch <slug>).
 
 Options:
   --base <ref>       Base ref for the new branch (default: origin/main).
-  --path <dir>       Explicit worktree path (default: /tmp/nub-wt-<slug>).
+  --path <dir>       Explicit worktree path (default: ~/.cache/nub/worktrees/<slug>).
   --no-fetch         Skip the initial \`git fetch origin\`.
   -h, --help         Show this help.
 
 After creation:
   cd <path>
-  export CARGO_TARGET_DIR=<path>-target   # stable per-worktree target dir
-  cargo build -p nub-cli --profile fast   # ~3 min cold, ~5s incremental
+  scripts/rust-build.sh build -p nub-cli --profile fast   # shares the cache; auto-isolates if you diverge a depended-on crate
 
 Cleanup when done:
-  git worktree remove <path> --force && rm -rf <path>-target
+  git worktree remove <path> --force   # the shared target dir is intentionally NOT removed
 `;
 
 type Opts = {
@@ -105,7 +112,7 @@ function parseArgs(argv: string[]): Opts {
   return {
     slug,
     base,
-    path: path ?? `/tmp/nub-wt-${slug}`,
+    path: path ?? `${homedir()}/.cache/nub/worktrees/${slug}`,
     fetch,
   };
 }
@@ -190,6 +197,9 @@ function main(): void {
 
   if (existsSync(opts.path)) die(`worktree path already exists: ${opts.path}`);
 
+  // Ensure the parent directory exists (e.g. ~/.cache/nub/worktrees/ on first run).
+  mkdirSync(dirname(opts.path), { recursive: true });
+
   if (opts.fetch) {
     const remoteRef = opts.base.includes("/") ? opts.base.split("/")[0] : "origin";
     run("git", ["fetch", remoteRef]);
@@ -202,14 +212,20 @@ function main(): void {
 
   applyInclude(mainRoot, opts.path);
 
-  const targetDir = `${opts.path}-target`;
+  // Build via scripts/rust-build.sh, not a hardcoded CARGO_TARGET_DIR: it points
+  // at the shared dir (~/.cache/nub/shared-target) for the fast incremental path,
+  // but auto-isolates to a private target dir the moment this worktree diverges a
+  // depended-on crate (vendor/aube, nub-core, …) — which is when the shared dir
+  // would otherwise clobber a sibling and fail with a phantom compile error on
+  // correct source. Pre-create the shared dir so the fast path is real on run 1.
+  const sharedTarget = `${homedir()}/.cache/nub/shared-target`;
+  mkdirSync(sharedTarget, { recursive: true });
   process.stderr.write("\n");
   process.stderr.write(`worktree ready: ${opts.path}\n`);
   process.stderr.write(`  cd ${opts.path}\n`);
-  process.stderr.write(`  export CARGO_TARGET_DIR=${targetDir}   # stable per-worktree target dir — keep it for the whole session\n`);
-  process.stderr.write(`  cargo build -p nub-cli --profile fast\n`);
-  process.stderr.write(`  # cleanup when done:\n`);
-  process.stderr.write(`  git worktree remove ${opts.path} --force && rm -rf ${targetDir}\n`);
+  process.stderr.write(`  scripts/rust-build.sh build -p nub-cli --profile fast   # shared cache; auto-isolates on depended-on-crate divergence\n`);
+  process.stderr.write(`  # cleanup when done (leave the shared target dir in place for the next worktree):\n`);
+  process.stderr.write(`  git worktree remove ${opts.path} --force\n`);
 }
 
 main();

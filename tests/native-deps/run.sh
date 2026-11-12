@@ -9,8 +9,8 @@
 #                              package is on the floor allowlist (it is a
 #                              long-lived, registry-only, well-known build tool).
 #                              The floor must: (a) allow the build to run,
-#                              (b) emit WARN_NUB_DEFAULT_TRUST_BUILDS disclosing
-#                              the package by name, (c) produce a working module.
+#                              (b) disclose the package by name, (c) produce a
+#                              working module.
 #
 #   better-sqlite3 (11.10.0) — compiles a C++ N-API addon via node-gyp at
 #                              postinstall. Also on the floor allowlist. Same
@@ -62,8 +62,8 @@ trap cleanup EXIT
 # the OSV advisory gate to have run (`osv_gate_active = true`). The OSV gate
 # depends on nub's packument cache, which lives in $XDG_CACHE_HOME/nub/pm/ —
 # a completely cold sandbox defeats the gate, causing the floor to fall back to
-# deny+warn (`WARN_NUB_IGNORED_BUILD_SCRIPTS`) instead of the expected allow+
-# disclose path (`WARN_NUB_DEFAULT_TRUST_BUILDS`). On CI (ubuntu-latest),
+# deny (`ERR_NUB_IGNORED_BUILDS`) instead of the expected allow+
+# disclose path. On CI (ubuntu-latest),
 # the runner has network access and the XDG cache starts cold — but the
 # resolver warms it during the resolve phase before the scripts phase, so the
 # OSV gate runs and the floor fires correctly. Sandboxing the project dirs
@@ -90,10 +90,10 @@ if echo "$install_out" | grep -qiE 'aube|jdx\.dev'; then
 fi
 
 # Default-trust disclosure: both floor-allowed packages must be named in the
-# WARN_NUB_DEFAULT_TRUST_BUILDS line — the floor is NOT a silent allow path.
+# defaultTrust warning — the floor is NOT a silent allow path.
 # This fires before the lifecycle script phase, so it is present even when a
 # build (e.g. better-sqlite3's node-gyp compile) fails afterward.
-echo "$install_out" | grep -q 'WARN_NUB_DEFAULT_TRUST_BUILDS' \
+echo "$install_out" | grep -q 'WARN defaultTrust: running build scripts' \
   || fail "defaultTrust disclosure missing from output (floor allowed builds silently). Output: $install_out"
 echo "$install_out" | grep -q 'esbuild' \
   || fail "esbuild not named in defaultTrust disclosure. Output: $install_out"
@@ -112,7 +112,17 @@ pass "esbuild postinstall ran: binary present"
 # gracefully on dev boxes where the toolchain can't compile node-gyp addons;
 # the esbuild check is authoritative on every platform.
 # Run from within $PROJ_ALLOW so require() resolves against that node_modules.
-LOAD_OUT="$(cd "$PROJ_ALLOW" && node ./verify-load.cjs 2>&1)"
+#
+# Capture the status separately instead of letting `set -e` kill the script on the
+# assignment. A native addon that aborts (SIGABRT/139/134) rather than throwing takes
+# the whole node process down, and under `set -e` the failing command substitution
+# ended run.sh with only the raw exit code — no output, because everything node wrote
+# went into the variable the failed assignment discarded. That is how an abort here
+# reads as an unexplained "exit code 134" with no diagnostics at all.
+LOAD_RC=0
+LOAD_OUT="$(cd "$PROJ_ALLOW" && node ./verify-load.cjs 2>&1)" || LOAD_RC=$?
+[ "$LOAD_RC" -eq 0 ] \
+  || fail "verify-load.cjs exited $LOAD_RC (a signal death is 128+n, so 134=SIGABRT in a native addon). Output: $LOAD_OUT"
 echo "$LOAD_OUT" | grep -q "NATIVE-DEPS-OK" \
   || fail "native modules not loadable after install. verify-load output: $LOAD_OUT"
 pass "native modules loadable: $LOAD_OUT"
@@ -130,11 +140,11 @@ pass "native modules loadable: $LOAD_OUT"
 echo ""
 echo "── frozen install runs trusted builds (Decision 2 regression) ────────────"
 LOCKFILE=""
-for cand in lock.yaml aube-lock.yaml pnpm-lock.yaml; do
+for cand in nub.lock lock.yaml aube-lock.yaml pnpm-lock.yaml; do
   [ -f "$PROJ_ALLOW/$cand" ] && { LOCKFILE="$cand"; break; }
 done
 [ -n "$LOCKFILE" ] \
-  || fail "fresh install produced no lockfile in $PROJ_ALLOW (expected lock.yaml, aube-lock.yaml, or pnpm-lock.yaml)"
+  || fail "fresh install produced no lockfile in $PROJ_ALLOW (expected nub.lock, lock.yaml, aube-lock.yaml, or pnpm-lock.yaml)"
 
 PROJ_FROZEN="$SANDBOX_ROOT/floor-frozen-clone"
 mkdir -p "$PROJ_FROZEN"
@@ -151,7 +161,7 @@ if echo "$frozen_out" | grep -qiE 'aube|jdx\.dev'; then
 fi
 
 # The floor must fire on the frozen install exactly as on the fresh one.
-echo "$frozen_out" | grep -q 'WARN_NUB_DEFAULT_TRUST_BUILDS' \
+echo "$frozen_out" | grep -q 'WARN defaultTrust: running build scripts' \
   || fail "FROZEN INSTALL: defaultTrust disclosure missing — the floor fell closed on a frozen install (Decision 2 bug). Output: $frozen_out"
 echo "$frozen_out" | grep -q 'esbuild' \
   || fail "FROZEN INSTALL: esbuild not named in defaultTrust disclosure. Output: $frozen_out"
@@ -176,16 +186,19 @@ cat > "$PROJ_DENY/package.json" <<'JSON'
 }
 JSON
 
-deny_out="$(cd "$PROJ_DENY" && "$NUB" install 2>&1)" || true
+deny_rc=0
+deny_out="$(cd "$PROJ_DENY" && "$NUB" install 2>&1)" || deny_rc=$?
 
-# The floor must NOT allow core-js's build (it is not on the allowlist).
-# The ignored-build-scripts warning must appear — not a hard failure, but not
-# a silent allow.
-echo "$deny_out" | grep -q 'WARN_NUB_IGNORED_BUILD_SCRIPTS' \
-  || fail "core-js build was not mentioned in WARN_NUB_IGNORED_BUILD_SCRIPTS (deny side broken). Output: $deny_out"
+# The floor must NOT allow core-js's build (it is not on the allowlist), and
+# under the default `strictDepBuilds` the install fails naming it, as pnpm 12's
+# ERR_PNPM_IGNORED_BUILDS does.
+[ "$deny_rc" -ne 0 ] \
+  || fail "install with an unapproved core-js build exited 0 (deny side broken). Output: $deny_out"
+echo "$deny_out" | grep -q 'ERR_NUB_IGNORED_BUILDS' \
+  || fail "core-js build was not reported as ERR_NUB_IGNORED_BUILDS (deny side broken). Output: $deny_out"
 echo "$deny_out" | grep -q 'core-js' \
-  || fail "core-js not named in ignored-build-scripts warning. Output: $deny_out"
-pass "default-trust deny side: core-js build blocked + named in warning"
+  || fail "core-js not named in the ignored-builds error. Output: $deny_out"
+pass "default-trust deny side: core-js build blocked + named in the error"
 
 echo ""
 echo "native-deps: all assertions passed."

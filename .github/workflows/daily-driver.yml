@@ -20,20 +20,26 @@ on:
       - "crates/**"
       - "runtime/**"
       - "vendor/aube/**"
+      - "vendor/libsui/**"
       - "tests/daily-driver/**"
       - ".github/workflows/daily-driver.yml"
   pull_request:
+    # Not part of plain `ci`: request a run with `gh pr edit <n> --add-label ci-full`. Rationale: ci.yml.
+    types: [labeled]
     branches: [main]
     paths:
       - "crates/**"
       - "runtime/**"
       - "vendor/aube/**"
+      - "vendor/libsui/**"
       - "tests/daily-driver/**"
       - ".github/workflows/daily-driver.yml"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event.label.name != 'ci-full' && github.event.label.name || '' }}
   cancel-in-progress: true
+
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,20 +47,36 @@ env:
 jobs:
   daily-driver:
     name: Daily-driver (ubuntu, node 24)
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-latest
     # Real registry install + Vite build + vitest can be slow on cold runners.
     timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable # zizmor: ignore[impostor-commit,ref-version-mismatch] dtolnay force-pushes its version tags, so pinned SHAs go unreachable; commit verified genuine upstream
+      # Trunk writes, pull requests read. A cache saved from a PR ref is visible only to
+      # that ONE pull request, yet it still counts against the repository-wide 10 GB
+      # budget — so unconditional saving here evicted the shared trunk caches that every
+      # other job restores from. Same reasoning in native-deps, lockfile-roundtrip,
+      # aube-parity and verb-dispatch.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
         with:
           version: 10
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: "24"
-          cache: "pnpm"
+          # No `cache: pnpm` here: the smoke installs into a throwaway temp fixture
+          # via the freshly-built `nub`, so no repo-root pnpm install ever populates
+          # the pnpm store. setup-node's post-cleanup cache-save then validates the
+          # (non-existent) store path and fails the job — even though every smoke
+          # scenario passed. The cache offered zero speedup and only this failure mode.
       - name: Build nub + native addon
         shell: bash
         run: |

@@ -1,17 +1,18 @@
 use super::dep_path::{
-    dep_path_tail, parse_dep_path, peerless_alias_target, rewrite_peer_suffix,
-    rewrite_snapshot_alias_deps,
-    version_to_dep_path,
+    PATCH_HASH_MARKER, dep_path_tail, parse_dep_path, peerless_alias_target,
+    registry_name_from_qualified_version, rewrite_peer_suffix, rewrite_snapshot_alias_deps,
+    strip_patch_hash_suffix, version_to_dep_path,
 };
 use super::raw::{
-    RawBinSpec, RawDepSpec, RawRuntimeVariant, local_source_from_resolution, parse_raw_lockfile,
+    RawBinSpec, RawDepSpec, RawPnpmLockfile, RawRuntimeVariant, local_source_from_resolution,
+    parse_raw_lockfile,
 };
 use crate::{
     CatalogEntry, DepType, DirectDep, Error, LocalSource, LockedPackage, LockfileGraph,
-    PeerDepMeta, RuntimePin, RuntimeTarget, RuntimeVariant, git_commits_match,
+    ParseOptions, PeerDepMeta, RuntimePin, RuntimeTarget, RuntimeVariant, git_commits_match,
 };
 use aube_util::path::normalize_lexical;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 fn rebase_importer_local(local: LocalSource, importer_path: &str) -> LocalSource {
@@ -33,11 +34,193 @@ fn rebase_importer_local(local: LocalSource, importer_path: &str) -> LocalSource
     }
 }
 
+/// Upstream aube writes a literal `link:` dep's `version:` relative to the
+/// lockfile root rather than the importer, so a lockfile it wrote must not be
+/// rebased again. That form is recognisable only when the specifier carries the
+/// path: the version then equals the spec resolved from the importer, and
+/// differs from the spec itself, which is what pnpm writes.
+fn is_root_relative_link(specifier: &str, version_path: &Path, importer_path: &str) -> bool {
+    let Some(spec_path) = specifier.strip_prefix("link:").map(Path::new) else {
+        return false;
+    };
+    let version_path = normalize_lexical(version_path);
+    normalize_lexical(spec_path) != version_path
+        && normalize_lexical(&Path::new(importer_path).join(spec_path)) == version_path
+}
+
+/// Lowest `lockfileVersion` this reader understands. pnpm v9 replaced
+/// the top-level `dependencies:` map and `/name@version` package keys
+/// with `importers:` + `snapshots:`; every pass below assumes that
+/// shape, so older files must be rejected rather than parsed into an
+/// empty graph.
+pub(super) const MIN_LOCKFILE_VERSION: u64 = 9;
+
+/// Major component of a `lockfileVersion`. pnpm has written the value
+/// both as a quoted string (`'9.0'`, `'6.0'`) and as a bare YAML float
+/// (`5.4`), so both encodings are accepted.
+///
+/// Every dot-separated component must be digits: reading only the
+/// leading component would accept `9.invalid` as version 9 and let a
+/// lockfile of unknown shape through the guard. Returns `None` for
+/// anything that isn't a well-formed version number, which the caller
+/// treats as unsupported.
+pub(super) fn lockfile_version_major(value: &yaml_serde::Value) -> Option<u64> {
+    if let Some(s) = value.as_str() {
+        let s = s.trim();
+        let mut components = s.split('.');
+        let major = components.next()?;
+        if !components.all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit())) {
+            return None;
+        }
+        return major.parse().ok();
+    }
+    if let Some(u) = value.as_u64() {
+        return Some(u);
+    }
+    // A bare YAML float is numeric by construction, so truncating to
+    // the major is safe here — `9.5` is a v9-family lockfile.
+    let f = value.as_f64()?;
+    (f.is_finite() && f >= 0.0).then_some(f.trunc() as u64)
+}
+
+/// Render a `lockfileVersion` back for the error message, preserving
+/// whichever encoding the lockfile used.
+fn render_lockfile_version(value: &yaml_serde::Value) -> String {
+    if let Some(s) = value.as_str() {
+        return s.to_string();
+    }
+    if let Some(u) = value.as_u64() {
+        return u.to_string();
+    }
+    if let Some(i) = value.as_i64() {
+        return i.to_string();
+    }
+    match value.as_f64() {
+        Some(f) => f.to_string(),
+        None => "(unreadable)".to_string(),
+    }
+}
+
 /// Parse a pnpm-lock.yaml file into a LockfileGraph.
 pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
+    parse_with_options(path, ParseOptions::default())
+}
+
+/// Erase pnpm's `(patch_hash=…)` markers from every key and dep-path
+/// value the graph is built out of, before any of it is interpreted.
+///
+/// The marker is a write-time spelling of a patched package's identity,
+/// not part of aube's dep_path model: the resolver never emits one, and
+/// the writer re-derives every occurrence from
+/// `patched_dependency_hashes`. Carrying it into the graph would key a
+/// patched project's package table differently from the freshly
+/// resolved graph it is compared against — the identity hash could
+/// never match, so the no-churn write guard could never fire — and the
+/// npm-alias synthesis would derive a marked alias key that no later
+/// `<alias>@<version>` lookup reproduces.
+fn strip_patch_hash_markers(raw: &mut RawPnpmLockfile) {
+    // A key collision can only come from a hand-merged lockfile holding
+    // both spellings of one package; first-wins keeps it deterministic.
+    fn rekey<V>(map: &mut BTreeMap<String, V>) {
+        if !map.keys().any(|k| k.contains(PATCH_HASH_MARKER)) {
+            return;
+        }
+        for (key, value) in std::mem::take(map) {
+            map.entry(strip_patch_hash_suffix(&key)).or_insert(value);
+        }
+    }
+
+    for importer in raw.importers.values_mut() {
+        let specs = [
+            &mut importer.dependencies,
+            &mut importer.dev_dependencies,
+            &mut importer.optional_dependencies,
+            &mut importer.skipped_optional_dependencies,
+        ];
+        for spec in specs.into_iter().flatten().flat_map(BTreeMap::values_mut) {
+            if spec.version.contains(PATCH_HASH_MARKER) {
+                spec.version = strip_patch_hash_suffix(&spec.version);
+            }
+        }
+    }
+    rekey(&mut raw.packages);
+    rekey(&mut raw.snapshots);
+    for snapshot in raw.snapshots.values_mut() {
+        let deps = [
+            &mut snapshot.dependencies,
+            &mut snapshot.optional_dependencies,
+        ];
+        for value in deps.into_iter().flatten().flat_map(BTreeMap::values_mut) {
+            if value.contains(PATCH_HASH_MARKER) {
+                *value = strip_patch_hash_suffix(value);
+            }
+        }
+    }
+}
+
+pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<LockfileGraph, Error> {
     let content = crate::read_lockfile(path)?;
-    let raw = parse_raw_lockfile(&content)
-        .map_err(|e| Error::parse_yaml_err(path, content.clone(), &e))?;
+    // Parse the project document alone when pnpm 11+'s env document leads
+    // the file, so the subset fast path still applies. A failure falls
+    // back to the whole file so a diagnostic's span points into it.
+    let main = match super::env::split_env_document(&content) {
+        (Some(_), main) => parse_raw_lockfile(main).ok(),
+        (None, _) => None,
+    };
+    let mut raw = match main {
+        Some(raw) => raw,
+        None => parse_raw_lockfile(&content)
+            .map_err(|e| Error::parse_yaml_err(path, content.clone(), &e))?,
+    };
+    strip_patch_hash_markers(&mut raw);
+
+    // Version guard before any structural pass: a pre-v9 lockfile is
+    // valid YAML that yields zero importers, which would otherwise
+    // link nothing and exit 0.
+    match lockfile_version_major(&raw.lockfile_version) {
+        Some(major) if major >= MIN_LOCKFILE_VERSION => {}
+        _ => {
+            return Err(Error::UnsupportedPnpmLockfileVersion {
+                path: path.to_path_buf(),
+                version: render_lockfile_version(&raw.lockfile_version),
+            });
+        }
+    }
+
+    // Layout guard for a lockfile whose declared version does not match
+    // its body: `lockfileVersion: '9.0'` over a pre-v9 body passes the
+    // version check, and its root deps are then dropped on the floor —
+    // the graph comes back empty and the declared dependencies go
+    // unlinked.
+    //
+    // Two independent signatures, because either can appear alone: a
+    // root-level dependency block (the only shape a `link:`/`file:`-only
+    // project has, since it has no `packages:` at all), and a
+    // slash-prefixed package key (`/is-odd@3.0.1` in v6,
+    // `/is-odd/3.0.1` in v5). A package name cannot begin with `/`, and
+    // no v9+ document puts dependencies at the root, so neither shape is
+    // one pnpm or aube writes at v9.
+    let legacy_marker = [
+        ("dependencies", raw.dependencies.is_some()),
+        ("devDependencies", raw.dev_dependencies.is_some()),
+        ("optionalDependencies", raw.optional_dependencies.is_some()),
+        ("specifiers", raw.specifiers.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(block, present)| present.then(|| format!("root-level `{block}:` block")))
+    .or_else(|| {
+        raw.packages
+            .keys()
+            .find(|key| key.starts_with('/'))
+            .map(|key| format!("package key `{key}`"))
+    });
+    if let Some(marker) = legacy_marker {
+        return Err(Error::PnpmLockfileLegacyLayout {
+            path: path.to_path_buf(),
+            version: render_lockfile_version(&raw.lockfile_version),
+            marker,
+        });
+    }
 
     // Parse importers (direct deps of each workspace package).
     // We track synthesized LockedPackages for local (`file:` / `link:`)
@@ -104,8 +287,10 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         // 404s. Strip it here so the URL that reaches the fetcher
         // and the dep_path hash are both peer-context-free —
         // consistent with what `parse_dep_path` does for snapshot
-        // keys downstream.
+        // keys downstream. The key keeps it: consumed with two sets of peers,
+        // the package is two entries, each linking its own.
         let classify_version = info.version.split('(').next().unwrap_or(&info.version);
+        let peer_suffix = &info.version[classify_version.len()..];
         if let Some(local) = LocalSource::parse(classify_version, Path::new("")) {
             // `Path::new("")` means tarball-vs-dir classification is
             // skipped; we default to Directory and rely on the
@@ -137,29 +322,28 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 }
                 other => other,
             };
-            let snapshot_key = format!("{name}@{}", local.specifier());
-            // pnpm writes a non-root importer's local `version:` path relative to
-            // that importer, so it must be rebased to root. This covers a literal
-            // `link:`/`file:` spec (`specifier == version`), the `workspace:`
-            // protocol, AND a plain semver range pnpm resolved to a workspace
-            // sibling — that last case carries a NON-`workspace:` specifier (e.g.
-            // `^0.0.18`) but still an importer-relative `version: link:../sibling`
-            // (real-world: dub's `@dub/embed-react` -> `@dub/embed-core`). The
-            // common thread is an importer-relative path, which pnpm always spells
-            // with a leading `..`; aube's own format is already root-relative and
-            // never escapes upward, so this never double-rebases (the
-            // `not_rebased_twice` invariant).
-            let importer_relative = local.path().is_some_and(|p| p.starts_with(".."));
+            let snapshot_key = format!("{name}@{}{peer_suffix}", local.specifier());
+            // pnpm anchors the two local protocols differently: a `link:`
+            // version is relative to its importer, a `file:` version (directory
+            // or tarball) to the lockfile directory (`fromLocal` in pnpm's
+            // local-resolver). So only `link:` is rebased to root, whatever the
+            // specifier was — a literal `link:`, `workspace:`, or a plain semver
+            // range pnpm resolved to a workspace sibling (dub's
+            // `@dub/embed-react` -> `@dub/embed-core: ^0.0.18`). Nub's writer
+            // uses the same anchoring.
             let should_rebase = importer_path != "."
-                && (info.specifier == classify_version
-                    || info.specifier.starts_with("workspace:")
-                    || importer_relative);
+                && match &local {
+                    LocalSource::Link(version_path) => {
+                        !is_root_relative_link(&info.specifier, version_path, importer_path)
+                    }
+                    _ => false,
+                };
             let local = if should_rebase {
                 rebase_importer_local(local, importer_path)
             } else {
                 local
             };
-            let dep_path = local.dep_path(name);
+            let dep_path = format!("{}{peer_suffix}", local.dep_path(name));
             deps.push(DirectDep {
                 name: name.to_string(),
                 dep_path: dep_path.clone(),
@@ -432,6 +616,38 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             {
                 local_pkg.version = ver.clone();
             }
+            // The main package loop below skips these entries, so the
+            // metadata the writer persisted for them is restored here or
+            // nowhere. Platform arrays decide whether a direct URL optional
+            // survives `filter_graph` on this host; peers decide what the
+            // linker places beside it.
+            if let Some(pkg_info) = pkg_info {
+                local_pkg.os = pkg_info.os.iter().cloned().collect();
+                local_pkg.cpu = pkg_info.cpu.iter().cloned().collect();
+                local_pkg.libc = pkg_info.libc.iter().cloned().collect();
+                local_pkg.engines = pkg_info.engines.clone();
+                local_pkg.peer_dependencies =
+                    pkg_info.peer_dependencies.clone().unwrap_or_default();
+                local_pkg.peer_dependencies_meta = pkg_info
+                    .peer_dependencies_meta
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            PeerDepMeta {
+                                optional: v.optional,
+                            },
+                        )
+                    })
+                    .collect();
+            }
+            if let Some(snap) = snap
+                && let Some(bundled) = snap.bundled_dependencies.clone()
+            {
+                local_pkg.bundled_dependencies = bundled;
+            }
             if let Some(pkg_info) = pkg_info
                 && let Some(ref res) = pkg_info.resolution
                 && let Some(mut ls) = local_source_from_resolution(res)
@@ -470,7 +686,11 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let mut rekeyed: BTreeMap<String, LockedPackage> = BTreeMap::new();
     let mut local_rekeys: BTreeMap<String, String> = BTreeMap::new();
     for (old_key, mut pkg) in local_packages {
-        let new_key = pkg.local_source.as_ref().unwrap().dep_path(&pkg.name);
+        let peer_suffix = old_key.find('(').map_or("", |i| &old_key[i..]);
+        let new_key = format!(
+            "{}{peer_suffix}",
+            pkg.local_source.as_ref().unwrap().dep_path(&pkg.name)
+        );
         pkg.dep_path = new_key.clone();
         if old_key != new_key {
             local_rekeys.insert(old_key, new_key.clone());
@@ -491,6 +711,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // snapshot keys we already absorbed above.
     let mut local_canonical_keys: std::collections::HashSet<String> = local_packages
         .values()
+        .filter(|p| !p.dep_path.contains('('))
         .filter_map(|p| {
             p.local_source
                 .as_ref()
@@ -511,6 +732,13 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         }
         let (name, version) = parse_dep_path(&dep_path)
             .ok_or_else(|| Error::parse(path, format!("invalid dep path: {dep_path}")))?;
+        if let Some(registry_name) = registry_name_from_qualified_version(&version) {
+            return Err(Error::UnsupportedNamedRegistry {
+                path: path.to_path_buf(),
+                dep_path,
+                registry_name: registry_name.to_string(),
+            });
+        }
         // Runtime pin entries (`node@runtime:24.4.1`) are not packages
         // — they're absorbed into `graph.runtimes` below. Skipping them
         // here keeps them out of the package table so the fetch/link
@@ -518,16 +746,6 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         if version.starts_with("runtime:") {
             continue;
         }
-        // URL-based direct deps are absorbed into `local_packages`
-        // under the peer-stripped URL form (see `push_direct`), but the
-        // snapshot key still carries any `(peer@ver)` suffix pnpm
-        // appended. Check the peer-stripped canonical too so we don't
-        // create a duplicate entry that round-trips as a stray
-        // `packages:` block.
-        if local_canonical_keys.contains(&format!("{name}@{version}")) {
-            continue;
-        }
-
         // Look up the canonical package entry by stripping any peer suffix.
         let canonical_key = version_to_dep_path(&name, &version);
         let pkg_info = raw
@@ -620,10 +838,19 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         // pnpm records a registry `deprecated:` reason on package
         // entries; stash it on the generic meta map so the writer can
         // re-emit it (matching how bun round-trips the same field).
-        let extra_meta = pkg_info
+        let mut extra_meta = pkg_info
             .and_then(|p| p.deprecated.clone())
             .map(|msg| BTreeMap::from([("deprecated".to_string(), serde_json::Value::String(msg))]))
             .unwrap_or_default();
+        if tarball_url
+            .as_deref()
+            .is_some_and(tarball_url_needs_preserve)
+        {
+            extra_meta.insert(
+                crate::EXTRA_PRESERVE_TARBALL_URL.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
         // pnpm's lockfile only stores `hasBin: true/false` (no paths);
         // reconstruct an opaque single-entry map on parse so
         // `!bin.is_empty()` stays equivalent to `hasBin`, then let
@@ -667,7 +894,8 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             Some(LocalSource::RemoteTarball(_)) if !version_is_http_url => None,
             other => other,
         };
-        if integrity.is_none()
+        if options.strict_store_integrity
+            && integrity.is_none()
             && resolution_requires_integrity(
                 pkg_info.and_then(|p| p.resolution.as_ref()),
                 &local_source,
@@ -701,6 +929,11 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 transitive_peer_dependencies,
                 tarball_url,
                 registry_git_hosted,
+                // Write-time-only signal, re-derived by the resolver's finalize
+                // pass; a parsed package keeps `false` and the persisted
+                // `tarball_url` above already carries the URL a frozen install
+                // fetches from.
+                force_tarball_url: false,
                 alias_of,
                 yarn_checksum: None,
                 engines,
@@ -711,6 +944,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 // when re-emitting a pnpm-sourced graph into one of
                 // their formats.
                 declared_dependencies: BTreeMap::new(),
+                declared_dependencies_known: false,
                 // pnpm's format doesn't carry per-package license or
                 // funding metadata, so a pnpm → npm conversion
                 // degrades to empty rather than re-fetching each
@@ -738,12 +972,17 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // to the final hashed key the package is stored under. Needed
     // by the alias synthesis below: aliases whose target is a
     // `file:` package reference it by the canonical spelling, but
-    // `local_packages` is keyed by `LocalSource::dep_path` hashes.
+    // `local_packages` is keyed by `LocalSource::dep_path` hashes. Values carry no
+    // peer suffix: that comes from whichever edge or alias refers to the package.
+    let peerless = |key: &str| key.split('(').next().unwrap_or(key).to_string();
     let local_by_canonical: BTreeMap<String, String> = {
         let mut m = BTreeMap::new();
-        for (final_key, pkg) in &local_packages {
+        for pkg in local_packages.values() {
             if let Some(l) = &pkg.local_source {
-                m.insert(format!("{}@{}", pkg.name, l.specifier()), final_key.clone());
+                m.insert(
+                    format!("{}@{}", pkg.name, l.specifier()),
+                    l.dep_path(&pkg.name),
+                );
             }
         }
         // The snapshot keys recorded at importer-parse time cover
@@ -752,8 +991,8 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         // `local_source`.
         for (dep_path, snapshot_key) in &local_snapshot_keys {
             let final_key = local_rekeys.get(dep_path).unwrap_or(dep_path);
-            m.entry(snapshot_key.clone())
-                .or_insert_with(|| final_key.clone());
+            m.entry(peerless(snapshot_key))
+                .or_insert_with(|| peerless(final_key));
         }
         m
     };
@@ -782,6 +1021,10 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // as a filesystem name) and every reference to the raw alias
     // spelling is remapped afterwards.
     let mut alias_local_renames: BTreeMap<String, String> = BTreeMap::new();
+    // Canonical keys the loop below cloned an alias out of. Collected so the
+    // orphan sweep after it can drop the ones nothing else references — see
+    // the sweep for why.
+    let mut alias_clone_sources: BTreeSet<String> = BTreeSet::new();
     for (alias_dep_path, real_dep_path, alias_name, real_name) in alias_remaps {
         // Skip if the alias entry already exists (aube-written
         // lockfile that emitted both `aliasOf:` and an alias-keyed
@@ -792,16 +1035,18 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         {
             continue;
         }
-        let bare_real = real_dep_path
-            .split('(')
-            .next()
-            .unwrap_or(&real_dep_path)
-            .to_string();
-        if let Some(local_key) = local_by_canonical.get(&bare_real)
-            && let Some(real_pkg) = packages.get(local_key)
+        let bare_real = peerless(&real_dep_path);
+        let real_peers = &real_dep_path[bare_real.len()..];
+        let local_target = local_by_canonical.get(&bare_real).and_then(|key| {
+            packages
+                .get(&format!("{key}{real_peers}"))
+                .map(|pkg| (pkg, real_peers))
+                .or_else(|| packages.get(key).map(|pkg| (pkg, "")))
+        });
+        if let Some((real_pkg, peer_suffix)) = local_target
             && let Some(local) = real_pkg.local_source.clone()
         {
-            let final_alias_key = local.dep_path(&alias_name);
+            let final_alias_key = format!("{}{peer_suffix}", local.dep_path(&alias_name));
             let mut aliased = real_pkg.clone();
             aliased.name = alias_name;
             aliased.dep_path = final_alias_key.clone();
@@ -821,6 +1066,18 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 ),
             ));
         };
+        // Record the key actually cloned from — `peerless_alias_target`
+        // may resolve to a peerless variant rather than `real_dep_path`.
+        // A `file:`-keyed target reaches this branch too (pnpm writes
+        // `version: <real>@file:<path>` for a local dep consumed under
+        // another name, and the local-rename branch above only fires when
+        // that package is ALSO a local direct dep), so gate on
+        // `local_source` here rather than assuming the branch above caught
+        // every local: the writer keys locals by `pkg.name`, so a swept
+        // local canonical is not regenerable from the clone.
+        if real_pkg.local_source.is_none() {
+            alias_clone_sources.insert(real_pkg.dep_path.clone());
+        }
         let mut aliased = real_pkg.clone();
         aliased.name = alias_name;
         aliased.dep_path = alias_dep_path.clone();
@@ -850,6 +1107,140 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 }
             }
         }
+    }
+
+    // Same for an importer-declared local package that another package also
+    // depends on (root -> `file:./a`, `file:./b`; `a` -> `file:../b`). The
+    // snapshot edge keeps the lockfile spelling `file:./b`, but the package was
+    // re-keyed to the hashed `b@file+<hash>`, so no graph key carries that
+    // spelling and every `resolve_dep_edge` walker dropped the edge: the linker
+    // wrote a dangling sibling symlink, and optional marking treated a
+    // required package as optional-only. A fresh resolve stores the hashed
+    // tail, and the writer renders it back to `file:`, so this matches both.
+    // Git and remote-tarball edges keep their values: they already resolve
+    // through `shared_local_dep_path`.
+    let file_source_key = |pkg: &LockedPackage| match &pkg.local_source {
+        Some(local @ (LocalSource::Directory(_) | LocalSource::Tarball(_))) => {
+            Some(local.dep_path(&pkg.name))
+        }
+        _ => None,
+    };
+    let file_sources: BTreeSet<String> = packages.values().filter_map(file_source_key).collect();
+    let mut file_local_keys: BTreeMap<String, String> = local_by_canonical
+        .iter()
+        .filter(|(_, key)| file_sources.contains(*key))
+        .map(|(canonical, key)| (canonical.clone(), key.clone()))
+        .collect();
+    // A local package only other packages depend on, or an alias of one, reaches
+    // here under its lockfile key (`b@file:./b`). A fresh resolve hashes that key
+    // too, and the package's parents hash theirs from it, so without this a
+    // project re-keys on every re-resolve: `dedupe --check` fails forever, and
+    // the shared store holds a second copy of each parent.
+    let transitive_local_keys: Vec<String> = packages
+        .iter()
+        .filter(|(key, pkg)| file_source_key(pkg).is_some_and(|source| peerless(key) != source))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in transitive_local_keys {
+        let Some(mut pkg) = packages.remove(&key) else {
+            continue;
+        };
+        let Some(source_key) = file_source_key(&pkg) else {
+            continue;
+        };
+        let final_key = format!("{source_key}{}", &key[peerless(&key).len()..]);
+        pkg.dep_path = final_key.clone();
+        for dep in importers.values_mut().flatten() {
+            if dep.dep_path == key {
+                dep.dep_path.clone_from(&final_key);
+            }
+        }
+        file_local_keys.insert(peerless(&key), source_key);
+        packages.entry(final_key).or_insert(pkg);
+    }
+    // pnpm keeps a `link:` target out of `packages:`, so the edge is its only
+    // record. It is relative to the lockfile directory on every parent, a directory
+    // parent's own dependency included: pnpm 10 and 12 link it from there. Build the
+    // package a fresh resolve stores, or the edge reaches nothing.
+    let mut link_targets: BTreeMap<String, LockedPackage> = BTreeMap::new();
+    for pkg in packages.values_mut() {
+        for map in [&mut pkg.dependencies, &mut pkg.optional_dependencies] {
+            for (dep_name, value) in map.iter_mut() {
+                let bare = value.split('(').next().unwrap_or(value);
+                if let Some(key) = file_local_keys.get(&format!("{dep_name}@{bare}")) {
+                    *value = format!("{}{}", dep_path_tail(key, dep_name), &value[bare.len()..]);
+                } else if let Some(target) = bare.strip_prefix("link:") {
+                    let local = LocalSource::Link(normalize_lexical(Path::new(target)));
+                    let key = local.dep_path(dep_name);
+                    *value = dep_path_tail(&key, dep_name).to_string();
+                    link_targets
+                        .entry(key.clone())
+                        .or_insert_with(|| LockedPackage {
+                            name: dep_name.clone(),
+                            version: "0.0.0".to_string(),
+                            dep_path: key,
+                            local_source: Some(local),
+                            ..Default::default()
+                        });
+                }
+            }
+        }
+    }
+    for (key, pkg) in link_targets {
+        packages.entry(key).or_insert(pkg);
+    }
+
+    // Drop each alias-clone source that nothing else in the graph reaches.
+    //
+    // pnpm v9 writes only the canonical (real-name-keyed) entry for an
+    // `npm:` alias, so the loop above clones it under the alias key. That
+    // left BOTH in the graph, while a fresh resolve produces only the
+    // alias-keyed one — an asymmetry every consumer that walks `packages`
+    // raw then disagreed on (#578: dedupe reported a phantom removal on
+    // every run and `--check` failed forever; `fetch` over-counted and
+    // re-imported the tarball; `rebuild <real-name>` matched a package
+    // that is not an installed dependency). `install`/linker were immune
+    // only because they run `filter_graph`'s reachability GC first.
+    //
+    // Dropping is safe for serialization: the pnpm writer regenerates the
+    // canonical `packages:`/`snapshots:` key from the alias clone via
+    // `alias_of`. It is NOT safe unconditionally — an aliased package is
+    // frequently also a genuine dep of something else (`@isaacs/cliui`
+    // reaches `string-width@4.2.3` both through its `string-width-cjs`
+    // alias and through `wrap-ansi@7.0.0`'s own edge), so the entry only
+    // goes when no importer and no surviving package edge resolves to it.
+    // Edges resolve through `resolve_dep_edge` — the same convention
+    // `filter_graph` uses — so a git/remote-tarball child keyed
+    // `name@url+<hash>` is not mistaken for unreferenced. Both dep maps
+    // are scanned even though the parse loop already folds
+    // `optional_dependencies` into `dependencies`: a missed edge would
+    // drop a live entry, so the scan errs toward keeping.
+    //
+    // Local (`file:`) targets never enter `alias_clone_sources` (see the
+    // `local_source` gate at the insert), so their canonical entry always
+    // survives — the writer keys locals by `pkg.name`, not `alias_of`, and
+    // could not regenerate one from the clone.
+    if !alias_clone_sources.is_empty() {
+        let mut referenced: BTreeSet<String> = BTreeSet::new();
+        for deps in importers.values() {
+            for dep in deps {
+                referenced.insert(dep.dep_path.clone());
+            }
+        }
+        for pkg in packages.values() {
+            for map in [&pkg.dependencies, &pkg.optional_dependencies] {
+                for (dep_name, value) in map {
+                    if let Some(child) =
+                        crate::resolve_dep_edge(dep_name, value, |k| packages.contains_key(k))
+                    {
+                        referenced.insert(child);
+                    }
+                }
+            }
+        }
+        packages.retain(|key, pkg| {
+            pkg.alias_of.is_some() || !alias_clone_sources.contains(key) || referenced.contains(key)
+        });
     }
 
     // Normalize git / remote-tarball references so a lockfile round-trip
@@ -891,6 +1282,17 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         let new_key = format!("{}{suffix}", local.dep_path(&pkg.name));
         (new_key != key).then_some(new_key)
     };
+    // An edge with peers lands on that set's entry, which `shared_local_dep_path`
+    // cannot name: it re-derives the bare key. The hashed tail reaches it the way a
+    // fresh resolve's edge does. An edge with no peers keeps its URL.
+    let with_peers_to_hashed = |(name, value): (String, String)| {
+        let value = rewrite_peer_suffix(&value, &spec_peer_to_hashed);
+        let hashed = value.find('(').and_then(|peers| {
+            let key = crate::shared_local_dep_path(&name, &value)?;
+            Some(format!("{}{}", dep_path_tail(&key, &name), &value[peers..]))
+        });
+        (name, hashed.unwrap_or(value))
+    };
     let has_local_source = packages.values().any(|p| {
         matches!(
             p.local_source,
@@ -907,12 +1309,12 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 pkg.dependencies = pkg
                     .dependencies
                     .into_iter()
-                    .map(|(n, v)| (n, rewrite_peer_suffix(&v, &spec_peer_to_hashed)))
+                    .map(with_peers_to_hashed)
                     .collect();
                 pkg.optional_dependencies = pkg
                     .optional_dependencies
                     .into_iter()
-                    .map(|(n, v)| (n, rewrite_peer_suffix(&v, &spec_peer_to_hashed)))
+                    .map(with_peers_to_hashed)
                     .collect();
                 (new_key, pkg)
             })
@@ -922,6 +1324,50 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             for dep in deps {
                 dep.dep_path = rewrite_peer_suffix(&dep.dep_path, &spec_peer_to_hashed);
             }
+        }
+    }
+
+    // Link a peer the key claims but the snapshot never recorded. Earlier
+    // nub releases could write a package keyed with a peer it declares
+    // while leaving that peer out of the snapshot's `dependencies`
+    // (#937), and a lockfile read takes the snapshot as the whole truth,
+    // so the package stayed unable to import its peer on every later
+    // install. A peer named in a key is a peer resolved for that package
+    // (pnpm records each one as a snapshot edge), so the edge is
+    // recoverable from the key; for any lockfile pnpm wrote this is a
+    // no-op. Adding the edge also changes the package's virtual-store
+    // hash, so a broken global-store entry is not reused.
+    let mut missing_peer_edges: Vec<(String, String, String)> = Vec::new();
+    for (key, pkg) in &packages {
+        if pkg.peer_dependencies.is_empty() {
+            continue;
+        }
+        for peer_key in super::dep_path::peer_references(key) {
+            let Some((name, _)) = parse_dep_path(peer_key) else {
+                continue;
+            };
+            if pkg.peer_dependencies.contains_key(&name)
+                && !pkg.dependencies.contains_key(&name)
+                && packages.contains_key(peer_key)
+            {
+                let tail = dep_path_tail(peer_key, &name).to_string();
+                missing_peer_edges.push((key.clone(), name, tail));
+            }
+        }
+    }
+    for (key, name, tail) in missing_peer_edges {
+        if let Some(pkg) = packages.get_mut(&key) {
+            // An optional peer is an optional edge (pnpm's snapshot
+            // `optionalDependencies`), so platform filtering can still
+            // drop a provider that only an optional dependency brought in.
+            if pkg
+                .peer_dependencies_meta
+                .get(&name)
+                .is_some_and(|m| m.optional)
+            {
+                pkg.optional_dependencies.insert(name.clone(), tail.clone());
+            }
+            pkg.dependencies.insert(name, tail);
         }
     }
 
@@ -968,12 +1414,21 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // The path map stays empty for pnpm regardless of which on-disk
     // form we read — pnpm itself discards the legacy object's `path` on
     // migration (`migratePatchedDependencies` keeps only `.hash`), and
-    // the install path derives the patch path from the manifest.
-    let patched_dependencies: BTreeMap<String, String> = BTreeMap::new();
+    // the install path derives the patch path from the manifest. The
+    // one exception is a hash-less entry, where the path is all there
+    // is and dropping it would silently lose the declaration.
+    let mut patched_dependencies: BTreeMap<String, String> = BTreeMap::new();
     let mut patched_dependency_hashes: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in raw.patched_dependencies.unwrap_or_default() {
-        let (_path, hash) = v.into_path_and_hash();
-        patched_dependency_hashes.insert(k, hash);
+        match v.into_path_and_hash() {
+            (_, Some(hash)) => {
+                patched_dependency_hashes.insert(k, hash);
+            }
+            (Some(path), None) => {
+                patched_dependencies.insert(k, path);
+            }
+            (None, None) => {}
+        }
     }
 
     // Lift the synthetic runtime importer deps recorded above into
@@ -1030,6 +1485,13 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         extra_fields: BTreeMap::new(),
         workspace_extra_fields: BTreeMap::new(),
     })
+}
+
+fn tarball_url_needs_preserve(url: &str) -> bool {
+    let Some((host, _)) = super::http_url_host_and_path(url) else {
+        return false;
+    };
+    !matches!(host.as_str(), "registry.npmjs.org" | "registry.yarnpkg.com")
 }
 
 /// Convert a raw `variations` variant into the typed graph shape.

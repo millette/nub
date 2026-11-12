@@ -1,20 +1,34 @@
-use super::super::{packument_cache_dir, packument_full_cache_dir};
 use super::version_from_dep_path;
 use miette::{Context, IntoDiagnostic, miette};
 use std::collections::BTreeMap;
 
+/// Curated manifest repairs shipped by Yarn and pnpm for standalone aube.
+///
+/// Keep these out of `packageExtensionsChecksum`: updates to bundled
+/// compatibility data must not invalidate an existing project lockfile.
+// Integer offsets keep the generated tables free of per-entry pointer
+// relocations, which otherwise add measurable work to every CLI startup.
+type BundledStringRef = (u32, u32);
+type BundledTableRef = (u32, u32);
+
+struct BundledPackageExtension {
+    selector: BundledStringRef,
+    dependencies: BundledTableRef,
+    optional_dependencies: BundledTableRef,
+    peer_dependencies: BundledTableRef,
+    peer_dependencies_meta: BundledTableRef,
+}
+
+include!(concat!(env!("OUT_DIR"), "/bundled_package_extensions.rs"));
+
 /// Accept pnpm's documented aliases (`highest`, `time-based`, `time`,
-/// `lowest-direct`) and map them to our enum. Unknown values fall back
-/// to `None` so the caller's `.npmrc` / default path still runs.
+/// `lowest-direct`). Unknown values fall back to `None` so the caller's
+/// `.npmrc` / default path still runs.
 fn parse_resolution_mode(s: &str) -> Option<aube_resolver::ResolutionMode> {
     match s.trim().to_ascii_lowercase().as_str() {
         "highest" => Some(aube_resolver::ResolutionMode::Highest),
-        // pnpm treats `lowest-direct` and `time-based` as distinct
-        // modes; aube folds them into `TimeBased` and skips the cutoff
-        // filter when there's no publish time to compare against, so
-        // `lowest-direct` behavior emerges naturally from `TimeBased`
-        // with `time:` absent. Close enough for the first pass.
-        "time-based" | "time" | "lowest-direct" => Some(aube_resolver::ResolutionMode::TimeBased),
+        "time-based" | "time" => Some(aube_resolver::ResolutionMode::TimeBased),
+        "lowest-direct" => Some(aube_resolver::ResolutionMode::LowestDirect),
         _ => None,
     }
 }
@@ -54,19 +68,17 @@ pub(crate) fn resolve_resolution_mode(
 }
 
 /// Translate the settings-side `ResolutionMode` enum into the
-/// resolver's runtime enum. pnpm treats `lowest-direct` and
-/// `time-based` as distinct modes, but aube folds them into
-/// `TimeBased` and lets the `time:` cutoff filter handle the
-/// difference — when publish times are missing the `lowest-direct`
-/// behavior emerges naturally. Close enough for the first pass.
+/// resolver's runtime enum.
 fn map_resolution_mode(
     m: aube_settings::resolved::ResolutionMode,
 ) -> aube_resolver::ResolutionMode {
     match m {
         aube_settings::resolved::ResolutionMode::Highest => aube_resolver::ResolutionMode::Highest,
-        aube_settings::resolved::ResolutionMode::TimeBased
-        | aube_settings::resolved::ResolutionMode::LowestDirect => {
+        aube_settings::resolved::ResolutionMode::TimeBased => {
             aube_resolver::ResolutionMode::TimeBased
+        }
+        aube_settings::resolved::ResolutionMode::LowestDirect => {
+            aube_resolver::ResolutionMode::LowestDirect
         }
     }
 }
@@ -76,7 +88,7 @@ fn map_resolution_mode(
 /// build-time-generated typed accessors in `aube_settings::resolved`
 /// — `.npmrc` first, then `pnpm-workspace.yaml`. CLI override
 /// (currently always `None`, no flag yet) wins over both.
-fn resolve_minimum_release_age(
+pub(crate) fn resolve_minimum_release_age(
     ctx: &aube_settings::ResolveCtx<'_>,
     cli_minutes: Option<u64>,
 ) -> Option<aube_resolver::MinimumReleaseAge> {
@@ -84,19 +96,15 @@ fn resolve_minimum_release_age(
     if minutes == 0 {
         return None;
     }
-    // Parse `minimumReleaseAgeExclude` with the same grammar as
-    // `trustPolicyExclude` so a version-pinned or `||`-union entry
-    // (`axios@0.18.1 || 0.21.1`) actually exempts those versions, not
-    // just name-only entries. parse_lossy keeps every well-formed rule
-    // and reports malformed ones individually — a strict batch parse
-    // would turn one typo into a silently-empty exclude list, a security
-    // regression. Name-only entries behave exactly as before.
-    let (exclude, exclude_parse_errors) = aube_resolver::TrustExcludeRules::parse_lossy(
+    // Parse pattern-by-pattern (bare names, `*` name globs, exact-version
+    // unions) so one malformed entry doesn't silently drop the rest and
+    // weaken the gate. Same engine pnpm uses for both exclude settings.
+    let (exclude, parse_errors) = aube_resolver::PackageVersionPolicy::parse_lossy(
         aube_settings::resolved::minimum_release_age_exclude(ctx).unwrap_or_default(),
     );
-    for err in exclude_parse_errors {
+    for err in parse_errors {
         tracing::warn!(
-            code = aube_codes::warnings::WARN_AUBE_INVALID_TRUST_POLICY,
+            code = aube_codes::warnings::WARN_AUBE_INVALID_MINIMUM_RELEASE_AGE_EXCLUDE,
             error = %err,
             "ignoring malformed minimumReleaseAgeExclude entry"
         );
@@ -144,20 +152,50 @@ pub(super) fn resolve_exclude_links_from_lockfile(ctx: &aube_settings::ResolveCt
 /// a library that declares `next` as a peer isn't itself a Next.js
 /// app.
 pub(super) fn find_gvs_incompatible_trigger<'a>(
-    manifests: &[(String, aube_manifest::PackageJson)],
-    triggers: &'a [String],
+    manifests: &'a [(String, aube_manifest::PackageJson)],
+    triggers: &[String],
 ) -> Option<&'a str> {
     for (_, m) in manifests {
-        for name in triggers {
-            if m.dependencies.contains_key(name)
-                || m.dev_dependencies.contains_key(name)
-                || m.optional_dependencies.contains_key(name)
+        for pattern in triggers {
+            if let Some(name) = m
+                .dependencies
+                .keys()
+                .chain(m.dev_dependencies.keys())
+                .chain(m.optional_dependencies.keys())
+                .find(|name| aube_linker::package_name_matches(pattern, name))
             {
                 return Some(name.as_str());
             }
         }
     }
     None
+}
+
+#[cfg(test)]
+mod gvs_trigger_pattern_tests {
+    use super::find_gvs_incompatible_trigger;
+
+    #[test]
+    fn wildcard_and_literal_triggers_match_declared_packages() {
+        let mut manifest = aube_manifest::PackageJson::default();
+        manifest
+            .dependencies
+            .insert("is-number".to_string(), "7.0.0".to_string());
+        let manifests = vec![(".".to_string(), manifest)];
+
+        assert_eq!(
+            find_gvs_incompatible_trigger(&manifests, &["is-*".to_string()]),
+            Some("is-number")
+        );
+        assert_eq!(
+            find_gvs_incompatible_trigger(&manifests, &["is-number".to_string()]),
+            Some("is-number")
+        );
+        assert_eq!(
+            find_gvs_incompatible_trigger(&manifests, &["left-*".to_string()]),
+            None
+        );
+    }
 }
 
 /// Classify the existing `.aube/` tree as built with the global virtual
@@ -174,14 +212,21 @@ pub(super) fn find_gvs_incompatible_trigger<'a>(
 /// symlinks. Callers use this to detect the transition and wipe
 /// `node_modules/` before the linker runs.
 ///
-/// Assumes a consistent `.aube/` tree (every entry the same type),
-/// which is what a successful install produces. A crash mid-link
-/// during a transition could leave a mixed tree; we classify from the
-/// first entry `read_dir` yields and let the next install self-heal
-/// — worst case is one extra wipe, which is identical to the cost of
-/// the transition we're already handling.
+/// Symlink-PRIORITY classification: any single symlink entry means the tree
+/// is in global-virtual-store mode. GVS-on trees are NOT necessarily uniform
+/// — `diskMaterializePackages` and the project-local legacy-Vite copies make
+/// a handful of entries real dirs while the rest stay shared-store symlinks, a
+/// legitimately MIXED tree — so classifying from the first `read_dir` entry
+/// would be order-dependent (a forced real dir landing first would misread the
+/// whole tree as per-project and trigger a spurious wipe on every install).
+/// Per-project mode is the only mode with NO symlink entries, so `false` is
+/// returned only after the full scan finds real dirs and zero symlinks. For a
+/// consistent tree (every entry the same type — standalone aube's default) the
+/// result is identical to the first-entry classification; only the mixed tree
+/// differs.
 pub(super) fn detect_aube_dir_gvs_mode(aube_dir: &std::path::Path) -> Option<bool> {
     let entries = std::fs::read_dir(aube_dir).ok()?;
+    let mut saw_real_dir = false;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -192,26 +237,61 @@ pub(super) fn detect_aube_dir_gvs_mode(aube_dir: &std::path::Path) -> Option<boo
         if name_str == "node_modules" || name_str.starts_with('.') {
             continue;
         }
-        // Classify via `read_link`, not `file_type().is_symlink()`.
-        // On Windows, `sys::create_dir_link` produces an NTFS junction
-        // whose `is_symlink()` is `false` and `is_dir()` is `true`,
-        // making a gvs-on entry indistinguishable from a per-project
-        // real directory via the file-type bit. `read_link` succeeds on
-        // both Unix symlinks and Windows junction reparse points, and
-        // returns `Err(InvalidInput)` on a regular directory — exactly
-        // the signal we need. Non-link IO errors just skip the entry
-        // and move on to the next candidate.
-        match std::fs::read_link(entry.path()) {
-            Ok(_) => return Some(true),
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => return Some(false),
-            Err(_) => continue,
+        // `read_link` is the positive test for a link: it succeeds on
+        // both a Unix symlink and a Windows junction reparse point,
+        // which is what `sys::create_dir_link` writes on each platform.
+        // The negative half is NOT its inverse — a failed `read_link`
+        // reports a DIFFERENT error kind per platform, and reading a
+        // plain directory off that kind is why this function could never
+        // return `Some(false)` on Windows (nub#566; see
+        // `aube_util::fs::is_real_dir`). With the mode change therefore
+        // invisible there, the mode-change reset never wiped a
+        // per-project tree and the gvs link pass that followed collided
+        // with the surviving directories (`ERROR_ALREADY_EXISTS`).
+        // Anything that is neither a link nor a real directory is
+        // skipped.
+        let path = entry.path();
+        if std::fs::read_link(&path).is_ok() {
+            return Some(true);
+        }
+        if aube_util::fs::is_real_dir(&path) {
+            saw_real_dir = true;
         }
     }
-    None
+    saw_real_dir.then_some(false)
 }
 
-/// Honor `cleanupUnusedCatalogs` by pruning declared-but-unreferenced
-/// catalog entries from the workspace yaml. No-op when the setting is
+#[cfg(test)]
+mod gvs_mode_tests {
+    use super::detect_aube_dir_gvs_mode;
+
+    #[test]
+    fn mixed_project_local_and_linked_entries_still_classify_as_gvs() {
+        let tmp = tempfile::tempdir().expect("tempdir should be created");
+        let aube_dir = tmp.path().join(".aube");
+        let global = tmp.path().join("global/foo");
+        std::fs::create_dir_all(aube_dir.join("vite@7.3.6"))
+            .expect("project-local entry should be created");
+        std::fs::create_dir_all(&global).expect("global entry should be created");
+        aube_linker::sys::create_dir_link(&global, &aube_dir.join("foo@1.0.0"))
+            .expect("global-store link should be created");
+
+        assert_eq!(detect_aube_dir_gvs_mode(&aube_dir), Some(true));
+
+        std::fs::remove_dir(aube_dir.join("foo@1.0.0"))
+            .or_else(|_| std::fs::remove_file(aube_dir.join("foo@1.0.0")))
+            .expect("global-store link should be removed");
+        assert_eq!(detect_aube_dir_gvs_mode(&aube_dir), Some(false));
+    }
+}
+
+pub(crate) fn resolve_catalog_prune(ctx: &aube_settings::ResolveCtx<'_>) -> bool {
+    aube_settings::resolved::catalog_prune(ctx)
+        .unwrap_or_else(|| aube_settings::resolved::cleanup_unused_catalogs(ctx))
+}
+
+/// Honor `catalogPrune` (or its deprecated `cleanupUnusedCatalogs` alias) by
+/// pruning declared-but-unreferenced catalog entries from the workspace yaml. No-op when the setting is
 /// off, when there is no workspace yaml file on disk, or when every
 /// declared entry was referenced by an importer.
 pub(super) fn maybe_cleanup_unused_catalogs(
@@ -223,7 +303,7 @@ pub(super) fn maybe_cleanup_unused_catalogs(
         std::collections::BTreeMap<String, aube_lockfile::CatalogEntry>,
     >,
 ) -> miette::Result<()> {
-    if !aube_settings::resolved::cleanup_unused_catalogs(ctx) {
+    if !resolve_catalog_prune(ctx) {
         return Ok(());
     }
     if declared.is_empty() {
@@ -239,7 +319,7 @@ pub(super) fn maybe_cleanup_unused_catalogs(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| ws_path.display().to_string());
         tracing::info!(
-            "cleanupUnusedCatalogs: pruned {} from {filename}",
+            "catalogPrune: pruned {} from {filename}",
             pluralizer::pluralize("entry", dropped.len() as isize, true)
         );
     }
@@ -421,11 +501,45 @@ pub(crate) fn resolve_force_metadata_primer(ctx: &aube_settings::ResolveCtx<'_>)
 pub(crate) fn resolve_dependency_policy(
     manifest: &aube_manifest::PackageJson,
     ctx: &aube_settings::ResolveCtx<'_>,
-) -> aube_resolver::DependencyPolicy {
+) -> miette::Result<aube_resolver::DependencyPolicy> {
     let mut policy = aube_resolver::DependencyPolicy::default();
 
+    validate_package_extension_containers(manifest, ctx)?;
     let package_extensions = effective_package_extensions(manifest, ctx);
-    policy.package_extensions = parse_package_extensions(package_extensions);
+    // User/project extensions first, then standalone and embedder-supplied
+    // bundled ecosystem defaults appended LAST. `apply_package_extensions`
+    // iterates this Vec in order and `extend_missing` is first-write-wins per
+    // dependency key, so user extensions take precedence over bundled ones.
+    // Bundled data is NEVER routed through `effective_package_extensions`,
+    // which feeds the lockfile
+    // `packageExtensionsChecksum`: routing bundled defaults through the
+    // checksum would drift every existing lockfile on each bundled-list bump
+    // and abort `--frozen-lockfile` under `enforce_package_extensions_checksum`.
+    let mut extensions = parse_package_extensions(package_extensions)?;
+    if !aube_settings::resolved::ignore_compatibility_db(ctx) {
+        // The vendored ecosystem catalogs apply to EVERY embedder, not only
+        // standalone aube. They are pnpm's own bundled data — Yarn's
+        // `packageExtensions` database plus pnpm's three additions — and pnpm
+        // merges it into every install unless `ignoreCompatibilityDb` is set. An
+        // embedder that skipped it resolves a strictly smaller dependency graph
+        // than the tool it mirrors, which is a compatibility difference users
+        // hit as a missing module rather than as a warning: `reactcss@1.2.3`
+        // requires `react` and declares it nowhere, so it installs and runs
+        // under pnpm (the catalog adds the peer, and `auto-install-peers`
+        // supplies it) and fails with `Cannot find module 'react'` without the
+        // catalog.
+        //
+        // Catalog order is significant when semver selectors overlap: the first
+        // matching extension wins per dependency key.
+        extensions.extend(vendored_compat_extensions());
+        if let Some(bundled) = aube_util::engine_context().bundled_package_extensions {
+            // Bundled extensions are embedder-supplied data, not user config.
+            // A malformed entry should warn and be skipped, not abort the install
+            // with an error naming a selector the user never wrote.
+            extensions.extend(parse_bundled_package_extensions(bundled));
+        }
+    }
+    policy.package_extensions = extensions;
 
     let mut allowed_deprecated = manifest.allowed_deprecated_versions();
     merge_string_map_setting(ctx, "allowedDeprecatedVersions", &mut allowed_deprecated);
@@ -458,10 +572,15 @@ pub(crate) fn resolve_dependency_policy(
     }
     policy.trust_policy_exclude =
         aube_resolver::TrustExcludeRules::with_defaults_and_user_rules(user_rules);
-    policy.trust_policy_ignore_after = aube_settings::resolved::trust_policy_ignore_after(ctx);
+    // An explicit user `trustPolicyIgnoreAfter` wins (including `0`, which
+    // re-enables the full check); when unset, fall back to the embedder-fixed
+    // default — `None` for standalone aube (unchanged: check every version), a
+    // finite window for nub (see `Embedder::trust_policy_ignore_after_default`).
+    policy.trust_policy_ignore_after = aube_settings::resolved::trust_policy_ignore_after(ctx)
+        .or(aube_util::embedder().trust_policy_ignore_after_default);
     policy.block_exotic_subdeps = aube_settings::resolved::block_exotic_subdeps(ctx);
 
-    policy
+    Ok(policy)
 }
 
 /// Assemble the effective `packageExtensions` object — the root
@@ -490,6 +609,16 @@ pub(crate) fn effective_package_extensions(
 /// `packageExtensions`. Unioning (rather than overriding) matches how the
 /// manifest and workspace-yaml sources already combine, and keeps the
 /// arch set additive across every config home.
+///
+/// Command-line `--os`/`--cpu`/`--libc`
+/// ([`aube_util::CliSupportedArchitectures`]) are applied LAST and per axis,
+/// REPLACING the unioned config value for each axis named rather than adding
+/// to it. Union is right between config homes, which all answer "what does
+/// this project support"; the flags answer "what should this invocation
+/// fetch", and a union could only ever widen — so `--os=linux` on a project
+/// whose config says `darwin` has to mean linux, not both. Every filter site
+/// routes through this function, so the override lands on the resolver, the
+/// streaming-fetch gate, and `filter_graph` alike.
 pub(crate) fn effective_supported_architectures(
     manifest: &aube_manifest::PackageJson,
     ws_config: &aube_manifest::workspace::WorkspaceConfig,
@@ -514,15 +643,33 @@ pub(crate) fn effective_supported_architectures(
     extend_field(&mut os, "os");
     extend_field(&mut cpu, "cpu");
     extend_field(&mut libc, "libc");
+
+    let cli = aube_util::engine_context().cli_supported_architectures;
+    if let Some(v) = cli.os {
+        os = v;
+    }
+    if let Some(v) = cli.cpu {
+        cpu = v;
+    }
+    if let Some(v) = cli.libc {
+        libc = v;
+    }
     (os, cpu, libc)
 }
 
 /// Stamp pnpm's `packageExtensionsChecksum` / `pnpmfileChecksum` onto
 /// `graph` so a written pnpm-lock.yaml matches what pnpm itself records,
 /// keeping config-drift detection in sync (a wrong/absent value makes
-/// pnpm re-resolve, or abort a frozen install). No-op for non-pnpm
-/// lockfiles: aube-lock.yaml shares the writer and must not grow
-/// pnpm-only fields.
+/// pnpm re-resolve, or abort a frozen install).
+///
+/// `packageExtensionsChecksum` is stamped on `pnpm-lock.yaml` always
+/// (registry byte-parity with pnpm) and on the embedder's own generic
+/// lockfile (the `Aube` kind, pnpm-v9 bytes) when the embedder enforces the
+/// checksum (`enforce_package_extensions_checksum` — nub) — so its own
+/// packageExtensions drift check reaches a fixpoint. Standalone aube leaves
+/// that posture off, so its aube-lock.yaml never grows the field (unchanged).
+/// `pnpmfileChecksum` stays pnpm-lock-only: the generic lockfile never
+/// carried it, and nub identity disables the default pnpmfile anyway.
 ///
 /// `local_pnpmfile` is the project-local pnpmfile that participates in
 /// the checksum — the caller resolves it via `crate::pnpmfile::detect`
@@ -536,12 +683,19 @@ pub(crate) async fn stamp_pnpm_config_checksums(
     ctx: &aube_settings::ResolveCtx<'_>,
     local_pnpmfile: Option<&std::path::Path>,
 ) {
-    if !matches!(write_kind, aube_lockfile::LockfileKind::Pnpm) {
+    let is_pnpm = matches!(write_kind, aube_lockfile::LockfileKind::Pnpm);
+    let stamp_package_extensions = is_pnpm
+        || (matches!(write_kind, aube_lockfile::LockfileKind::Aube)
+            && aube_util::engine_context().enforce_package_extensions_checksum);
+    if !stamp_package_extensions {
         return;
     }
     let package_extensions = effective_package_extensions(manifest, ctx);
     graph.package_extensions_checksum =
         aube_lockfile::pnpm::package_extensions_checksum(&package_extensions);
+    if !is_pnpm {
+        return;
+    }
 
     // Always reflect the *current* pnpmfile state: a missing, hook-less,
     // or unreadable pnpmfile must clear any checksum the graph carried
@@ -617,14 +771,13 @@ pub(crate) async fn finalize_lockfile_graph(
     ignore_pnpmfile: bool,
     cli_pnpmfile: Option<&std::path::Path>,
 ) -> miette::Result<()> {
-    let write_kind = aube_lockfile::detect_existing_lockfile_kind(cwd)
-        .unwrap_or(aube_lockfile::LockfileKind::Aube);
     let files = crate::commands::FileSources::load(cwd);
     let (ws_config, raw_workspace) = aube_manifest::workspace::load_both(cwd)
         .into_diagnostic()
         .wrap_err("failed to load workspace config for lockfile finalization")?;
     let env = aube_settings::values::process_env();
     let ctx = files.ctx(&raw_workspace, env, &[]);
+    let write_kind = crate::commands::lockfile_kind_for_write_with_ctx(cwd, &ctx);
     let local_pnpmfile = if ignore_pnpmfile {
         None
     } else {
@@ -750,6 +903,77 @@ fn parse_json_object(raw: &str) -> Option<BTreeMap<String, serde_json::Value>> {
     Some(obj.into_iter().collect())
 }
 
+fn validate_package_extension_containers(
+    manifest: &aube_manifest::PackageJson,
+    ctx: &aube_settings::ResolveCtx<'_>,
+) -> miette::Result<()> {
+    for value in manifest.package_extension_values() {
+        if !value.is_object() {
+            return Err(invalid_package_extension(
+                "packageExtensions",
+                "setting must be an object",
+            ));
+        }
+    }
+
+    let meta = aube_settings::find("packageExtensions").ok_or_else(|| {
+        invalid_package_extension("packageExtensions", "setting is not registered")
+    })?;
+    for entries in [
+        ctx.user_npmrc,
+        ctx.user_aube_config,
+        ctx.project_npmrc,
+        ctx.project_aube_config,
+    ] {
+        for (key, raw) in entries.iter().rev() {
+            if !meta.npmrc_keys.contains(&key.as_str()) {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
+                invalid_package_extension("packageExtensions", "setting must be valid JSON")
+            })?;
+            if !value.is_object() {
+                return Err(invalid_package_extension(
+                    "packageExtensions",
+                    "setting must be an object",
+                ));
+            }
+            break;
+        }
+    }
+    for key in meta.workspace_yaml_keys {
+        let Some(value) = aube_settings::workspace_yaml_value(ctx.workspace_yaml, key) else {
+            continue;
+        };
+        let value = serde_json::to_value(value).map_err(|_| {
+            invalid_package_extension("packageExtensions", "setting must be an object")
+        })?;
+        if !value.is_object() {
+            return Err(invalid_package_extension(
+                "packageExtensions",
+                "setting must be an object",
+            ));
+        }
+        break;
+    }
+    for (key, raw) in ctx.env.iter().rev() {
+        if !meta.env_vars.contains(&key.as_str()) {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
+            invalid_package_extension("packageExtensions", "setting must be valid JSON")
+        })?;
+        if !value.is_object() {
+            return Err(invalid_package_extension(
+                "packageExtensions",
+                "setting must be an object",
+            ));
+        }
+        break;
+    }
+    Ok(())
+}
+
 fn json_string_map(map: BTreeMap<String, serde_json::Value>) -> BTreeMap<String, String> {
     map.into_iter()
         .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
@@ -757,53 +981,188 @@ fn json_string_map(map: BTreeMap<String, serde_json::Value>) -> BTreeMap<String,
 }
 
 fn parse_package_extensions(
-    raw: BTreeMap<String, serde_json::Value>,
+    raw: impl IntoIterator<Item = (String, serde_json::Value)>,
+) -> miette::Result<Vec<aube_resolver::PackageExtension>> {
+    raw.into_iter()
+        .map(|(selector, value)| parse_package_extension(selector, value))
+        .collect()
+}
+
+fn parse_bundled_package_extensions(
+    raw: impl IntoIterator<Item = (String, serde_json::Value)>,
 ) -> Vec<aube_resolver::PackageExtension> {
     raw.into_iter()
-        .filter_map(|(selector, value)| {
-            let obj = value.as_object()?;
-            Some(aube_resolver::PackageExtension {
-                selector,
-                dependencies: read_json_string_map(obj.get("dependencies")),
-                optional_dependencies: read_json_string_map(obj.get("optionalDependencies")),
-                peer_dependencies: read_json_string_map(obj.get("peerDependencies")),
-                peer_dependencies_meta: read_peer_dependencies_meta(
-                    obj.get("peerDependenciesMeta"),
-                ),
-            })
+        .filter_map(
+            |(selector, value)| match parse_package_extension(selector, value) {
+                Ok(extension) => Some(with_database_peers(extension)),
+                Err(err) => {
+                    tracing::warn!(
+                        code = aube_codes::warnings::WARN_AUBE_INVALID_BUNDLED_PACKAGE_EXTENSION,
+                        error = %err,
+                        "ignoring malformed bundled package extension"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+/// Move an embedder database entry's optional peers to `database_peers`. Its
+/// required peers stay peers: those repair a package the same way the curated
+/// catalogs do, and they install something when nothing else provides them.
+fn with_database_peers(
+    mut extension: aube_resolver::PackageExtension,
+) -> aube_resolver::PackageExtension {
+    let optional: Vec<String> = extension
+        .peer_dependencies_meta
+        .iter()
+        .filter(|(_, meta)| meta.optional)
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in optional {
+        extension.peer_dependencies_meta.remove(&name);
+        let range = extension.peer_dependencies.remove(&name);
+        extension
+            .database_peers
+            .insert(name, range.unwrap_or_else(|| "*".to_string()));
+    }
+    extension
+}
+
+fn vendored_compat_extensions() -> Vec<aube_resolver::PackageExtension> {
+    VENDORED_COMPAT_EXTENSIONS
+        .iter()
+        .map(|extension| aube_resolver::PackageExtension {
+            selector: bundled_string(extension.selector).to_owned(),
+            dependencies: bundled_string_map(extension.dependencies),
+            optional_dependencies: bundled_string_map(extension.optional_dependencies),
+            peer_dependencies: bundled_string_map(extension.peer_dependencies),
+            peer_dependencies_meta: bundled_peer_meta(extension.peer_dependencies_meta),
+            database_peers: BTreeMap::new(),
         })
         .collect()
 }
 
-fn read_json_string_map(value: Option<&serde_json::Value>) -> BTreeMap<String, String> {
-    value
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
+fn bundled_string(reference: BundledStringRef) -> &'static str {
+    let start = reference.0 as usize;
+    &BUNDLED_STRINGS[start..start + reference.1 as usize]
+}
+
+fn bundled_string_map(reference: BundledTableRef) -> BTreeMap<String, String> {
+    let start = reference.0 as usize;
+    let mut map = BTreeMap::new();
+    for &(name, value) in &BUNDLED_STRING_PAIRS[start..start + reference.1 as usize] {
+        map.insert(
+            bundled_string(name).to_owned(),
+            bundled_string(value).to_owned(),
+        );
+    }
+    map
+}
+
+fn bundled_peer_meta(reference: BundledTableRef) -> BTreeMap<String, aube_registry::PeerDepMeta> {
+    let start = reference.0 as usize;
+    let mut map = BTreeMap::new();
+    for &(name, optional) in &BUNDLED_PEER_META[start..start + reference.1 as usize] {
+        map.insert(
+            bundled_string(name).to_owned(),
+            aube_registry::PeerDepMeta { optional },
+        );
+    }
+    map
+}
+
+fn parse_package_extension(
+    selector: String,
+    value: serde_json::Value,
+) -> miette::Result<aube_resolver::PackageExtension> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid_package_extension(&selector, "entry must be an object"))?;
+    let dependencies_path = format!("{selector}.dependencies");
+    let optional_dependencies_path = format!("{selector}.optionalDependencies");
+    let peer_dependencies_path = format!("{selector}.peerDependencies");
+    let peer_dependencies_meta_path = format!("{selector}.peerDependenciesMeta");
+    Ok(aube_resolver::PackageExtension {
+        selector,
+        dependencies: read_json_string_map(obj.get("dependencies"), &dependencies_path)?,
+        optional_dependencies: read_json_string_map(
+            obj.get("optionalDependencies"),
+            &optional_dependencies_path,
+        )?,
+        peer_dependencies: read_json_string_map(
+            obj.get("peerDependencies"),
+            &peer_dependencies_path,
+        )?,
+        peer_dependencies_meta: read_peer_dependencies_meta(
+            obj.get("peerDependenciesMeta"),
+            &peer_dependencies_meta_path,
+        )?,
+        database_peers: BTreeMap::new(),
+    })
+}
+
+fn read_json_string_map(
+    value: Option<&serde_json::Value>,
+    field: &str,
+) -> miette::Result<BTreeMap<String, String>> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid_package_extension(field, "field must be an object"))?;
+    obj.iter()
+        .map(|(name, value)| {
+            let range = value.as_str().ok_or_else(|| {
+                invalid_package_extension(
+                    &format!("{field}.{name}"),
+                    "dependency range must be a string",
+                )
+            })?;
+            Ok((name.clone(), range.to_string()))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn read_peer_dependencies_meta(
     value: Option<&serde_json::Value>,
-) -> BTreeMap<String, aube_registry::PeerDepMeta> {
-    value
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .map(|(name, meta)| {
-                    let optional = meta
-                        .as_object()
-                        .and_then(|m| m.get("optional"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    (name.clone(), aube_registry::PeerDepMeta { optional })
-                })
-                .collect()
+    field: &str,
+) -> miette::Result<BTreeMap<String, aube_registry::PeerDepMeta>> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid_package_extension(field, "field must be an object"))?;
+    obj.iter()
+        .map(|(name, meta)| {
+            let meta = meta.as_object().ok_or_else(|| {
+                invalid_package_extension(
+                    &format!("{field}.{name}"),
+                    "peer metadata must be an object",
+                )
+            })?;
+            let optional = match meta.get("optional") {
+                Some(value) => value.as_bool().ok_or_else(|| {
+                    invalid_package_extension(
+                        &format!("{field}.{name}.optional"),
+                        "optional must be a boolean",
+                    )
+                })?,
+                None => false,
+            };
+            Ok((name.clone(), aube_registry::PeerDepMeta { optional }))
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+fn invalid_package_extension(path: &str, reason: &str) -> miette::Report {
+    miette::miette!(
+        code = aube_codes::errors::ERR_AUBE_INVALID_PACKAGE_EXTENSION,
+        "invalid packageExtensions entry at {path:?}: {reason}"
+    )
 }
 
 /// Apply the install-time resolver configuration that's shared between
@@ -825,6 +1184,11 @@ pub(crate) struct ResolverConfigInputs<'a> {
     pub(crate) workspace_config: &'a aube_manifest::workspace::WorkspaceConfig,
     pub(crate) workspace_catalogs:
         &'a std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// Merged `namedRegistries` alias→URL map (builtin `gh:` + global
+    /// `config.yaml` + workspace yaml), from `discover_named_registries`.
+    /// Empty under any non-pnpm posture, which makes the resolver's
+    /// named-registry branch inert.
+    pub(crate) named_registries: &'a std::collections::BTreeMap<String, String>,
     /// CLI-supplied `--minimum-release-age` override in minutes. Only
     /// `aube install` exposes the flag today; every other caller passes
     /// `None` and gets the settings-chain value.
@@ -841,6 +1205,7 @@ pub(crate) struct ResolverConfigInputs<'a> {
     /// — nothing consumes the extra resolutions. Callers compute this
     /// as `lockfile_enabled.then(|| source_kind_before.unwrap_or(Aube))`.
     pub(crate) target_lockfile_kind: Option<aube_lockfile::LockfileKind>,
+    pub(crate) dependency_policy: aube_resolver::DependencyPolicy,
     /// When `true`, the resolver caches full (non-corgi) packuments on
     /// disk so the next install/update can reuse them without a
     /// round-trip. Install opts in (`true`) to amortize the cost of
@@ -869,8 +1234,10 @@ pub(crate) fn configure_resolver(
         settings_ctx,
         workspace_config,
         workspace_catalogs,
+        named_registries,
         minimum_release_age_override,
         target_lockfile_kind,
+        dependency_policy,
         cache_full_packuments,
         ignore_scripts,
     } = inputs;
@@ -882,30 +1249,27 @@ pub(crate) fn configure_resolver(
     let resolve_peers_from_workspace_root_opt = resolve_peers_from_workspace_root(settings_ctx);
     let registry_supports_time_field = resolve_registry_supports_time_field(settings_ctx);
     let force_metadata_primer = resolve_force_metadata_primer(settings_ctx);
+    // The full funnel, not the manifest-only reader: this is a filter input
+    // like every other site, so an `.npmrc`-sourced object and a `--os`/`--cpu`
+    // /`--libc` flag have to reach it too. Only the non-portable-lockfile arm
+    // below consumes it — the portable kinds take `accept_all` instead.
     let (sup_os, sup_cpu, sup_libc) =
         effective_supported_architectures(manifest, workspace_config, settings_ctx);
-    // pnpm-lock.yaml, aube-lock.yaml, bun.lock, and package-lock.json are
-    // all committed, cross-platform artifacts that carry per-package os/cpu
-    // metadata. When the user hasn't declared
-    // `pnpm.supportedArchitectures`, record EVERY optional-dep variant a
-    // package declares (`accept_all`) so the committed lockfile installs
-    // cleanly on every contributor's platform — withholding variants leaves
-    // teammates with "Cannot find native binding". This matches what pnpm
-    // AND bun both write verbatim (all 26 `@esbuild/*` / `@rollup/rollup-*`
-    // natives, freebsd/ppc64/s390x and all), so a lockfile aube regenerates
-    // stays diff-clean against the native tool. For package-lock.json the
-    // stakes are higher still: a platform-mismatched *root* optional
-    // dependency (fsevents on Linux) missing from the lockfile makes
-    // `npm ci` refuse the whole install with EUSAGE "Missing:
-    // fsevents@x.y.z from lock file", so npm is widened too. Install-time
-    // filtering (`filter_graph`) and the streaming-fetch gate run against
-    // the unmodified host triple, so `node_modules` and tarball downloads
-    // stay trimmed to the host — the wider lockfile costs only bytes, never
-    // extra installs. Yarn classic lockfiles have no per-package os/cpu
-    // metadata, so widening there would only bloat them — keep pnpm's
-    // host-only default.
-    let manifest_set_supported_arch =
-        !(sup_os.is_empty() && sup_cpu.is_empty() && sup_libc.is_empty());
+    // pnpm-lock.yaml, aube-lock.yaml, bun.lock, package-lock.json, and
+    // npm-shrinkwrap.json are committed, cross-platform artifacts that
+    // carry per-package os/cpu metadata.
+    // Record EVERY optional-dep variant a package declares (`accept_all`) in
+    // portable lockfiles, even when the user configured
+    // `supportedArchitectures`. pnpm applies that setting when deciding what
+    // to install, not when deciding what its lockfile records; narrowing the
+    // resolver here silently removes the variants another platform needs.
+    // This also matches what npm and bun write verbatim (all 26 `@esbuild/*`
+    // / `@rollup/rollup-*` natives, freebsd/ppc64/s390x and all), so a
+    // lockfile aube regenerates stays diff-clean against the native tool.
+    // Install-time filtering (`filter_graph`) and the streaming-fetch gate
+    // still use the configured architectures, so the wider lockfile costs
+    // only bytes, never extra installs. Yarn lockfiles don't carry the same
+    // per-package os/cpu metadata, so widening there would only bloat them.
     let writes_cross_platform_lock = matches!(
         target_lockfile_kind,
         Some(
@@ -913,16 +1277,10 @@ pub(crate) fn configure_resolver(
                 | aube_lockfile::LockfileKind::Aube
                 | aube_lockfile::LockfileKind::Bun
                 | aube_lockfile::LockfileKind::Npm
+                | aube_lockfile::LockfileKind::NpmShrinkwrap
         )
     );
-    let supported_architectures = if manifest_set_supported_arch {
-        aube_resolver::SupportedArchitectures {
-            os: sup_os,
-            cpu: sup_cpu,
-            libc: sup_libc,
-            ..Default::default()
-        }
-    } else if writes_cross_platform_lock {
+    let supported_architectures = if writes_cross_platform_lock {
         aube_resolver::SupportedArchitectures {
             accept_all: true,
             ..Default::default()
@@ -955,7 +1313,6 @@ pub(crate) fn configure_resolver(
     if !effective_overrides.is_empty() {
         tracing::debug!("applying {} overrides", effective_overrides.len());
     }
-    let dependency_policy = resolve_dependency_policy(manifest, settings_ctx);
     if !dependency_policy.package_extensions.is_empty() {
         tracing::debug!(
             "applying {} packageExtensions",
@@ -975,7 +1332,7 @@ pub(crate) fn configure_resolver(
         resolve_minimum_release_age(settings_ctx, minimum_release_age_override);
     if let Some(ref mra) = minimum_release_age {
         tracing::debug!(
-            "minimumReleaseAge: {} min, {} excluded, strict={}",
+            "minimumReleaseAge: {} min, {} exclude rules, strict={}",
             mra.minutes,
             mra.exclude.len(),
             mra.strict
@@ -983,11 +1340,12 @@ pub(crate) fn configure_resolver(
     }
     let git_shallow_hosts = resolve_git_shallow_hosts(settings_ctx);
     let packument_concurrency = resolve_network_concurrency(settings_ctx);
+    let cache_dir = crate::commands::resolved_cache_dir_with_ctx(cwd, settings_ctx);
     let mut resolver = resolver
         .with_packument_network_concurrency(packument_concurrency)
-        .with_packument_cache(packument_cache_dir());
+        .with_packument_cache(cache_dir.join("packuments-v1"));
     if cache_full_packuments {
-        resolver = resolver.with_packument_full_cache(packument_full_cache_dir());
+        resolver = resolver.with_packument_full_cache(cache_dir.join("packuments-full-v1"));
     }
     let mut resolver = resolver
         .with_auto_install_peers(auto_install_peers)
@@ -1004,6 +1362,7 @@ pub(crate) fn configure_resolver(
         .with_resolution_mode(resolution_mode)
         .with_minimum_release_age(minimum_release_age)
         .with_catalogs(workspace_catalogs.clone())
+        .with_named_registries(named_registries.clone())
         .with_project_root(cwd.to_path_buf())
         .with_ignore_scripts(ignore_scripts)
         .with_dependency_policy(dependency_policy)
@@ -1036,23 +1395,24 @@ pub(super) fn check_unmet_peers(
     if unmet.is_empty() {
         return Ok(());
     }
-    // Called from install flow after resolver, before linker phase.
-    // Progress bar is active at this point. Raw eprintln smears
-    // across bar frames. Route through safe_eprintln.
-    crate::progress::safe_eprintln("error: Issues with peer dependencies found");
+    super::control::output(
+        super::InstallOutputLevel::Error,
+        None,
+        "Issues with peer dependencies found",
+    );
     for u in &unmet {
         let from_ver = version_from_dep_path(&u.from_dep_path, &u.from_name);
         let msg = match &u.found {
             Some(found) => format!(
-                "error:   {}@{from_ver}: expected peer {}@{}, found {found}",
+                "  {}@{from_ver}: expected peer {}@{}, found {found}",
                 u.from_name, u.peer_name, u.declared,
             ),
             None => format!(
-                "error:   {}@{from_ver}: missing required peer {}@{}",
+                "  {}@{from_ver}: missing required peer {}@{}",
                 u.from_name, u.peer_name, u.declared,
             ),
         };
-        crate::progress::safe_eprintln(&msg);
+        super::control::output(super::InstallOutputLevel::Error, None, msg);
     }
     Err(miette!(
         "{} unmet peer dependenc{} (strict-peer-dependencies is enabled)\n  \
@@ -1175,6 +1535,154 @@ fn compile_peer_patterns(field: &str, raw: &[String]) -> Vec<glob::Pattern> {
 }
 
 #[cfg(test)]
+mod bundled_compat_tests {
+    use super::*;
+
+    #[test]
+    fn the_catalog_carries_the_rule_an_embedder_gate_used_to_withhold() {
+        // Until this gate came off, the vendored catalogs applied only when the
+        // embedder was standalone aube, so every embedder resolved a smaller
+        // graph than pnpm for the same project. `reactcss` is the cheapest
+        // demonstration: it requires `react` and declares it nowhere, so without
+        // this rule the peer is never added, `auto-install-peers` has nothing to
+        // install, and the package fails at require time with `Cannot find
+        // module 'react'` — under a tool whose whole claim is pnpm parity.
+        let extensions = vendored_compat_extensions();
+        let reactcss = extensions
+            .iter()
+            .find(|extension| extension.selector == "reactcss@*")
+            .expect("the bundled catalog must carry reactcss@*");
+        assert_eq!(
+            reactcss.peer_dependencies["react"], "*",
+            "reactcss must gain react as a peer for auto-install-peers to supply it"
+        );
+    }
+
+    #[test]
+    fn catalog_matches_curated_upstreams_and_preserves_order() {
+        let extensions = vendored_compat_extensions();
+
+        assert_eq!(extensions.len(), 161);
+        let extension = |selector: &str| {
+            extensions
+                .iter()
+                .find(|extension| extension.selector == selector)
+                .unwrap_or_else(|| panic!("missing bundled selector {selector}"))
+        };
+        assert_eq!(
+            extension("@angular/build@*").dependencies["tslib"],
+            "^2.3.0"
+        );
+        assert_eq!(
+            extension("@nuxt/vite-builder@>=4.5.0").dependencies["unplugin"],
+            "^3.3.0"
+        );
+        let selector_position = |selector: &str| {
+            extensions
+                .iter()
+                .position(|extension| extension.selector == selector)
+                .unwrap_or_else(|| panic!("missing bundled selector {selector}"))
+        };
+        assert!(
+            selector_position("consolidate@<=0.16.0") < selector_position("consolidate@<0.16.0")
+        );
+    }
+
+    #[test]
+    fn catalog_does_not_inject_type_only_or_singleton_runtimes() {
+        // These are the bare runtime targets the reverted scanner rules
+        // injected. Their `@types/*` counterparts are legitimate packages and
+        // intentionally remain allowed in curated repairs.
+        let extensions = vendored_compat_extensions();
+        for target in ["estree", "typescript", "react", "eslint"] {
+            for extension in &extensions {
+                assert!(
+                    !extension.dependencies.contains_key(target),
+                    "{} must not inject {target}",
+                    extension.selector
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_bundled_entry_does_not_discard_valid_entries() {
+        let raw = vec![
+            ("broken@*".to_string(), serde_json::Value::Null),
+            (
+                "valid@*".to_string(),
+                serde_json::json!({"dependencies": {"left-pad": "^1.3.0"}}),
+            ),
+        ];
+
+        let parsed = parse_bundled_package_extensions(raw);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].selector, "valid@*");
+        assert_eq!(parsed[0].dependencies["left-pad"], "^1.3.0");
+    }
+
+    #[test]
+    fn a_bundled_entrys_optional_peers_become_database_peers_and_required_ones_stay() {
+        let parsed = parse_bundled_package_extensions(vec![(
+            "host@*".to_string(),
+            serde_json::json!({
+                "peerDependencies": {"opt": "^1", "req": "^2"},
+                "peerDependenciesMeta": {"opt": {"optional": true}, "meta-only": {"optional": true}}
+            }),
+        )]);
+
+        assert_eq!(parsed[0].database_peers["opt"], "^1");
+        assert_eq!(parsed[0].database_peers["meta-only"], "*");
+        assert_eq!(parsed[0].peer_dependencies["req"], "^2");
+        assert!(!parsed[0].peer_dependencies.contains_key("opt"));
+        assert!(parsed[0].peer_dependencies_meta.is_empty());
+    }
+
+    #[test]
+    fn ignore_compatibility_db_skips_bundled_but_keeps_project_extensions() {
+        let npmrc = [("ignoreCompatibilityDb".to_string(), "true".to_string())];
+        let workspace = BTreeMap::new();
+        let ctx = aube_settings::ResolveCtx::files_only(&npmrc, &workspace);
+        let manifest = serde_json::from_value(serde_json::json!({
+            "pnpm": {
+                "packageExtensions": {
+                    "project-extension@*": {"dependencies": {"left-pad": "^1.3.0"}}
+                }
+            }
+        }))
+        .expect("test manifest should parse");
+
+        let policy =
+            resolve_dependency_policy(&manifest, &ctx).expect("test policy should resolve");
+
+        assert_eq!(policy.package_extensions.len(), 1);
+        assert_eq!(policy.package_extensions[0].selector, "project-extension@*");
+    }
+}
+
+#[cfg(test)]
+mod resolution_mode_tests {
+    use super::*;
+
+    #[test]
+    fn lowest_direct_maps_to_the_public_resolver_mode() {
+        assert_eq!(
+            parse_resolution_mode("lowest-direct"),
+            Some(aube_resolver::ResolutionMode::LowestDirect)
+        );
+    }
+
+    #[test]
+    fn time_alias_keeps_time_based_mode() {
+        assert_eq!(
+            parse_resolution_mode("time"),
+            Some(aube_resolver::ResolutionMode::TimeBased)
+        );
+    }
+}
+
+#[cfg(test)]
 mod override_tests {
     use super::*;
 
@@ -1222,7 +1730,7 @@ mod yarn_package_extensions_tests {
         let workspace_yaml = std::collections::BTreeMap::new();
         let ctx = aube_settings::ResolveCtx::files_only(&yarnrc_entries, &workspace_yaml);
         let manifest = aube_manifest::PackageJson::default();
-        let policy = resolve_dependency_policy(&manifest, &ctx);
+        let policy = resolve_dependency_policy(&manifest, &ctx).unwrap();
 
         let ext = policy
             .package_extensions
@@ -1249,6 +1757,60 @@ mod network_concurrency_tests {
         assert_eq!(network_concurrency_for_workers(24), 72);
         assert_eq!(network_concurrency_for_workers(64), 128);
         assert_eq!(network_concurrency_for_workers(usize::MAX), 128);
+    }
+}
+
+// These ran `unix`-only, which is what let the Windows half of the
+// detector stay broken (nub#566): on Windows the real-dir arm never
+// fired, `all_real_dirs_reads_as_per_project` was the test that would
+// have caught it, and it was compiled out. Every entry is now built
+// through `create_dir_link` / `create_dir_all`, so the same three cases
+// assert against a real junction on Windows and a real symlink on Unix.
+#[cfg(test)]
+mod gvs_mode_detect_tests {
+    use super::*;
+
+    // A link target that does not exist — the detector classifies by the
+    // entry's own shape and must not care whether the target resolves.
+    fn dangling_link(store_leaf: &str, at: std::path::PathBuf) {
+        let target = at
+            .parent()
+            .expect("entry has a parent")
+            .join("nonexistent-store")
+            .join(store_leaf);
+        aube_linker::sys::create_dir_link(&target, &at).unwrap();
+    }
+
+    // `diskMaterializePackages` produces a MIXED `.aube` tree — some entries
+    // are shared-store links, some are disk-materialized real dirs. The
+    // detector must classify such a tree as GVS-on regardless of `read_dir`
+    // order; a forced real dir landing first must NOT misread it as per-project
+    // (which would wipe node_modules on every install).
+    #[test]
+    fn mixed_tree_with_any_link_reads_as_gvs() {
+        let dir = tempfile::tempdir().unwrap();
+        let aube = dir.path();
+        std::fs::create_dir_all(aube.join("real@1.0.0/node_modules/real")).unwrap();
+        dangling_link("dep@2.0.0", aube.join("dep@2.0.0"));
+        assert_eq!(detect_aube_dir_gvs_mode(aube), Some(true));
+    }
+
+    #[test]
+    fn all_real_dirs_reads_as_per_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let aube = dir.path();
+        std::fs::create_dir_all(aube.join("a@1.0.0/node_modules/a")).unwrap();
+        std::fs::create_dir_all(aube.join("b@1.0.0/node_modules/b")).unwrap();
+        assert_eq!(detect_aube_dir_gvs_mode(aube), Some(false));
+    }
+
+    #[test]
+    fn all_links_reads_as_gvs() {
+        let dir = tempfile::tempdir().unwrap();
+        let aube = dir.path();
+        dangling_link("a@1.0.0", aube.join("a@1.0.0"));
+        dangling_link("b@1.0.0", aube.join("b@1.0.0"));
+        assert_eq!(detect_aube_dir_gvs_mode(aube), Some(true));
     }
 }
 
@@ -1354,7 +1916,7 @@ mod finalize_lockfile_graph_tests {
     use super::*;
 
     fn node_available() -> bool {
-        std::process::Command::new(crate::runtime::node_program())
+        std::process::Command::new(crate::runtime::internal_node_program())
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1402,12 +1964,18 @@ mod finalize_lockfile_graph_tests {
         );
     }
 
-    /// aube-lock.yaml must never grow pnpm-only checksum fields — the
-    /// stamp is a no-op when no pnpm lockfile is present.
+    /// The generic (`Aube`) lockfile grows `packageExtensionsChecksum` ONLY
+    /// when the embedder enforces the checksum (nub). Standalone aube leaves
+    /// the posture off, so its aube-lock.yaml never grows the pnpm-only field
+    /// — the byte-for-byte default. `pnpmfileChecksum` stays pnpm-lock-only
+    /// under either posture. Both branches run in one test fn (with a
+    /// save/restore of the process-global posture) so the enforce window can't
+    /// race the sibling pnpm-lock stamp tests.
     #[tokio::test]
-    async fn finalize_skips_checksums_on_aube_lock() {
+    async fn finalize_stamps_generic_lock_checksum_only_when_embedder_enforces() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
+        std::fs::write(cwd.join("aube-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
         std::fs::write(
             cwd.join("package.json"),
             r#"{"name":"x","version":"1.0.0"}"#,
@@ -1419,26 +1987,52 @@ mod finalize_lockfile_graph_tests {
         )
         .unwrap();
 
+        // Default posture (standalone aube): no checksum on aube-lock.yaml.
         let mut graph = aube_lockfile::LockfileGraph::default();
         finalize_lockfile_graph(cwd, &mut graph, &manifest(), false, None)
             .await
             .unwrap();
         assert!(
             graph.package_extensions_checksum.is_none(),
-            "aube-lock.yaml must not grow pnpm-only checksum fields"
+            "standalone aube must not stamp packageExtensionsChecksum on aube-lock.yaml"
         );
         assert!(graph.pnpmfile_checksum.is_none());
+
+        // Enforcing embedder (nub): the generic lockfile grows the checksum,
+        // but never the pnpmfile checksum.
+        aube_util::update_engine_context(|c| c.enforce_package_extensions_checksum = true);
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        finalize_lockfile_graph(cwd, &mut graph, &manifest(), false, None)
+            .await
+            .unwrap();
+        aube_util::update_engine_context(|c| c.enforce_package_extensions_checksum = false);
+        assert!(
+            graph.package_extensions_checksum.is_some(),
+            "an enforcing embedder must stamp packageExtensionsChecksum on its generic lockfile"
+        );
+        assert!(
+            graph.pnpmfile_checksum.is_none(),
+            "pnpmfileChecksum stays pnpm-lock-only even under an enforcing embedder"
+        );
     }
 
     /// The pnpmfile half of the same regression: a local pnpmfile that
     /// exports hooks gets its `pnpmfileChecksum` recorded on a pnpm-lock
     /// rewrite (matching pnpm + a fresh `aube install`).
+    // The pnpmfile default-gate lock is a std mutex held across the finalize
+    // await on purpose: this test binary is single-threaded per `.cargo/config`
+    // and the gate must stay held for the whole detect+finalize sequence.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn finalize_stamps_pnpmfile_checksum_on_pnpm_lock() {
         if !node_available() {
             eprintln!("skipping: `node` not on PATH");
             return;
         }
+        // Resolving `local_pnpmfile` reaches the cwd-default arm of
+        // `pnpmfile::detect`, whose gate is a process-global shared with
+        // pnpmfile's own tests across this one lib test binary.
+        let _lock = crate::pnpmfile::default_gate_lock();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         std::fs::write(cwd.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();

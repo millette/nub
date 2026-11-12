@@ -24,7 +24,11 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-NUB="$REPO_ROOT/target/release/nub"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tests/bench/install/provenance.sh
+source "$SCRIPT_DIR/provenance.sh"   # bench_env_json / bench_inject_env
+DEFAULT_NUB="$REPO_ROOT/target/release/nub"
+NUB="${NUB:-$DEFAULT_NUB}"
 FIXTURE_DIR="$REPO_ROOT/tests/bench/install/fixtures"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 
@@ -36,9 +40,10 @@ trap cleanup_trash EXIT
 
 # Empty npmrc so a host ~/.npmrc can't redirect fetches (e.g. custom registry=).
 EMPTY_NPMRC="$TRASH_DIR/empty.npmrc"
-touch "$EMPTY_NPMRC"
+EMPTY_NPMRC_GLOBAL="$TRASH_DIR/empty-global.npmrc"
+touch "$EMPTY_NPMRC" "$EMPTY_NPMRC_GLOBAL"
 export NPM_CONFIG_USERCONFIG="$EMPTY_NPMRC"
-export NPM_CONFIG_GLOBALCONFIG="$EMPTY_NPMRC"
+export NPM_CONFIG_GLOBALCONFIG="$EMPTY_NPMRC_GLOBAL"
 
 RUN_WARM=1
 RUN_COLD=1
@@ -66,10 +71,36 @@ HAS_BUN=0
 if command -v bun &>/dev/null; then HAS_BUN=1; fi
 
 # ── Preflight ──────────────────────────────────────────────────────────────
+# Staleness guard: the nub binary's version MUST match the workspace, or the bench
+# silently measures an ancient binary (this happened — a v0.2.8 target/release/nub
+# gave bogus numbers). Auto-build the default binary; hard-error a mismatched NUB=.
+WS_VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+nub_semver() { "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+is_default_nub=0
+[[ "$NUB" == "$DEFAULT_NUB" ]] && is_default_nub=1
 if [[ ! -x "$NUB" ]]; then
-  echo "ERROR: $NUB not found or not executable. Run 'cargo build --release' first." >&2
-  exit 1
+  if [[ $is_default_nub -eq 1 ]]; then
+    echo "== nub binary missing at $NUB — building release (cargo build --release -p nub-cli) =="
+    ( cd "$REPO_ROOT" && cargo build --release -p nub-cli ) || { echo "ERROR: release build failed" >&2; exit 1; }
+  else
+    echo "ERROR: nub not found at NUB=$NUB. Build it: cargo build --release -p nub-cli" >&2
+    exit 1
+  fi
 fi
+NUB_SEMVER="$(nub_semver "$NUB")"
+if [[ "$NUB_SEMVER" != "$WS_VERSION" ]]; then
+  if [[ $is_default_nub -eq 1 ]]; then
+    echo "== STALE nub binary: $NUB is v$NUB_SEMVER but workspace is v$WS_VERSION — rebuilding release =="
+    ( cd "$REPO_ROOT" && cargo build --release -p nub-cli ) || { echo "ERROR: release build failed" >&2; exit 1; }
+    NUB_SEMVER="$(nub_semver "$NUB")"
+    [[ "$NUB_SEMVER" == "$WS_VERSION" ]] || { echo "ERROR: after rebuild nub is still v$NUB_SEMVER, expected v$WS_VERSION" >&2; exit 1; }
+  else
+    echo "ERROR: stale/mismatched nub binary: NUB=$NUB is v$NUB_SEMVER but workspace is v$WS_VERSION." >&2
+    echo "       Rebuild release and re-run: cargo build --release -p nub-cli" >&2
+    exit 1
+  fi
+fi
+echo "== nub binary OK: v$NUB_SEMVER (matches workspace v$WS_VERSION) =="
 if ! command -v hyperfine &>/dev/null; then
   echo "ERROR: hyperfine not found. Install with: brew install hyperfine" >&2
   exit 1
@@ -109,16 +140,17 @@ setup_workdir() {
   rm -rf "$workdir"
   cp -r "$FIXTURE_DIR/$fixture" "$workdir"
   rm -rf "$workdir/node_modules" "$workdir"/packages/*/node_modules 2>/dev/null || true
-  # A fixture may ship multiple lockfiles (pnpm-lock.yaml for nub+pnpm, bun.lock for
-  # bun, package-lock.json for npm). Each tool installs from its OWN lockfile; a
-  # foreign lockfile alongside makes nub refuse to infer a PM ("two competing
-  # lockfiles") and lets a tool read a stale lock. Resolution stays identical within
-  # a tool's own lockfile family; we only strip the OTHER tools' lockfiles from this
-  # tool's isolated workdir.
+  # A fixture ships every tool's lockfile (nub.lock for nub, pnpm-lock.yaml for
+  # pnpm, bun.lock for bun, package-lock.json for npm). Each tool installs from its
+  # OWN lockfile; a foreign lockfile alongside makes nub refuse to infer a PM ("two
+  # competing lockfiles") and lets a tool read a stale lock. We strip every OTHER
+  # tool's lockfile from this tool's isolated workdir so the nub leg exercises nub's
+  # NATIVE nub.lock path — not the pnpm-lock.yaml compat-read.
   case "$tool" in
-    pnpm|nub) rm -f "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true ;;
-    bun)      rm -f "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" "$workdir/package-lock.json" 2>/dev/null || true ;;
-    npm)      rm -f "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" 2>/dev/null || true ;;
+    nub)  rm -f "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true ;;
+    pnpm) rm -f "$workdir/nub.lock" "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true ;;
+    bun)  rm -f "$workdir/nub.lock" "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" "$workdir/package-lock.json" 2>/dev/null || true ;;
+    npm)  rm -f "$workdir/nub.lock" "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" 2>/dev/null || true ;;
   esac
 }
 
@@ -162,9 +194,9 @@ setup_workdir() {
 nub_install() {
   local wd="$1"; shift
   if [[ $MATERIALIZED -eq 1 ]]; then
-    CI=1 "$NUB" install --frozen-lockfile --cwd "$wd" "$@"
+    CI=1 "$NUB" --cwd "$wd" install --frozen-lockfile "$@"
   else
-    env -u CI "$NUB" install --frozen-lockfile --cwd "$wd" "$@"
+    env -u CI "$NUB" --cwd "$wd" install --frozen-lockfile "$@"
   fi
 }
 
@@ -229,14 +261,17 @@ run_warm() {
   # nub install command, GVS pinned via CI env. Single-quote-safe.
   local nub_cmd
   if [[ $MATERIALIZED -eq 1 ]]; then
-    nub_cmd="CI=1 '$NUB' install --frozen-lockfile --cwd '$WD_NUB' -s"
+    nub_cmd="CI=1 '$NUB' --cwd '$WD_NUB' install --frozen-lockfile -s"
   else
-    nub_cmd="env -u CI '$NUB' install --frozen-lockfile --cwd '$WD_NUB' -s"
+    nub_cmd="env -u CI '$NUB' --cwd '$WD_NUB' install --frozen-lockfile -s"
   fi
 
   # Run nub and pnpm together for direct comparison. Per-command --prepare so
   # each tool's (untimed) teardown is isolated and rename-aside fast.
+  # --shell=sh: hyperfine 2.0 runs commands with no shell by default and refuses
+  # the `CI=1 …` and `cd … && npm ci` commands below; sh was 1.x's default.
   local HYPERFINE_ARGS=(
+    --shell=sh
     --warmup 3
     --runs 12
     --prepare "$(reset_cmd "$WD_PNPM")"
@@ -292,6 +327,12 @@ run_warm() {
   nub_install "$WD_NUB" -s 2>/dev/null || true
 
   hyperfine "${HYPERFINE_ARGS[@]}" --export-json "$outfile_nub"
+
+  # Stamp provenance (tool versions/platform/arch/timestamp/load) into the result.
+  local warm_env_args=(nub="$NUB_SEMVER" pnpm="$PNPM_VERSION")
+  [[ $has_npm_lock -eq 1 ]] && warm_env_args+=(npm="$NPM_VERSION")
+  [[ $HAS_BUN -eq 1 && -f "$FIXTURE_DIR/$fixture/bun.lock" ]] && warm_env_args+=(bun="$BUN_VERSION")
+  bench_inject_env "$outfile_nub" "$(bench_env_json "${warm_env_args[@]}")"
 
   echo ""
   echo "  [results saved → $outfile_nub]"
@@ -385,16 +426,14 @@ run_cold() {
     local t0; t0=$(ms_now)
     XDG_DATA_HOME="$data" XDG_CACHE_HOME="$cache" \
       NPM_CONFIG_USERCONFIG="$EMPTY_NPMRC" NPM_CONFIG_GLOBALCONFIG="$EMPTY_NPMRC" \
-      "$NUB" install \
+      "$NUB" --cwd "$wd" install \
       --frozen-lockfile \
-      --cwd "$wd" \
       -s \
       2>/dev/null \
       || XDG_DATA_HOME="$data" XDG_CACHE_HOME="$cache" \
            NPM_CONFIG_USERCONFIG="$EMPTY_NPMRC" NPM_CONFIG_GLOBALCONFIG="$EMPTY_NPMRC" \
-           "$NUB" install \
+           "$NUB" --cwd "$wd" install \
            --frozen-lockfile \
-           --cwd "$wd" \
            2>&1 | tail -2
     local t1; t1=$(ms_now)
     local ms=$(( t1 - t0 ))
@@ -436,13 +475,16 @@ run_cold() {
 
   local outfile="$RESULTS_DIR/cold-${fixture}-${TIMESTAMP}.json"
   local bun_json='null'
+  local cold_env_args=(nub="$NUB_SEMVER" pnpm="$PNPM_VERSION")
   if [[ $has_bun_lock -eq 1 ]]; then
     read -r bun_mean bun_sd <<< "$(compute_stats_ms "${bun_times[@]}")"
     bun_json="$(printf '{"times_ms":[%s],"mean_ms":%d,"stddev_ms":%d}' \
       "$(IFS=,; echo "${bun_times[*]}")" "$bun_mean" "$bun_sd")"
+    cold_env_args+=(bun="$BUN_VERSION")
   fi
-  printf '{"scenario":"cold","fixture":"%s","runs":%d,"pnpm":{"times_ms":[%s],"mean_ms":%d,"stddev_ms":%d},"nub":{"times_ms":[%s],"mean_ms":%d,"stddev_ms":%d},"bun":%s}\n' \
-    "$fixture" "$RUNS" \
+  local cold_env_json; cold_env_json="$(bench_env_json "${cold_env_args[@]}")"
+  printf '{"scenario":"cold","fixture":"%s","runs":%d,"env":%s,"pnpm":{"times_ms":[%s],"mean_ms":%d,"stddev_ms":%d},"nub":{"times_ms":[%s],"mean_ms":%d,"stddev_ms":%d},"bun":%s}\n' \
+    "$fixture" "$RUNS" "$cold_env_json" \
     "$(IFS=,; echo "${pnpm_times[*]}")" "$pnpm_mean" "$pnpm_sd" \
     "$(IFS=,; echo "${nub_times[*]}")"  "$nub_mean"  "$nub_sd" \
     "$bun_json" \
@@ -457,6 +499,7 @@ ALL_FIXTURES=(
   "simple|simple (~435 pkgs)"
   "monorepo|monorepo (~407 pkgs, 4 workspaces)"
   "t3|t3-app (~222 pkgs, Next16/tRPC11/Drizzle — Bun's benchmark fixture)"
+  "tanstack-start|tanstack-start (~313 pkgs, TanStack Start + Vite + React — GVS-eligible)"
   "large|large (~1168 pkgs, react+MUI+webpack+babel+ts+eslint)"
 )
 

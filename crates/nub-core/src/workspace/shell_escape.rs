@@ -18,7 +18,7 @@
 /// otherwise it is wrapped in single quotes with embedded `'` rendered as
 /// `'\''`, then npm's two cosmetic cleanups are applied (they shorten the string
 /// without changing how `sh` tokenizes it).
-pub fn sh(input: &str) -> String {
+fn sh(input: &str) -> String {
     if input.is_empty() {
         return "''".to_string();
     }
@@ -87,7 +87,7 @@ fn strip_leading_empty_quote_pairs(s: &str) -> String {
 /// whitespace/`"` per the MS command-line rules, then prefixes cmd metacharacters
 /// with `^`. `double_escape` repeats the `^` pass — npm does this when the script
 /// target is a `.cmd`/`.bat` file, which re-parses its arguments once more.
-pub fn cmd(input: &str, double_escape: bool) -> String {
+fn cmd(input: &str, double_escape: bool) -> String {
     if input.is_empty() {
         return "\"\"".to_string();
     }
@@ -149,10 +149,33 @@ fn caret_escape(s: &str) -> String {
     out
 }
 
+/// Splice the user's forwarded args onto an unescaped script `body`, escaping
+/// each arg for the target `shell` exactly as npm's `@npmcli/promise-spawn`
+/// does. The result is both the string `nub run` executes and the command it
+/// echoes in the `$ <cmd>` preamble, so the displayed command always matches the
+/// effective one (issue #146). With no args the body is returned unchanged.
+pub fn splice_args(body: &str, args: &[String], shell: &str) -> String {
+    if args.is_empty() {
+        return body.to_string();
+    }
+    let use_cmd = is_cmd(shell);
+    let double_escape = use_cmd && body_targets_batch_file(body);
+    let mut full = body.to_string();
+    for arg in args {
+        full.push(' ');
+        if use_cmd {
+            full.push_str(&cmd(arg, double_escape));
+        } else {
+            full.push_str(&sh(arg));
+        }
+    }
+    full
+}
+
 /// Does `shell` invoke `cmd.exe`? Mirrors npm's `/(?:^|\\)cmd(?:\.exe)?$/i`, so a
 /// custom `script-shell` of `bash`/`zsh` selects POSIX escaping while the Windows
 /// default (`cmd`) selects cmd escaping.
-pub fn is_cmd(shell: &str) -> bool {
+fn is_cmd(shell: &str) -> bool {
     let lower = shell.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
     stem == "cmd" || stem.ends_with("\\cmd")
@@ -167,7 +190,7 @@ pub fn is_cmd(shell: &str) -> bool {
 /// whose `eslint` resolves to `eslint.cmd` is treated as non-batch and
 /// single-escaped. Closing that needs Windows PATHEXT resolution and Windows
 /// validation; tracked as the residual Windows gap on A42.
-pub fn body_targets_batch_file(script_body: &str) -> bool {
+fn body_targets_batch_file(script_body: &str) -> bool {
     let first = script_body.split_whitespace().next().unwrap_or("");
     let lower = first.to_ascii_lowercase();
     lower.ends_with(".cmd") || lower.ends_with(".bat")
@@ -254,5 +277,24 @@ mod tests {
         assert!(body_targets_batch_file("build.bat"));
         assert!(!body_targets_batch_file("eslint .")); // PATHEXT gap (documented)
         assert!(!body_targets_batch_file("node script.js"));
+    }
+
+    // ── splice_args (the body+args display/exec string) ───────────────────
+
+    #[test]
+    fn splice_args_matches_the_executed_command() {
+        // No args → the body is returned verbatim (the common `nub run build` case).
+        assert_eq!(splice_args("jest --ci", &[], "/bin/sh"), "jest --ci");
+        // A plain flag appends unquoted; a metachar arg is sh-quoted as one token,
+        // so the displayed preamble equals what `sh -c` actually runs (#146).
+        assert_eq!(
+            splice_args("jest", &["-u".into(), "two words".into()], "/bin/sh"),
+            "jest -u 'two words'",
+        );
+        // A cmd.exe shell selects caret/quote escaping instead.
+        assert_eq!(
+            splice_args("jest", &["a b".into()], "cmd.exe"),
+            "jest ^\"a^ b^\"",
+        );
     }
 }

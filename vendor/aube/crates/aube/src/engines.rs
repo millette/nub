@@ -78,46 +78,90 @@ pub fn resolve_node_version(override_: Option<&str>) -> Option<String> {
     if let Some(v) = override_ {
         return Some(v.trim().trim_start_matches('v').to_string());
     }
-    // Memoize the `node --version` probe. Spawning a process is cheap
-    // individually but this is called once per install and may end up
-    // called again by future callers in the same process (workspace
-    // installs, `aube add` chaining into `install`, tests). OnceLock
-    // gives us zero-cost lookups after the first probe.
-    static PROBED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    PROBED.get_or_init(probe_node_version).clone()
+    // Prefer the active runtime's real binary (`npm_node_execpath`) so a
+    // wrapper embedder that left `version` unset gets the underlying
+    // Node's version, not whatever bare `node` PATH resolves to. Falls
+    // back to bare `node` when no runtime is active.
+    let program =
+        crate::runtime::node_execpath().unwrap_or_else(|| std::path::PathBuf::from("node"));
+    probe_node_version(&program)
 }
 
-/// The Node version aube should report for engines checks once
-/// runtime switching is in play:
+/// The Node the install's build artifacts are actually compiled by. This is
+/// what every ABI-sensitive cache key must fold in — the virtual-store path,
+/// the side-effects cache and its marker, the delta and freshness gates:
 ///
-/// 1. an explicit `node-version` `.npmrc` override always wins
-///    (validation-only knob, pnpm semantics);
-/// 2. otherwise the resolved runtime context's version — engines must
-///    validate the node scripts will actually run on, not whatever
-///    PATH happened to carry;
+/// 1. the resolved runtime context's version — the Node scripts will run on;
+/// 2. otherwise the version an embedder provisioned
+///    ([`EngineContext::runtime_node_version`]) — the same, for a host that
+///    owns provisioning itself and so leaves the resolver inert;
 /// 3. otherwise the memoized `node --version` probe.
-pub fn effective_node_version(override_: Option<&str>) -> Option<String> {
-    if override_.is_some() {
-        return resolve_node_version(override_);
-    }
+///
+/// Deliberately NOT the `.npmrc` `node-version` override: that knob is
+/// validation-only (pnpm semantics — it never switches the runtime scripts
+/// run on), so letting it name the engine would key artifacts to a Node that
+/// never compiled them. Use [`effective_node_version`] where the override is
+/// meant to win — the `engines.node` check and `doctor`.
+///
+/// [`EngineContext::runtime_node_version`]: aube_util::EngineContext::runtime_node_version
+pub fn build_node_version() -> Option<String> {
     if let Some(rt) = crate::runtime::current()
         && let Some(v) = &rt.version
     {
         return Some(v.clone());
     }
+    if let Some(v) = aube_util::engine_context().runtime_node_version {
+        return Some(v);
+    }
     resolve_node_version(None)
 }
 
-fn probe_node_version() -> Option<String> {
-    let output = std::process::Command::new("node")
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// The Node version for the `engines.node` check and `doctor` display: the
+/// `.npmrc` `node-version` override wins (validation-only knob, pnpm
+/// semantics), else [`build_node_version`]. Do NOT use this to key an
+/// ABI-sensitive cache — the override does not switch the runtime, so it would
+/// mis-key. That is [`build_node_version`]'s job.
+pub fn effective_node_version(override_: Option<&str>) -> Option<String> {
+    if override_.is_some() {
+        return resolve_node_version(override_);
     }
-    let s = String::from_utf8(output.stdout).ok()?;
-    Some(s.trim().trim_start_matches('v').to_string())
+    build_node_version()
+}
+
+/// Probe `program --version`, memoized **per program path** — spawning is
+/// cheap individually but this is hit once per install and again by later
+/// callers in the same process (workspace installs, `aube add` chaining
+/// into `install`, tests). Keying the cache by path (rather than a single
+/// process-global slot) means a runtime that became active after an
+/// earlier bare-`node` probe still gets its own binary probed, instead of
+/// returning the stale first result.
+fn probe_node_version(program: &std::path::Path) -> Option<String> {
+    static PROBED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Option<String>>>,
+    > = std::sync::OnceLock::new();
+    let cache = PROBED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Recover from a poisoned lock rather than panic: this runs in
+    // embedded/library contexts, and a stale cache entry from a panicked
+    // probe is harmless (worst case: one redundant `--version` spawn).
+    if let Some(cached) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(program) {
+        return cached.clone();
+    }
+    let probed = (|| {
+        let output = std::process::Command::new(program)
+            .arg("--version")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(output.stdout).ok()?;
+        Some(s.trim().trim_start_matches('v').to_string())
+    })();
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(program.to_path_buf(), probed.clone());
+    probed
 }
 
 /// Test whether `version` satisfies `range`. A version or range we can't
@@ -232,7 +276,7 @@ fn check_manifest_engines(
 /// their own importer manifests. `engines.pnpm` is ignored everywhere;
 /// see the module docs.
 pub fn collect_dep_mismatches(
-    aube_dir: &Path,
+    aube_dir: Option<&Path>,
     graph: &LockfileGraph,
     indices: &BTreeMap<String, PackageIndex>,
     node_version: &str,
@@ -259,12 +303,21 @@ pub fn collect_dep_mismatches(
             // install driver threads it in via
             // `commands::resolve_virtual_store_dir` so custom
             // overrides land on the same path the linker wrote to.
-            let materialized = aube_dir
-                .join(dep_path_to_filename(dep_path, virtual_store_dir_max_length))
-                .join("node_modules")
-                .join(&pkg.name)
-                .join("package.json");
-            let content = match std::fs::read_to_string(&materialized) {
+            //
+            // `None` reads the fetched index only: the virtual store on
+            // disk is not this install's (a mode reset still pending), and a
+            // `file:` package keeps its dep_path while its contents change.
+            let materialized = aube_dir.map(|dir| {
+                dir.join(dep_path_to_filename(dep_path, virtual_store_dir_max_length))
+                    .join("node_modules")
+                    .join(&pkg.name)
+                    .join("package.json")
+            });
+            let read = match &materialized {
+                Some(path) => std::fs::read_to_string(path),
+                None => Err(std::io::ErrorKind::NotFound.into()),
+            };
+            let content = match read {
                 Ok(s) => s,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Fallback: CAS read via the package index, which
@@ -300,7 +353,7 @@ pub fn collect_dep_mismatches(
                         "failed to read materialized `package.json` for {}@{} at {}: {e}",
                         pkg.name,
                         pkg.version,
-                        materialized.display()
+                        materialized.as_deref().unwrap_or(Path::new("")).display()
                     ));
                 }
             };
@@ -378,7 +431,7 @@ pub fn check_workspace_importers(
 /// `engines.aube` — that one doesn't depend on Node.
 #[allow(clippy::too_many_arguments)]
 pub fn run_checks(
-    aube_dir: &Path,
+    aube_dir: Option<&Path>,
     manifest: &aube_manifest::PackageJson,
     workspace_manifests: &[(String, aube_manifest::PackageJson)],
     graph: &LockfileGraph,
@@ -519,7 +572,7 @@ mod tests {
         // version (1.x) lives in a different namespace than pnpm's
         // (10.x+), so comparing them produces spurious warnings on
         // every install of a project that pins a pnpm version.
-        // Discussion: github.com/jdx/aube/discussions/626.
+        // Discussion: github.com/aubepkg/aube/discussions/626.
         let mut m = empty_manifest();
         m.engines.insert("pnpm".into(), ">=99999".into());
         assert!(check_root(&m, Some("18.0.0")).is_empty());
@@ -681,7 +734,7 @@ mod tests {
         let indices: BTreeMap<String, PackageIndex> = BTreeMap::new();
         let aube_dir = tmp.path().join("node_modules/.aube");
         let mismatches = collect_dep_mismatches(
-            &aube_dir,
+            Some(&aube_dir),
             &graph,
             &indices,
             "18.0.0",
@@ -759,7 +812,7 @@ mod tests {
         let indices: BTreeMap<String, PackageIndex> = BTreeMap::new();
         let aube_dir = tmp.path().join("node_modules/.aube");
         let result = collect_dep_mismatches(
-            &aube_dir,
+            Some(&aube_dir),
             &graph,
             &indices,
             "18.0.0",
@@ -784,6 +837,50 @@ mod tests {
             result.is_err(),
             "permission-denied read must propagate, got {result:?}"
         );
+    }
+
+    #[test]
+    fn embedder_node_version_outranks_probe_but_not_override() {
+        // An embedder that owns Node provisioning leaves aube's resolver inert,
+        // so without this tier `effective_node_version` falls to the ambient
+        // PATH probe — and the GVS engine fingerprint keyed off it then names a
+        // different node than the one lifecycle scripts build against. The
+        // `.npmrc` `node-version` knob still outranks it (pnpm semantics).
+        let prev = aube_util::engine_context().runtime_node_version;
+        aube_util::update_engine_context(|c| c.runtime_node_version = Some("18.19.0".into()));
+        assert_eq!(
+            effective_node_version(None).as_deref(),
+            Some("18.19.0"),
+            "the embedder's provisioned version must win over the PATH probe"
+        );
+        assert_eq!(
+            effective_node_version(Some("v20.11.0")).as_deref(),
+            Some("20.11.0"),
+            "an explicit `node-version` override must still win"
+        );
+        aube_util::update_engine_context(|c| c.runtime_node_version = prev);
+    }
+
+    #[test]
+    fn build_node_version_ignores_the_validation_only_override() {
+        // `build_node_version` keys the ABI-sensitive caches, so it must reflect
+        // the Node that actually compiles — the provisioned/resolved one — never
+        // the `.npmrc` `node-version` knob, which is validation-only and never
+        // switches the runtime. `effective_node_version` still honors the
+        // override for the `engines.node` check.
+        let prev = aube_util::engine_context().runtime_node_version;
+        aube_util::update_engine_context(|c| c.runtime_node_version = Some("22.15.0".into()));
+        assert_eq!(
+            build_node_version().as_deref(),
+            Some("22.15.0"),
+            "the build version is the provisioned Node, regardless of any override"
+        );
+        assert_eq!(
+            effective_node_version(Some("v18.19.0")).as_deref(),
+            Some("18.19.0"),
+            "the validation path still honors the override — the split is intentional"
+        );
+        aube_util::update_engine_context(|c| c.runtime_node_version = prev);
     }
 
     #[test]

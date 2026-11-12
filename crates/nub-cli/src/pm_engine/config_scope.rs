@@ -187,7 +187,7 @@ pub(crate) fn role_of(declared: Option<&str>, kind: Option<LockfileKind>) -> Opt
         LockfileKind::Npm | LockfileKind::NpmShrinkwrap => Role::Npm,
         LockfileKind::Yarn | LockfileKind::YarnBerry => Role::Yarn,
         LockfileKind::Bun => Role::Bun,
-        // The generic lock.yaml (aube's `Aube` slot under nub's filename
+        // The generic nub.lock (aube's `Aube` slot under nub's filename
         // toggle) is nub identity.
         LockfileKind::Aube => Role::Nub,
     })
@@ -238,12 +238,13 @@ fn honors_namespaced_overrides(role: Role) -> bool {
 }
 
 /// Does the active PM honor Bun's top-level `trustedDependencies` (the
-/// build-script allowlist)? Only bun — and bun@10 DROPPED it (pnpm@10's
-/// approve-builds migration also dropped `trustedDependencies` +
-/// `onlyBuiltDependencies`, and bun followed). `major` is bun's declared
-/// major; undeclared bun is assumed current (honors).
-pub(crate) fn honors_trusted_dependencies(role: Role, major: Option<u64>) -> bool {
-    role == Role::Bun && major.is_none_or(|m| m < 10)
+/// build-script allowlist)? Only bun — at every major. Bun's current line
+/// (1.3.x) still uses `trustedDependencies` for lifecycle-script approval
+/// (bun.com/docs/install/lifecycle; bun source `install/lifecycle.zig` +
+/// `lockfile.zig`), and ships no `onlyBuiltDependencies` / `approve-builds`
+/// migration (zero hits in bun source). No version gate applies.
+pub(crate) fn honors_trusted_dependencies(role: Role) -> bool {
+    role == Role::Bun
 }
 
 /// One graph-shaping field nub dropped because the active PM ignores it,
@@ -333,6 +334,79 @@ pub(crate) fn scope_overrides(
     });
 
     (effective, ignored)
+}
+
+/// The manifest's effective `packageExtensions`, scoped to the active `role`,
+/// plus the top-level field to warn about when it's dropped.
+///
+/// Top-level `packageExtensions` is a nub-identity neutral field: NO package
+/// manager reads it from `package.json` root (pnpm reads `pnpm.packageExtensions`
+/// / `pnpm-workspace.yaml`; yarn reads `.yarnrc.yml`; npm and bun have no such
+/// feature). So nub honors the top-level home ONLY under its own identity;
+/// under an npm/pnpm/yarn/bun compat role it applies exactly what the incumbent
+/// would — pnpm's `pnpm.packageExtensions` under pnpm, nothing from the manifest
+/// under npm/yarn/bun (yarn's own extensions ride the `.yarnrc.yml` config
+/// cascade, not this manifest map). This is the packageExtensions arm of the
+/// same "mirror the active PM, never silently" policy [`scope_overrides`]
+/// implements for override fields.
+///
+/// The returned map is the manifest's sole packageExtensions contribution, fed
+/// to the engine via `EngineContext::embedder_package_extensions`. The config
+/// cascade (`.npmrc` / `pnpm-workspace.yaml` / `.yarnrc.yml`) is layered on top
+/// by the engine and is unaffected — only the top-level manifest read leaks.
+pub(crate) fn scope_package_extensions(
+    role: Role,
+    manifest: &PackageJson,
+) -> (BTreeMap<String, serde_json::Value>, Option<IgnoredField>) {
+    let object = |v: &serde_json::Value| v.as_object().cloned();
+    let top_level = manifest.extra.get("packageExtensions").and_then(object);
+    let pnpm_ns = manifest
+        .extra
+        .get("pnpm")
+        .and_then(|p| p.get("packageExtensions"))
+        .and_then(object);
+
+    let mut effective: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let keep = match role {
+        // nub identity: the top-level home is nub's neutral surface.
+        Role::Nub => top_level.as_ref(),
+        // pnpm compat: mirror pnpm — its branded home, never the top-level one.
+        Role::Pnpm => pnpm_ns.as_ref(),
+        // npm/yarn/bun: no manifest packageExtensions home to mirror.
+        Role::Npm | Role::Yarn | Role::Bun => None,
+    };
+    if let Some(obj) = keep {
+        for (k, v) in obj {
+            effective.insert(k.clone(), v.clone());
+        }
+    }
+
+    // Warn iff a top-level block was present under a role that drops it AND the
+    // drop actually changes the applied set — a portable repo mirroring the
+    // same extensions into the kept home (pnpm's branded field) stays silent,
+    // matching the "not annoying" guard in `scope_overrides`.
+    let ignored = match (role, &top_level) {
+        (Role::Nub, _) | (_, None) => None,
+        (_, Some(obj)) => obj
+            .iter()
+            .any(|(k, v)| effective.get(k) != Some(v))
+            .then(|| IgnoredField {
+                field: "packageExtensions",
+                fix: package_extensions_fix(role),
+            }),
+    };
+
+    (effective, ignored)
+}
+
+/// The fix clause for a dropped top-level `packageExtensions`, per active PM.
+fn package_extensions_fix(role: Role) -> String {
+    match role {
+        Role::Pnpm => "move it to `pnpm.packageExtensions`".to_string(),
+        Role::Yarn => "move it to `.yarnrc.yml` `packageExtensions`".to_string(),
+        // npm and bun have no package-extensions feature.
+        _ => "remove it, or switch the project to nub".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -463,10 +537,70 @@ mod tests {
     }
 
     #[test]
-    fn bun_10_dropped_trusted_dependencies() {
-        assert!(honors_trusted_dependencies(Role::Bun, Some(9)));
-        assert!(honors_trusted_dependencies(Role::Bun, None));
-        assert!(!honors_trusted_dependencies(Role::Bun, Some(10)));
-        assert!(!honors_trusted_dependencies(Role::Pnpm, None));
+    fn only_bun_honors_trusted_dependencies() {
+        // Bun honors `trustedDependencies` at every major (no version drop —
+        // bun 1.3.x still uses it; see `honors_trusted_dependencies`).
+        assert!(honors_trusted_dependencies(Role::Bun));
+        assert!(!honors_trusted_dependencies(Role::Pnpm));
+        assert!(!honors_trusted_dependencies(Role::Npm));
+        assert!(!honors_trusted_dependencies(Role::Yarn));
+        assert!(!honors_trusted_dependencies(Role::Nub));
+    }
+
+    fn manifest(json: &str) -> PackageJson {
+        serde_json::from_str(json).expect("manifest parses")
+    }
+
+    #[test]
+    fn nub_identity_honors_top_level_package_extensions() {
+        let m = manifest(
+            r#"{"name":"t","packageExtensions":{"foo@*":{"dependencies":{"bar":"1.0.0"}}}}"#,
+        );
+        let (eff, ignored) = scope_package_extensions(Role::Nub, &m);
+        assert!(eff.contains_key("foo@*"), "nub honors the top-level home");
+        assert!(ignored.is_none(), "nothing dropped under nub identity");
+    }
+
+    #[test]
+    fn pnpm_role_drops_top_level_keeps_branded_and_warns() {
+        let m = manifest(
+            r#"{
+                "name":"t",
+                "packageExtensions":{"foo@*":{"dependencies":{"bar":"1.0.0"}}},
+                "pnpm":{"packageExtensions":{"baz@*":{"peerDependencies":{"qux":"2.0.0"}}}}
+            }"#,
+        );
+        let (eff, ignored) = scope_package_extensions(Role::Pnpm, &m);
+        assert!(eff.contains_key("baz@*"), "pnpm keeps its branded home");
+        assert!(!eff.contains_key("foo@*"), "pnpm drops the top-level home");
+        let f = ignored.expect("dropped top-level warns");
+        assert_eq!(f.field, "packageExtensions");
+        assert!(f.fix.contains("pnpm.packageExtensions"));
+    }
+
+    #[test]
+    fn npm_role_drops_top_level_with_warning() {
+        let m = manifest(
+            r#"{"name":"t","packageExtensions":{"foo@*":{"dependencies":{"bar":"1.0.0"}}}}"#,
+        );
+        let (eff, ignored) = scope_package_extensions(Role::Npm, &m);
+        assert!(eff.is_empty(), "npm has no packageExtensions home");
+        let f = ignored.expect("dropped top-level warns");
+        assert_eq!(f.field, "packageExtensions");
+        assert!(f.fix.contains("nub"), "npm fix suggests removing or nub");
+    }
+
+    #[test]
+    fn portable_repo_mirrored_extensions_stays_silent_under_pnpm() {
+        // The same extension declared in both top-level and pnpm.* for
+        // cross-PM portability: pnpm applies the branded copy, so dropping the
+        // top-level one changes nothing — no warning.
+        let ext = r#"{"foo@*":{"dependencies":{"bar":"1.0.0"}}}"#;
+        let m = manifest(&format!(
+            r#"{{"name":"t","packageExtensions":{ext},"pnpm":{{"packageExtensions":{ext}}}}}"#
+        ));
+        let (eff, ignored) = scope_package_extensions(Role::Pnpm, &m);
+        assert!(eff.contains_key("foo@*"));
+        assert!(ignored.is_none(), "mirrored extension drop stays silent");
     }
 }

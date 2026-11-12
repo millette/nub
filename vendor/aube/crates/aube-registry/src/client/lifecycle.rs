@@ -80,6 +80,7 @@ impl RegistryClient {
             config,
             network_mode: NetworkMode::Online,
             fetch_policy,
+            named_routes: std::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -146,12 +147,9 @@ impl RegistryClient {
                 targets.push((client, url.clone()));
             }
         }
-        // The HEAD requests below populate hickory-dns's in-process
-        // cache as a side effect of issuing the request. A separate
-        // `tokio::net::lookup_host` preresolve would only warm the
-        // OS-level resolver (getaddrinfo), which reqwest's hickory
-        // path does not consult. So the prewarm itself is the DNS
-        // warm-up; no extra lookup needed.
+        // The HEAD requests below populate the shared DNS cache
+        // (`aube_util::http::dns`) as a side effect of connecting, so
+        // the prewarm itself is the DNS warm-up; no extra lookup needed.
         aube_util::http::prewarm::spawn_head(targets);
     }
 

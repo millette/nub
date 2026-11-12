@@ -18,19 +18,44 @@ name: Node matrix
 #   - push:main + nightly: the FULL version matrix + both real-app builds.
 #   - concurrency group with cancel-in-progress so superseded runs free their slots.
 
+# The path filter is `paths-ignore`, not `paths`, and the direction is deliberate: a
+# `paths` allowlist fails CLOSED — a new Rust directory nobody remembered to add would
+# silently stop running this workflow — while `paths-ignore` fails toward RUNNING, and
+# GitHub skips the workflow only when EVERY changed file matches. The listed surfaces
+# cannot change what `Build nub (once)` compiles, and that build is otherwise ~4 min of
+# Rust on a docs-only pull request. The nightly cron ignores path filters entirely, so
+# the full matrix still runs daily regardless.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "site/**"
+      - "wiki/**"
+      - "*.md"
+      - ".claude/**"
   pull_request:
+    # PR CI is opt-in — request a run with `gh pr edit <n> --add-label ci`. Rationale: ci.yml.
+    types: [labeled]
     branches: [main]
+    paths-ignore:
+      - "site/**"
+      - "wiki/**"
+      - "*.md"
+      - ".claude/**"
   schedule:
     # Nightly full matrix at 05:00 UTC (offset from the other nightlies: CI 06:00,
     # lockfile-roundtrip 07:00, pnpm-conformance 08:00).
     - cron: "0 5 * * *"
   workflow_dispatch:
 
+permissions: {}
+
+# The event name is part of the group so a trunk push cannot cancel the nightly
+# schedule run. rust-cache saves in a post-step that a cancelled job never reaches,
+# and 34 of the last 39 push:main runs were cancelled by the next push — so the
+# nightly is the one run guaranteed to refresh every trunk-scoped cache key.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{ github.event.label.name != 'ci' && github.event.label.name != 'ci-full' && github.event.label.name || '' }}
   cancel-in-progress: true
 
 env:
@@ -41,14 +66,21 @@ jobs:
   # the heavy legs entirely (the lightweight smoke still runs on a tier-boundary subset).
   plan:
     name: Plan
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # dorny/paths-filter lists a PR's changed files via the API on pull_request events.
+      pull-requests: read
     outputs:
       smoke_versions: ${{ steps.plan.outputs.smoke_versions }}
       run_full: ${{ steps.plan.outputs.run_full }}
       run_realapps: ${{ steps.plan.outputs.run_realapps }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590  # v3
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: filter
         with:
           # The surfaces whose changes can break version-banded augmentation. A change here
@@ -62,6 +94,8 @@ jobs:
               - '.github/workflows/node-matrix.yml'
       - id: plan
         shell: bash
+        env:
+          AUG_CHANGED: ${{ steps.filter.outputs.aug }}
         run: |
           set -euo pipefail
           run_full=false; run_realapps=false
@@ -71,30 +105,47 @@ jobs:
           smoke='["22.12","22.15","22.16","24.11","26"]'
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             run_full=true; run_realapps=true
-          elif [[ "${{ steps.filter.outputs.aug }}" == "true" ]]; then
+          elif [[ "$AUG_CHANGED" == "true" ]]; then
             # A PR touching the augmentation surface gets the full version sweep + real apps.
             run_full=true; run_realapps=true
           fi
           if [[ "$run_full" == "true" ]]; then
-            # FULL sweep: tier boundaries + Node-fix points across every live line.
-            smoke='["18.19","20.19","22.12","22.15","22.16","23.6","23.11","24.1","24.11","24.12","25.0","25.2","26"]'
+            # FULL sweep: tier boundaries + Node-fix points across every live line, plus
+            # "latest" — floats to the newest release INCLUDING a brand-new major, so the
+            # nightly trips the day a future Node drops a flag nub injects on an open-ended
+            # band (e.g. --experimental-import-text: injected on every spawn >=26.5, so a
+            # removal exit-9s the whole leg). Redundant with "26" until 27 ships; that's fine.
+            smoke='["18.19","20.19","22.12","22.15","22.16","23.6","23.11","24.1","24.11","24.12","25.0","25.2","26","latest"]'
           fi
           {
             echo "smoke_versions=$smoke"
             echo "run_full=$run_full"
             echo "run_realapps=$run_realapps"
           } >> "$GITHUB_OUTPUT"
-          echo "event=${{ github.event_name }} aug=${{ steps.filter.outputs.aug }} run_full=$run_full smoke=$smoke"
+          echo "event=${{ github.event_name }} aug=$AUG_CHANGED run_full=$run_full smoke=$smoke"
 
   # Build nub + the native addon ONCE; publish as an artifact the matrix legs reuse.
   build:
     name: Build nub (once)
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable # zizmor: ignore[impostor-commit,ref-version-mismatch] dtolnay force-pushes its version tags, so pinned SHAs go unreachable; commit verified genuine upstream
+      # Stable shared-key (restore main's warm cache on PR); save-if:main → PRs
+      # read-only. Same debug nub-cli + nub-native footprint as ci.yml's build legs.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          shared-key: node-matrix
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            .
+            crates/nub-native
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: "24"
@@ -127,17 +178,51 @@ jobs:
   smoke:
     name: Smoke (node ${{ matrix.node }})
     needs: [plan, build]
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         node: ${{ fromJSON(needs.plan.outputs.smoke_versions) }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
-          node-version: ${{ matrix.node }}
+          persist-credentials: false
+      # setup-node takes "latest" literally, prerelease included: index.json listed
+      # v27.0.0-alpha.0.0.0 first on 2026-10-29, which nub rightly refuses for the
+      # fixture's ">=18", so the leg ran 26.13.0 and failed its version check.
+      # `--retry-all-errors` because plain `--retry` skips DNS failures and connection
+      # resets, the same blips the setup-node retry below exists for.
+      - name: Resolve "latest" to the newest release
+        id: node
+        shell: bash
+        env:
+          NODE_SPEC: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          version="$NODE_SPEC"
+          if [[ "$version" == "latest" ]]; then
+            version=$(curl -fsSL --retry 3 --retry-all-errors https://nodejs.org/dist/index.json \
+              | jq -er '[.[] | select(.version | contains("-") | not)][0].version')
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # actions/node-versions publishes no 23.x or 25.x, so four of these legs (23.6, 23.11,
+      # 25.0, 25.2) miss the manifest and setup-node fetches nodejs.org/dist/index.json live
+      # on every run. That request retries only on 502/503/504 (@actions/http-client), so a
+      # DNS timeout or connection reset fails the leg outright (nubjs/nub#585, upstream
+      # actions/setup-node#1136). One retry turns that red back into the blip it is.
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        id: setup-node
+        continue-on-error: true
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
+        if: steps.setup-node.outcome == 'failure'
+        with:
+          node-version: ${{ steps.node.outputs.version }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: nub-bundle
@@ -159,9 +244,11 @@ jobs:
   real-apps:
     name: Real apps (node ${{ matrix.node }})
     needs: [plan, build]
-    if: ${{ needs.plan.outputs.run_realapps == 'true' }}
+    if: (github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full') && (needs.plan.outputs.run_realapps == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -170,7 +257,9 @@ jobs:
         # a curated subset rather than the full version list.
         node: ["22.16", "24.11", "24.12", "26"]
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: ${{ matrix.node }}
@@ -194,16 +283,44 @@ jobs:
   node-matrix-gate:
     name: Node matrix gate
     needs: [smoke, real-apps]
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full')
     runs-on: ubuntu-latest
+    permissions:
+      # The `needs.*.result` rollup collapses all 14 smoke legs into one word, so a red
+      # here used to say only "smoke failed" (nubjs/nub#585).
+      actions: read  # this run's own job list, so a red gate names the leg that failed
     steps:
       - shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           smoke='${{ needs.smoke.result }}'
           apps='${{ needs.real-apps.result }}'
           echo "smoke=$smoke real-apps=$apps"
           # A skipped leg (PR that didn't trigger it) is fine; a failure is not.
-          [[ "$smoke" == "success" || "$smoke" == "skipped" ]] || { echo "smoke failed"; exit 1; }
-          [[ "$apps"  == "success" || "$apps"  == "skipped" ]] || { echo "real-apps failed"; exit 1; }
-          echo "node matrix gate: OK"
+          #
+          # `cancelled` is also fine, and leaving it out painted main red: this job is
+          # `if: always()`, so it still runs when the RUN was cancelled, and the concurrency
+          # group is cancel-in-progress, so every merge cancels the previous push's run. The
+          # legs report `cancelled`, and this gate turned that into a permanent failed check
+          # on a commit whose code was fine. Accepting `cancelled` cannot mask a real failure:
+          # a leg that genuinely fails aggregates to `failure`, not `cancelled`, even when
+          # fail-fast cancels its siblings.
+          #
+          # Do NOT write a GitHub expression literally in this comment. Actions expands
+          # `${...}`-style template syntax inside a `run:` block BEFORE the shell runs,
+          # comments included, so naming the group inline is a real template injection and
+          # zizmor fails the build for it.
+          ok() { [[ "$1" == "success" || "$1" == "skipped" || "$1" == "cancelled" ]]; }
+          if ok "$smoke" && ok "$apps"; then
+            echo "node matrix gate: OK"
+            exit 0
+          fi
+          echo "::error::Node matrix red: smoke=$smoke real-apps=$apps. Failing legs:"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+            --paginate --jq '.jobs[]
+              | select(.conclusion != null and .conclusion != "success"
+                       and .conclusion != "skipped" and .conclusion != "cancelled")
+              | "  \(.conclusion)\t\(.name)\t\(.html_url)"' || echo "  (job list unavailable)"
+          exit 1

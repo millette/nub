@@ -11,15 +11,62 @@ use super::yarnrc;
 /// the file is read on every load and its auth tokens merged into the
 /// user-scope config).
 ///
-/// This is a GLOBAL / user-scope pnpm-named file, so it is gated by
+/// This is a global / user-scope pnpm-named file, so it is gated by
 /// `read_pnpm_global_config` — NOT by the project-derived
-/// `read_branded_pnpm_config`. Global config has no project incumbent, so an
-/// embedder whose global config is its own neutral surface (e.g. nub) clears
-/// `read_pnpm_global_config` UNCONDITIONALLY and this file is never read,
-/// regardless of the cwd's incumbent PM. The `.npmrc` / `npmrcAuthFile`
-/// sources are unaffected; only the pnpm-named `auth.ini` is gated.
+/// `read_branded_pnpm_config`. The two postures are separate because these
+/// files are loaded by different readers; an embedder may still derive both
+/// from project identity. Nub enables this one only under a provable
+/// pnpm-v11+ incumbent. The `.npmrc` / `npmrcAuthFile` sources are unaffected;
+/// only the pnpm-named `auth.ini` is gated.
 fn pnpm_auth_ini_enabled() -> bool {
     aube_util::engine_context().read_pnpm_global_config
+}
+
+/// pnpm 11's `.npmrc` key allowlist (`isNpmrcReadableKey`, pnpm
+/// `config/reader/src/localConfig.ts:189-198`): under a pnpm-11 incumbent a
+/// project/user `.npmrc` contributes ONLY auth/registry/network keys to the
+/// settings view; every layout/behavior key is dropped (its home is
+/// `pnpm-workspace.yaml`/`config.yaml`). Matched on the key exactly as pnpm
+/// spells it — note `no-proxy` (hyphen) is allowlisted while npm's `noproxy`
+/// is not.
+fn is_pnpm11_npmrc_readable_key(key: &str) -> bool {
+    key.starts_with('@')
+        || key.starts_with("//")
+        || matches!(
+            key,
+            // NPM_AUTH_SETTINGS
+            "ca" | "cafile" | "cert" | "key" | "registry" | "_auth" | "_authToken" | "_password"
+            | "email" | "username"
+            // NETWORK_INI_KEYS
+            | "https-proxy" | "proxy" | "no-proxy" | "http-proxy" | "local-address" | "strict-ssl"
+        )
+}
+
+/// Apply pnpm 11's `.npmrc` settings allowlist when the embedder profile
+/// requests it ([`aube_util::EngineContext::npmrc_settings_allowlist`]);
+/// otherwise return the entries untouched — the open key space that is
+/// standalone aube's default (pnpm ≤10 / npm semantics). Gates the
+/// settings-facing `.npmrc` readers only; the registry-client auth track walks
+/// `.npmrc` on its own path and keeps every auth key regardless, so this never
+/// affects auth resolution.
+fn apply_npmrc_settings_allowlist(entries: Vec<(String, String)>) -> Vec<(String, String)> {
+    let ctx = aube_util::engine_context();
+    if !ctx.npmrc_settings_allowlist {
+        return entries;
+    }
+    // The allowlist drops layout keys only because pnpm 11 takes them from the
+    // workspace YAML instead. An embedder that also refuses the YAML as a
+    // layout source (`read_layout_from_workspace_yaml = false`) would otherwise
+    // be left with no config file at all for its own layout axis, so the two
+    // postures move together.
+    let keep_layout = !ctx.read_layout_from_workspace_yaml;
+    entries
+        .into_iter()
+        .filter(|(k, _)| {
+            is_pnpm11_npmrc_readable_key(k)
+                || (keep_layout && aube_settings::is_layout_npmrc_key(k))
+        })
+        .collect()
 }
 
 impl NpmConfig {
@@ -79,6 +126,7 @@ impl NpmConfig {
         // Feed tagged entries so `apply_tagged` can reject
         // high-privilege settings sourced from untrusted locations.
         let xdg = aube_util::env::xdg_config_home();
+        let local_app_data = aube_util::env::local_app_data();
         let home = home_dir();
         // `NPM_CONFIG_USERCONFIG` / `npm_config_userconfig` move the
         // user-level `.npmrc` off the default `$HOME/.npmrc`. npm and
@@ -95,6 +143,7 @@ impl NpmConfig {
         let tagged = load_npmrc_entries_tagged_with_globals(
             home.as_deref(),
             xdg.as_deref(),
+            local_app_data.as_deref(),
             project_dir,
             user_rc_override.as_deref(),
             &global_paths,
@@ -154,6 +203,7 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
         return hit.clone();
     }
     let xdg = aube_util::env::xdg_config_home();
+    let local_app_data = aube_util::env::local_app_data();
     let home = home_dir();
     let user_rc_override =
         userconfig_env_value().and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
@@ -161,6 +211,7 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
     let tagged = load_npmrc_entries_tagged_with_globals(
         home.as_deref(),
         xdg.as_deref(),
+        local_app_data.as_deref(),
         project_dir,
         user_rc_override.as_deref(),
         &global_paths,
@@ -199,6 +250,11 @@ pub fn load_npmrc_entries_split(project_dir: &Path) -> SplitNpmrcEntries {
     }
     split.project.extend(yarn_env);
     split.project.extend(bun_env);
+    // pnpm-11 incumbent: the settings view of `.npmrc` is the auth/registry
+    // allowlist only (applied to BOTH user and project scope, matching pnpm 11,
+    // which drops layout keys from `~/.npmrc` as well as the project file).
+    split.user = apply_npmrc_settings_allowlist(split.user);
+    split.project = apply_npmrc_settings_allowlist(split.project);
     if let Ok(mut map) = cache.lock() {
         map.insert(key, split.clone());
     }
@@ -219,6 +275,7 @@ pub struct SplitNpmrcEntries {
 /// project files that can block or be attacker-controlled.
 pub fn load_user_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
     let xdg = aube_util::env::xdg_config_home();
+    let local_app_data = aube_util::env::local_app_data();
     let home = home_dir();
     let user_rc_override =
         userconfig_env_value().and_then(|raw| expand_userconfig_path(&raw, home.as_deref()));
@@ -226,6 +283,7 @@ pub fn load_user_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
     let mut tagged = load_user_npmrc_entries_tagged(
         home.as_deref(),
         xdg.as_deref(),
+        local_app_data.as_deref(),
         project_dir,
         user_rc_override.as_deref(),
         &global_paths,
@@ -301,6 +359,7 @@ pub fn load_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
     // explicit override so tests don't inherit the developer's real
     // `XDG_CONFIG_HOME` and pick up whatever auth tokens live there.
     let xdg = aube_util::env::xdg_config_home();
+    let local_app_data = aube_util::env::local_app_data();
     let home = home_dir();
     // `*_CONFIG_USERCONFIG` relocates the user-level `.npmrc` (XDG
     // layouts, `~/.config/npm/npmrc`, etc.). Read directly rather than
@@ -315,6 +374,7 @@ pub fn load_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
     let tagged = load_npmrc_entries_tagged_with_globals(
         home.as_deref(),
         xdg.as_deref(),
+        local_app_data.as_deref(),
         project_dir,
         user_rc_override.as_deref(),
         &global_paths,
@@ -334,10 +394,12 @@ pub fn load_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
                 .map(|(k, v)| (NpmrcSource::Env, k, v)),
         );
     }
-    let entries = tagged
-        .into_iter()
-        .map(|(_, k, v)| (k, v))
-        .collect::<Vec<_>>();
+    let entries = apply_npmrc_settings_allowlist(
+        tagged
+            .into_iter()
+            .map(|(_, k, v)| (k, v))
+            .collect::<Vec<_>>(),
+    );
     if let Ok(mut map) = cache.lock() {
         map.insert(key, entries.clone());
     }
@@ -347,7 +409,11 @@ pub fn load_npmrc_entries(project_dir: &Path) -> Vec<(String, String)> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct NpmrcCacheKey {
     project_dir: PathBuf,
+    invocation_dir: Option<PathBuf>,
     read_branded_pnpm_config: bool,
+    read_pnpm_config_env_registry: bool,
+    npmrc_settings_allowlist: bool,
+    workspace_npmrc: aube_util::WorkspaceNpmrc,
     read_yarn_config: bool,
     synthetic_user_npmrc_entries: Vec<(String, String)>,
     synthetic_project_npmrc_entries: Vec<(String, String)>,
@@ -369,7 +435,11 @@ fn npmrc_cache_key(project_dir: &Path) -> NpmrcCacheKey {
     };
     NpmrcCacheKey {
         project_dir: project_dir.to_path_buf(),
+        invocation_dir: invocation_dir(&ctx),
         read_branded_pnpm_config: ctx.read_branded_pnpm_config,
+        read_pnpm_config_env_registry: ctx.read_pnpm_config_env_registry,
+        npmrc_settings_allowlist: ctx.npmrc_settings_allowlist,
+        workspace_npmrc: ctx.workspace_npmrc,
         read_yarn_config: ctx.read_yarn_config,
         synthetic_user_npmrc_entries: ctx.synthetic_user_npmrc_entries,
         synthetic_project_npmrc_entries: ctx.synthetic_project_npmrc_entries,
@@ -414,6 +484,10 @@ pub(super) fn load_npmrc_entries_tagged_with_home(
     load_npmrc_entries_tagged_with_globals(
         home,
         xdg_config_home,
+        // Derived, not a parameter: isolation is the whole point of this
+        // shim, so no fixture should be able to forget to pass it and
+        // silently read the developer's real `%LOCALAPPDATA%` (nub#605).
+        home.map(test_local_app_data).as_deref(),
         project_dir,
         user_rc_override,
         &GlobalNpmrcPaths::default(),
@@ -431,6 +505,7 @@ pub(super) fn load_npmrc_entries_tagged_with_home(
 pub(super) fn load_npmrc_entries_tagged_with_globals(
     home: Option<&Path>,
     xdg_config_home: Option<&Path>,
+    local_app_data: Option<&Path>,
     project_dir: &Path,
     user_rc_override: Option<&Path>,
     global_paths: &GlobalNpmrcPaths,
@@ -491,19 +566,16 @@ pub(super) fn load_npmrc_entries_tagged_with_globals(
     {
         out.extend(entries.into_iter().map(|(k, v)| (NpmrcSource::User, k, v)));
     }
-    if let Some(home) = home
-        && pnpm_auth_ini_enabled()
+    if pnpm_auth_ini_enabled()
+        && let Some(auth_ini) = pnpm_global_auth_ini_path(home, xdg_config_home, local_app_data)
+        && auth_ini.exists()
+        && let Ok(entries) = parse_npmrc(&auth_ini)
     {
-        let auth_ini = pnpm_global_auth_ini_path(home, xdg_config_home);
-        if auth_ini.exists()
-            && let Ok(entries) = parse_npmrc(&auth_ini)
-        {
-            out.extend(
-                entries
-                    .into_iter()
-                    .map(|(k, v)| (NpmrcSource::PnpmAuth, k, v)),
-            );
-        }
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::PnpmAuth, k, v)),
+        );
     }
     if let Some((auth_path, auth_source)) = resolve_npmrc_auth_file_tagged(home, project_dir, &out)
         && !auth_source.is_project_controlled()
@@ -516,17 +588,11 @@ pub(super) fn load_npmrc_entries_tagged_with_globals(
                 .map(|(k, v)| (NpmrcSource::UserNpmrcAuthFile, k, v)),
         );
     }
-    let project_rc = project_dir.join(".npmrc");
-    if project_rc.exists()
-        && !is_same_npmrc_file(&project_rc, user_rc.as_deref())
-        && let Ok(entries) = parse_npmrc_untrusted(&project_rc)
-    {
-        out.extend(
-            entries
-                .into_iter()
-                .map(|(k, v)| (NpmrcSource::Project, k, v)),
-        );
-    }
+    out.extend(
+        read_project_npmrc_layers(project_dir, user_rc.as_deref())
+            .into_iter()
+            .map(|(k, v)| (NpmrcSource::Project, k, v)),
+    );
     if let Some((auth_path, auth_source)) = resolve_npmrc_auth_file_tagged(home, project_dir, &out)
         && auth_source.is_project_controlled()
         && !is_same_npmrc_file(&auth_path, user_rc.as_deref())
@@ -545,6 +611,7 @@ pub(super) fn load_npmrc_entries_tagged_with_globals(
 fn load_user_npmrc_entries_tagged(
     home: Option<&Path>,
     xdg_config_home: Option<&Path>,
+    local_app_data: Option<&Path>,
     project_dir: &Path,
     user_rc_override: Option<&Path>,
     global_paths: &GlobalNpmrcPaths,
@@ -586,19 +653,16 @@ fn load_user_npmrc_entries_tagged(
     {
         out.extend(entries.into_iter().map(|(k, v)| (NpmrcSource::User, k, v)));
     }
-    if let Some(home) = home
-        && pnpm_auth_ini_enabled()
+    if pnpm_auth_ini_enabled()
+        && let Some(auth_ini) = pnpm_global_auth_ini_path(home, xdg_config_home, local_app_data)
+        && auth_ini.exists()
+        && let Ok(entries) = parse_npmrc(&auth_ini)
     {
-        let auth_ini = pnpm_global_auth_ini_path(home, xdg_config_home);
-        if auth_ini.exists()
-            && let Ok(entries) = parse_npmrc(&auth_ini)
-        {
-            out.extend(
-                entries
-                    .into_iter()
-                    .map(|(k, v)| (NpmrcSource::PnpmAuth, k, v)),
-            );
-        }
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(k, v)| (NpmrcSource::PnpmAuth, k, v)),
+        );
     }
     if let Some((auth_path, _auth_source)) = resolve_npmrc_auth_file_tagged(home, project_dir, &out)
         && auth_path.exists()
@@ -626,17 +690,11 @@ fn load_project_npmrc_entries_tagged(
             .map(|(k, v)| (NpmrcSource::Project, k, v)),
     );
     let user_rc = resolve_user_rc_path(home);
-    let project_rc = project_dir.join(".npmrc");
-    if project_rc.exists()
-        && !is_same_npmrc_file(&project_rc, user_rc.as_deref())
-        && let Ok(entries) = parse_npmrc_untrusted(&project_rc)
-    {
-        out.extend(
-            entries
-                .into_iter()
-                .map(|(k, v)| (NpmrcSource::Project, k, v)),
-        );
-    }
+    out.extend(
+        read_project_npmrc_layers(project_dir, user_rc.as_deref())
+            .into_iter()
+            .map(|(k, v)| (NpmrcSource::Project, k, v)),
+    );
     if let Some((auth_path, _auth_source)) = resolve_npmrc_auth_file_tagged(home, project_dir, &out)
         && auth_path.exists()
         && !is_same_npmrc_file(&auth_path, user_rc.as_deref())
@@ -647,6 +705,98 @@ fn load_project_npmrc_entries_tagged(
                 .into_iter()
                 .map(|(k, v)| (NpmrcSource::ProjectNpmrcAuthFile, k, v)),
         );
+    }
+    out
+}
+
+/// The project-scope `.npmrc` directories for `project_dir`, lowest
+/// precedence first.
+///
+/// Inside a workspace, project config belongs to the workspace and to the
+/// invocation, not to whichever member a command happens to target: npm,
+/// pnpm, Yarn 1 and Bun all read the workspace root's `.npmrc` (where a
+/// monorepo declares its registry, scoped registries and auth), and none
+/// reads a member's file when invoked from elsewhere (`--filter`, `-r`).
+/// pnpm 10 and Yarn 1 additionally layer the `.npmrc` of the package the
+/// command was run from on top; pnpm 11, npm and Bun do not. The embedder
+/// picks that per incumbent ([`aube_util::WorkspaceNpmrc`]). A caller that
+/// hands the engine a member path with no invocation inside the workspace
+/// (no recorded invocation dir, and a process cwd elsewhere) gets the target
+/// itself as the invoking package, the way `pnpm -C <dir>` makes `<dir>` the
+/// local prefix. Outside a workspace this is just `project_dir`.
+fn project_npmrc_dirs(project_dir: &Path) -> Vec<PathBuf> {
+    let Some(root) = aube_manifest::workspace::find_workspace_root(project_dir) else {
+        return vec![project_dir.to_path_buf()];
+    };
+    let ctx = aube_util::engine_context();
+    let invoked_from = match ctx.workspace_npmrc {
+        aube_util::WorkspaceNpmrc::RootOnly => None,
+        aube_util::WorkspaceNpmrc::RootBeneathMember => {
+            match invocation_dir(&ctx).and_then(|dir| within(&dir, &root)) {
+                Some((dir, root)) => package_dir_below_root(&dir, &root),
+                None => within(project_dir, &root)
+                    .filter(|(dir, root)| dir != root)
+                    .map(|_| project_dir.to_path_buf()),
+            }
+        }
+    };
+    let mut dirs = vec![root];
+    dirs.extend(invoked_from);
+    dirs
+}
+
+fn invocation_dir(ctx: &aube_util::EngineContext) -> Option<PathBuf> {
+    ctx.invocation_dir
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+}
+
+/// `dir` and `root` in one spelling, when `dir` is `root` or inside it.
+fn within(dir: &Path, root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let (dir, root) = if dir.starts_with(root) {
+        (dir.to_path_buf(), root.to_path_buf())
+    } else {
+        (dir.canonicalize().ok()?, root.canonicalize().ok()?)
+    };
+    dir.starts_with(&root).then_some((dir, root))
+}
+
+/// The nearest directory at or above `dir` holding a `package.json`, strictly
+/// inside the workspace `root` (pnpm's "local prefix"). Both come from [`within`].
+fn package_dir_below_root(dir: &Path, root: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .take_while(|d| *d != root)
+        .find(|d| d.join("package.json").is_file())
+        .map(Path::to_path_buf)
+}
+
+/// Read every project-scope `.npmrc` from [`project_npmrc_dirs`], untrusted,
+/// skipping one that is the user rc itself. A relative `npmrc-auth-file` in a
+/// file outside `project_dir` is anchored to that file's directory here, since
+/// the shared resolver anchors relative paths to `project_dir`.
+fn read_project_npmrc_layers(project_dir: &Path, user_rc: Option<&Path>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for dir in project_npmrc_dirs(project_dir) {
+        let rc = dir.join(".npmrc");
+        if !rc.exists() || is_same_npmrc_file(&rc, user_rc) {
+            continue;
+        }
+        let Ok(entries) = parse_npmrc_untrusted(&rc) else {
+            continue;
+        };
+        let anchor_auth_file = dir != project_dir;
+        out.extend(entries.into_iter().map(|(k, v)| {
+            if anchor_auth_file
+                && matches!(k.as_str(), "npmrcAuthFile" | "npmrc-auth-file")
+                && !v.starts_with('~')
+                && Path::new(&v).is_relative()
+            {
+                let anchored = dir.join(&v).to_string_lossy().into_owned();
+                (k, anchored)
+            } else {
+                (k, v)
+            }
+        }));
     }
     out
 }
@@ -940,17 +1090,46 @@ fn resolve_global_npmrc_paths_from_std_env() -> GlobalNpmrcPaths {
 /// [`load_npmrc_entries`]; tests inject an override or `None`) the file
 /// lives at `<xdg>/pnpm/auth.ini` on every OS; otherwise it follows the
 /// platform default — macOS `~/Library/Preferences/pnpm`, Windows
-/// `%LOCALAPPDATA%\pnpm\config`, Linux `~/.config/pnpm`. A flat
+/// `<local_app_data>\pnpm\config`, Linux `~/.config/pnpm`. A flat
 /// `~/.config/pnpm` is correct only on Linux, so the previous
 /// home-joined fallback read the wrong location on a stock macOS or
 /// Windows box and silently missed the user's `auth.ini` there.
-fn pnpm_global_auth_ini_path(home: &Path, xdg_config_home: Option<&Path>) -> PathBuf {
-    let config_dir = aube_util::env::pnpm_config_dir_with(Some(home), xdg_config_home)
-        // `home` is always `Some` at every call site (guarded by
-        // `if let Some(home) = home`), so the helper only returns `None`
-        // when both home and XDG are absent — impossible here. Keep a
-        // defined fallback rather than unwrap so a future caller change
-        // can't panic.
-        .unwrap_or_else(|| home.join(".config").join("pnpm"));
-    config_dir.join("auth.ini")
+///
+/// `local_app_data` is the Windows root, injected for the same reason
+/// `home` is: production reads `%LOCALAPPDATA%`, tests pin a tempdir. It
+/// is inert on every other platform.
+///
+/// `None` means no config dir resolves at all — no XDG root, no home, and
+/// (on Windows) no local-app-data root — so there is no `auth.ini` to
+/// read. Guarding on the config dir rather than on `home` is what keeps
+/// this matching pnpm, whose Windows branch reads `%LOCALAPPDATA%`
+/// without consulting a home directory at all.
+fn pnpm_global_auth_ini_path(
+    home: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> Option<PathBuf> {
+    aube_util::env::pnpm_config_dir_with(home, xdg_config_home, local_app_data)
+        .map(|dir| dir.join("auth.ini"))
+}
+
+/// The `%LOCALAPPDATA%`-equivalent root the `*_with_home` test loaders
+/// pin under an injected tempdir home. A real Windows profile puts it at
+/// `<home>\AppData\Local`, so mirroring that keeps the Windows branch of
+/// [`aube_util::env::pnpm_config_dir_with`] genuinely under test instead
+/// of routing every fixture to the `~/.config` fallback a `None` would
+/// select — while staying inside the tempdir.
+#[cfg(test)]
+pub(super) fn test_local_app_data(home: &Path) -> PathBuf {
+    home.join("AppData").join("Local")
+}
+
+/// The `auth.ini` path the `*_with_home` test loaders read for a given
+/// tempdir `$HOME` and no XDG override. Fixture writers compose their
+/// path through this rather than by hand, so the write and the read can
+/// never drift apart on a platform nobody ran the suite on (nub#605).
+#[cfg(test)]
+pub(super) fn test_pnpm_global_auth_ini_path(home: &Path) -> PathBuf {
+    pnpm_global_auth_ini_path(Some(home), None, Some(&test_local_app_data(home)))
+        .expect("a home is given, so every platform branch resolves")
 }

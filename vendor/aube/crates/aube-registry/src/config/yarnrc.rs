@@ -84,7 +84,7 @@ fn load_project_yarnrc_entries_with_home(
 /// (root→child order) into the single concatenated list the settings layer
 /// reads.
 ///
-/// Scalar settings (registry/auth/nodeLinker) stay concatenated in order so the
+/// Scalar settings (registry/auth) stay concatenated in order so the
 /// settings reader's last-one-wins (`entries.iter().rev()`) keeps the nearest
 /// file winning. `packageExtensions` is the exception: it is a map-typed
 /// setting, and the settings reader is single-file last-wins, so emitting one
@@ -130,7 +130,6 @@ pub(super) fn yarn_env_entries_from(env: &[(String, String)]) -> Vec<(String, St
             Some("npmRegistryServer") => config.npm_registry_server = Some(value.clone()),
             Some("npmAuthToken") => config.npm_auth_token = Some(value.clone()),
             Some("npmAuthIdent") => config.npm_auth_ident = Some(value.clone()),
-            Some("nodeLinker") => config.node_linker = Some(value.clone()),
             // Yarn Berry resolves env vars with `camelcase(name)` to a flat
             // top-level setting key (`getEnvironmentSettings`), so only the
             // top-level network/TLS settings have a well-defined env spelling.
@@ -331,7 +330,12 @@ struct YarnRc {
     // key (top-level here, `//host/:always-auth` per-registry, or scoped
     // via the owning scope's registry). See `into_entries`.
     npm_always_auth: Option<bool>,
-    node_linker: Option<String>,
+    // `nodeLinker` is absent on purpose. node_modules LAYOUT is outside the
+    // compatibility guarantee (version resolution, module resolution, the
+    // lockfile), so a Yarn-branded file never directs how the tree is
+    // arranged. Yarn PnP is a separate concern the embedder handles by reading
+    // `.yarnrc.yml` itself and refusing the install — a `node_modules` tree is
+    // not a PnP tree, so there is nothing to translate either way.
     // Top-level network/TLS settings. Yarn Berry expresses the CA bundle
     // as a *file path* (`httpsCaFilePath`) and the proxies as plain URLs
     // (`httpProxy` / `httpsProxy`), which map 1:1 onto the npmrc-shaped
@@ -382,6 +386,19 @@ struct YarnRc {
     // platform filter. Captured as a generic `serde_json::Value` so the
     // arrays round-trip untouched.
     supported_architectures: Option<serde_json::Value>,
+    // Yarn Berry's supply-chain min-release-age gate (`npmMinimalAgeGate`, a
+    // DURATION whose declared unit is MINUTES — plugin-npm
+    // `scopablePackageGateSettings`) and its allowlist
+    // (`npmPreapprovedPackages`, an array of package descriptors / name globs).
+    // Mapped onto the engine's `minimumReleaseAge` (also minutes) +
+    // `minimumReleaseAgeExclude` — the SAME gate nub reads from npmrc/pnpm/bun
+    // config. Only honored when the user set them explicitly: yarn's `1d`
+    // default is yarn's, not nub's, so an unset gate stays unset (no entry
+    // emitted). Captured as a generic `Value` because a duration may be written
+    // either as a unit string (`"7d"`) or a bare number of minutes (`1440`).
+    npm_minimal_age_gate: Option<serde_json::Value>,
+    #[serde(default)]
+    npm_preapproved_packages: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -514,16 +531,6 @@ impl YarnRc {
             }
         }
 
-        if let Some(linker) = self.node_linker.as_deref().map(str::trim) {
-            match linker.to_ascii_lowercase().as_str() {
-                "node-modules" => push(&mut out, "nodeLinker", "hoisted"),
-                "pnpm" => push(&mut out, "nodeLinker", "isolated"),
-                // PnP generation is out of scope. Leave it to nub's existing
-                // Yarn-PnP warning/refusal path instead of pretending support.
-                _ => {}
-            }
-        }
-
         // Top-level network/TLS settings → npmrc-shaped keys. These flow
         // through the same `apply_tagged` consumer the `.npmrc` path uses, so
         // they inherit the existing trust gate: a *project* `.yarnrc.yml`
@@ -606,8 +613,86 @@ impl YarnRc {
             push(&mut out, "supportedArchitectures", json);
         }
 
+        // Supply-chain age gate. Honor ONLY an explicit user value — never
+        // impose yarn's `1d` default (that default belongs to yarn, not nub).
+        if let Some(minutes) = self
+            .npm_minimal_age_gate
+            .as_ref()
+            .and_then(parse_yarn_duration_minutes)
+        {
+            push(&mut out, "minimumReleaseAge", minutes.to_string());
+        }
+        // `npmPreapprovedPackages` → `minimumReleaseAgeExclude`. Yarn's entries
+        // are package descriptors / name-glob patterns; pass them verbatim
+        // (comma-joined) the same way the bun reader forwards
+        // `minimumReleaseAgeExcludes` — the engine's exclude matcher consumes
+        // the list, and an entry it can't interpret simply doesn't match.
+        let excludes: Vec<&str> = self
+            .npm_preapproved_packages
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !excludes.is_empty() {
+            push(&mut out, "minimumReleaseAgeExclude", excludes.join(","));
+        }
+
         out
     }
+}
+
+/// Parse a Yarn Berry `npmMinimalAgeGate` value into the engine's
+/// `minimumReleaseAge` unit (MINUTES). Yarn declares the setting as a DURATION
+/// with `unit: MINUTES`, so a unitless number is already minutes; a unit suffix
+/// (`ms`/`s`/`m`/`h`/`d`/`w`) is converted to minutes the same way Yarn's
+/// `parseDuration` does (`miscUtils.parseDuration`: value→ms via the unit
+/// table, then ÷ the target unit's ms). A value may arrive as a YAML number
+/// (bare minutes) or a string (`"7d"`).
+///
+/// Rounds UP to a whole minute so a small sub-minute gate (`"30s"`) never
+/// collapses to 0 and silently disables a security control — matching the
+/// bunfig reader's ceiling-division rationale. Returns `None` for an
+/// unparseable / negative value (the gate is then simply not applied, rather
+/// than emitting a malformed entry).
+fn parse_yarn_duration_minutes(value: &serde_json::Value) -> Option<u64> {
+    // ms per unit, mirroring Yarn's `DURATION_UNITS`.
+    fn unit_ms(unit: &str) -> Option<f64> {
+        Some(match unit {
+            "ms" => 1.0,
+            "s" => 1_000.0,
+            "m" => 60_000.0,
+            "h" => 3_600_000.0,
+            "d" => 86_400_000.0,
+            "w" => 604_800_000.0,
+            _ => return None,
+        })
+    }
+    const MS_PER_MINUTE: f64 = 60_000.0;
+
+    let minutes = match value {
+        // A bare YAML number is already minutes (Yarn's unitless path returns
+        // `parseFloat(num)` directly, interpreted in the setting's declared
+        // MINUTES unit).
+        serde_json::Value::Number(n) => n.as_f64()?,
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            // Split the trailing alphabetic unit, if any, off the numeric head.
+            let split = s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len());
+            let (num, unit) = s.split_at(split);
+            let num: f64 = num.trim().parse().ok()?;
+            if unit.is_empty() {
+                num
+            } else {
+                num * unit_ms(unit)? / MS_PER_MINUTE
+            }
+        }
+        _ => return None,
+    };
+    if !minutes.is_finite() || minutes < 0.0 {
+        return None;
+    }
+    // Ceiling to a whole minute (a sub-minute non-zero gate must not become 0).
+    Some(minutes.ceil() as u64)
 }
 
 /// Read a PEM file referenced by a Yarn `httpsCertFilePath` /
@@ -718,7 +803,6 @@ fn yarn_env_key(key: &str) -> Option<String> {
         "npm_registry_server" => Some("npmRegistryServer".to_string()),
         "npm_auth_token" => Some("npmAuthToken".to_string()),
         "npm_auth_ident" => Some("npmAuthIdent".to_string()),
-        "node_linker" => Some("nodeLinker".to_string()),
         "https_ca_file_path" => Some("httpsCaFilePath".to_string()),
         "http_proxy" => Some("httpProxy".to_string()),
         "https_proxy" => Some("httpsProxy".to_string()),

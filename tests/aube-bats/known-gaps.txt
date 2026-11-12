@@ -26,22 +26,24 @@ install.bats|aube install labels workspace dependency summaries by package name|
 # ── verbs / aliases / flags not wired yet ───────────────────────────────────
 install.bats|aube recursive install honors nested --frozen-lockfile|'recursive' verb staged (phase Surface)
 install.bats|aube recursive install honors nested --registry|'recursive' verb staged (phase Surface)
-install.bats|aube install --fix-lockfile is a no-op on a fresh lockfile|--fix-lockfile not wired
-install.bats|aube install --fix-lockfile preserves unchanged deps when new dep is added|--fix-lockfile not wired
-install.bats|aube install --fix-lockfile --lockfile-only is a no-op on a fresh lockfile|--fix-lockfile not wired
-install.bats|aube install --fix-lockfile --lockfile-only heals drift without linking|--fix-lockfile not wired
-install.bats|aube install --fix-lockfile conflicts with --frozen-lockfile|--fix-lockfile not wired
-install.bats|aube install --fix-lockfile conflicts with --no-frozen-lockfile|--fix-lockfile not wired
-install.bats|aube install --fix-lockfile conflicts with --prefer-frozen-lockfile|--fix-lockfile not wired
 install.bats|aube install --network-concurrency caps tarball fetches|--network-concurrency / --no-verify-store-integrity / --no-side-effects-cache not wired
 install.bats|aube install --lockfile-only conflicts with --frozen-lockfile|flag-conflict validation not wired
 ci.bats|aube clean-install is an alias for aube ci|clean-install alias not wired
+ci.bats|aube clean-install --enable-global-virtual-store overrides the CI default|clean-install alias not wired
 lockfile_dir.bats|aube install --lockfile-dir: writes lockfile to the named dir, not the project root|--lockfile-dir not wired
 lockfile_dir.bats|aube install --lockfile-dir: importer key is the project's relative path|--lockfile-dir not wired
 lockfile_dir.bats|aube install --lockfile-dir: creates the target directory if missing|--lockfile-dir not wired
 lockfile_dir.bats|aube install --lockfile-dir: refuses to write a lockfile already used by another project|--lockfile-dir not wired
 lockfile_dir.bats|aube install --lockfile-dir: refuses to clobber a parent dir that is itself a project|--lockfile-dir not wired
 lockfile_dir.bats|aube install --lockfile-dir: warm install reads the relocated lockfile|--lockfile-dir not wired
+
+# ── install --dry-run not wired (new 1.25.x resolution-preview surface) ─────
+install.bats|aube install --dry-run resolves without writing lockfile or node_modules|install --dry-run not wired
+install.bats|aube install --dry-run --frozen-lockfile fails without lockfile|install --dry-run not wired
+install.bats|aube install --dry-run in CI resolves without lockfile|install --dry-run not wired
+install.bats|aube install --dry-run in CI resolves drifted lockfile|install --dry-run not wired
+install.bats|aube install --dry-run with fresh lockfile still reports skipped fetch and link|install --dry-run not wired
+lockfile_settings.bats|lockfile=false + --dry-run resolves without lockfile-only conflict|install --dry-run not wired
 
 # ── exit-code mapping ───────────────────────────────────────────────────────
 lockfile_settings.bats|lockfile tarball URLs are verified against registry metadata before fetch|expected failure exit not produced (engine exit-code mapping gap)

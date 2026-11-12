@@ -6,7 +6,6 @@
 //! service calls are made.
 
 use aube_lockfile::{DepType, DirectDep, LocalSource, LockedPackage, LockfileGraph};
-use clap::Args;
 use miette::{Context, IntoDiagnostic, miette};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,7 +33,7 @@ Examples:
   $ aube query ':bin' --json
 ";
 
-#[derive(Debug, Args)]
+#[derive(Debug, usage_rs::Args)]
 pub struct QueryArgs {
     /// Selector expression.
     ///
@@ -46,24 +45,19 @@ pub struct QueryArgs {
     pub selector: String,
 
     /// Only match devDependency roots and their transitive deps.
-    #[arg(short = 'D', long, conflicts_with = "prod")]
+    #[usage(short = 'D', long, conflicts = "--prod")]
     pub dev: bool,
 
     /// Only match production/optional roots and their transitive deps.
-    #[arg(
-        short = 'P',
-        long,
-        conflicts_with = "dev",
-        visible_alias = "production"
-    )]
+    #[usage(short = 'P', long, long = "production", conflicts = "--dev")]
     pub prod: bool,
 
     /// Emit a JSON array instead of the default text layout.
-    #[arg(long, conflicts_with = "parseable")]
+    #[usage(long, conflicts = "--parseable")]
     pub json: bool,
 
     /// Emit tab-separated rows: dep_path, name, version, source, flags.
-    #[arg(long)]
+    #[usage(long)]
     pub parseable: bool,
 }
 
@@ -127,14 +121,10 @@ fn selected_importers(
             root.display()
         ));
     }
-    let selected =
-        aube_workspace::selector::select_workspace_packages(root, &workspace_pkgs, filter)
-            .map_err(|e| miette!("invalid --filter selector: {e}"))?;
+    let selected = super::select_projects(root, &workspace_pkgs, filter, "query")?;
     if selected.is_empty() {
-        return Err(miette!(
-            "{}: filter {filter:?} did not match any workspace package",
-            aube_util::cmd("query")
-        ));
+        super::no_projects_matched(root, filter, super::NoMatchReport::Quiet)?;
+        return Ok(Some(BTreeSet::new()));
     }
 
     let mut importers = BTreeSet::new();

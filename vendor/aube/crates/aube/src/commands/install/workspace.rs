@@ -119,12 +119,8 @@ pub(super) fn filter_graph_to_workspace_selection(
     graph: &aube_lockfile::LockfileGraph,
     filters: &aube_workspace::selector::EffectiveFilter,
 ) -> miette::Result<aube_lockfile::LockfileGraph> {
-    let selected = aube_workspace::selector::select_workspace_packages(
-        workspace_root,
-        workspace_packages,
-        filters,
-    )
-    .map_err(|e| miette!("invalid --filter selector: {e}"))?;
+    let selected =
+        crate::commands::select_projects(workspace_root, workspace_packages, filters, "install")?;
     if selected.is_empty() {
         return Err(miette!(
             "{}: filter {filters:?} did not match any workspace package",
@@ -174,17 +170,59 @@ pub(super) fn per_project_write_selection(
     if workspace_filter.is_empty() {
         return Ok(None);
     }
-    let selected = aube_workspace::selector::select_workspace_packages(
+    let selected = crate::commands::select_projects(
         workspace_root,
         workspace_packages,
         workspace_filter,
-    )
-    .map_err(|e| miette!("invalid --filter selector: {e}"))?;
+        "install",
+    )?;
     let mut keys = std::collections::BTreeSet::new();
     for pkg in &selected {
         keys.insert(workspace_importer_path(workspace_root, &pkg.dir)?);
     }
     Ok(Some(keys))
+}
+
+/// The importers an install links, recorded in the install state as
+/// [`crate::state::InstallState::workspace_selection`]: the root and the
+/// selection for a `--filter` install
+/// ([`filter_graph_to_workspace_selection`]), the root alone for an
+/// unfiltered one under `recursiveInstall=false`, and `None` when it
+/// links every importer.
+pub(super) fn linked_workspace_selection(
+    per_project_write_selection: Option<&std::collections::BTreeSet<String>>,
+    links_every_importer: bool,
+) -> Option<std::collections::BTreeSet<String>> {
+    match per_project_write_selection {
+        Some(selected) => {
+            let mut linked = selected.clone();
+            linked.insert(".".to_string());
+            Some(linked)
+        }
+        None if links_every_importer => None,
+        None => Some(std::collections::BTreeSet::from([".".to_string()])),
+    }
+}
+
+/// The importers whose own lifecycle hooks this install runs, in
+/// `lifecycle_manifests` (dependency) order. A caller's explicit set wins.
+/// Otherwise a `--filter` narrows them to the selected members plus the
+/// root, whose hooks pnpm runs under any filter; with neither, every linked
+/// importer runs its hooks.
+pub(super) fn project_hook_importers(
+    lifecycle_manifests: &[(String, aube_manifest::PackageJson)],
+    requested: Option<&std::collections::BTreeSet<String>>,
+    filter_selection: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<(String, aube_manifest::PackageJson)> {
+    lifecycle_manifests
+        .iter()
+        .filter(|(importer, _)| match (requested, filter_selection) {
+            (Some(requested), _) => requested.contains(importer),
+            (None, Some(selected)) => importer == "." || selected.contains(importer),
+            (None, None) => true,
+        })
+        .cloned()
+        .collect()
 }
 
 pub(super) fn importer_project_dir(
@@ -205,6 +243,172 @@ pub(super) fn importer_project_dir(
     }
 }
 
+/// A local path the workspace graph holds relative to the workspace root,
+/// re-expressed relative to the member at `importer_path`. Worked out on the
+/// real directories, so a member outside the root (`../app`) gets a path that
+/// still names the same target.
+fn root_to_member(workspace_root: &Path, importer_path: &str, path: &Path) -> PathBuf {
+    let root = aube_util::path::normalize_lexical(workspace_root);
+    let target = aube_util::path::normalize_lexical(&root.join(path));
+    relative_or_original(&target, &importer_project_dir(&root, importer_path), path)
+}
+
+/// The inverse of [`root_to_member`].
+fn member_to_root(workspace_root: &Path, importer_path: &str, path: &Path) -> PathBuf {
+    let root = aube_util::path::normalize_lexical(workspace_root);
+    let target =
+        aube_util::path::normalize_lexical(&importer_project_dir(&root, importer_path).join(path));
+    relative_or_original(&target, &root, path)
+}
+
+fn relative_or_original(target: &Path, base: &Path, original: &Path) -> PathBuf {
+    if original.is_absolute() {
+        return original.to_path_buf();
+    }
+    match pathdiff::diff_paths(target, base) {
+        Some(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
+        Some(rel) => rel,
+        None => original.to_path_buf(),
+    }
+}
+
+/// The graph a per-project lockfile records for `importer_path`, in that
+/// project's frame as pnpm writes it under `sharedWorkspaceLockfile=false`:
+/// a sibling member is `link:<path from the project>`, and every `file:` /
+/// `link:` path is relative to the project rather than the workspace root.
+/// A bare subset knows neither: its sibling importers are gone, so a member
+/// dependency serialized as a registry version pnpm cannot find.
+fn project_lockfile_graph(
+    workspace_root: &Path,
+    graph: &aube_lockfile::LockfileGraph,
+    importer_path: &str,
+    workspace_manifests: &[(String, aube_manifest::PackageJson)],
+) -> Option<aube_lockfile::LockfileGraph> {
+    let mut subset = graph.subset_to_importer(importer_path, |_| true)?;
+    // A runtime pin belongs to the project whose manifest declares it.
+    if importer_path != "." {
+        let manifest = workspace_manifests
+            .iter()
+            .find(|(path, _)| path == importer_path)
+            .map(|(_, manifest)| manifest);
+        let pins = |name: &str| {
+            manifest
+                .and_then(|manifest| manifest.dev_engines.as_ref())
+                .is_some_and(|engines| engines.runtime.iter().any(|r| r.name == name))
+        };
+        subset.runtimes.retain(|name, _| pins(name));
+    }
+    // Same `name@version` match the shared-lockfile writer uses to spot a
+    // workspace member, including its `0.0.0` default for a versionless one.
+    let member_dirs: BTreeMap<String, &str> = workspace_manifests
+        .iter()
+        .filter(|(path, _)| path != ".")
+        .filter_map(|(path, manifest)| {
+            let name = manifest.name.as_deref()?;
+            let version = manifest.version.as_deref().unwrap_or("0.0.0");
+            Some((format!("{name}@{version}"), path.as_str()))
+        })
+        .collect();
+    let mut links = Vec::new();
+    for dep in subset.importers.values_mut().flatten() {
+        if subset.packages.contains_key(&dep.dep_path) {
+            continue;
+        }
+        let Some(member_dir) = member_dirs.get(&dep.dep_path) else {
+            continue;
+        };
+        let local = aube_lockfile::LocalSource::Link(PathBuf::from(member_dir));
+        dep.dep_path = local.dep_path(&dep.name);
+        links.push(aube_lockfile::LockedPackage {
+            name: dep.name.clone(),
+            version: "0.0.0".to_string(),
+            dep_path: dep.dep_path.clone(),
+            local_source: Some(local),
+            ..Default::default()
+        });
+    }
+    for pkg in links {
+        subset.packages.insert(pkg.dep_path.clone(), pkg);
+    }
+    if importer_path != "." {
+        subset.rebase_local_paths(|path| root_to_member(workspace_root, importer_path, path));
+    }
+    Some(subset)
+}
+
+/// A member's per-project lockfile, moved into the workspace-root frame the
+/// resolver and linker use — the inverse of [`project_lockfile_graph`].
+///
+/// Earlier versions wrote a member lockfile with every `file:` / `link:` path
+/// relative to the workspace root. Such a lockfile is recognised by a direct
+/// dep whose version is its specifier resolved from the member (the test the
+/// pnpm reader applies to a shared lockfile), and is then read as it is.
+pub(crate) fn parse_member_lockfile(
+    workspace_root: &Path,
+    importer_path: &str,
+    manifest: &aube_manifest::PackageJson,
+) -> Result<aube_lockfile::LockfileGraph, aube_lockfile::Error> {
+    use aube_util::path::normalize_lexical;
+    let member_dir = importer_project_dir(workspace_root, importer_path);
+    let mut graph = aube_lockfile::parse_lockfile(&member_dir, manifest)?;
+    if importer_path == "." {
+        return Ok(graph);
+    }
+    let root_frame = graph.importers.values().flatten().any(|dep| {
+        let Some(spec) = dep.specifier.as_deref().and_then(|spec| {
+            spec.strip_prefix("file:")
+                .or_else(|| spec.strip_prefix("link:"))
+        }) else {
+            return false;
+        };
+        let Some(version) = graph
+            .packages
+            .get(&dep.dep_path)
+            .and_then(|pkg| pkg.local_source.as_ref())
+            .and_then(|local| local.path())
+        else {
+            return false;
+        };
+        let version = normalize_lexical(version);
+        normalize_lexical(Path::new(spec)) != version
+            && member_to_root(workspace_root, importer_path, Path::new(spec)) == version
+    });
+    if !root_frame {
+        graph.rebase_local_paths(|path| member_to_root(workspace_root, importer_path, path));
+    }
+    Ok(graph)
+}
+
+/// The workspace root when `project_dir` is a member of a workspace that
+/// keeps one lockfile per project; `None` for the root itself, a shared
+/// lockfile, or no workspace. Install runs at that root, so it holds the
+/// member's store, install state and settings.
+pub(crate) fn unshared_lockfile_workspace_root(project_dir: &Path) -> Option<PathBuf> {
+    let root = crate::dirs::find_workspace_root(project_dir)?;
+    let shared = crate::commands::with_settings_ctx(
+        &root,
+        aube_settings::resolved::shared_workspace_lockfile,
+    );
+    (root != project_dir && !shared).then_some(root)
+}
+
+/// The lockfile of the project at `project_dir`, in the frame its installation
+/// used: a member of a workspace with per-project lockfiles reads through
+/// [`parse_member_lockfile`], so a local package's key matches the one its
+/// store entry was materialized under, and its path is relative to the
+/// workspace root [`unshared_lockfile_workspace_root`] names.
+pub(crate) fn parse_project_lockfile(
+    project_dir: &Path,
+    manifest: &aube_manifest::PackageJson,
+) -> Result<aube_lockfile::LockfileGraph, aube_lockfile::Error> {
+    if let Some(root) = unshared_lockfile_workspace_root(project_dir)
+        && let Ok(importer_path) = workspace_importer_path(&root, project_dir)
+    {
+        return parse_member_lockfile(&root, &importer_path, manifest);
+    }
+    aube_lockfile::parse_lockfile(project_dir, manifest)
+}
+
 /// Reconstruct missing workspace-member importer entries from each
 /// member's own per-project lockfile, folding them into `graph`.
 ///
@@ -223,19 +427,27 @@ pub(super) fn importer_project_dir(
 /// closure in. Members already present in `graph` (the cold/resolve path
 /// produces every importer) are skipped, so this is a no-op there.
 /// Best-effort: a member without a parseable lockfile is skipped — a
-/// genuinely new member busts the warm path through its manifest hash and
-/// gets a full resolve instead.
+/// genuinely new member busts the warm path (via `state::new_workspace_member`,
+/// or `member_lockfiles_stale` under `sharedWorkspaceLockfile=false`) and gets
+/// a full resolve instead, so this merge only ever runs on the warm path for
+/// members already present at the last install.
+///
+/// pnpm records a catalog entry only in the lockfile of a project that uses
+/// it, so the member's catalogs are folded into the graph the drift checks
+/// read. A member whose catalog range or runtime pin no longer holds is left
+/// out, which makes the graph stale against its manifest, and the first such
+/// disagreement is returned for a frozen install to report.
 pub(super) fn merge_member_lockfile_graphs(
     workspace_root: &std::path::Path,
     graph: &mut aube_lockfile::LockfileGraph,
     manifests: &[(String, aube_manifest::PackageJson)],
-) {
+) -> Option<String> {
+    let mut mismatch = None;
     for (importer_path, manifest) in manifests {
         if importer_path == "." || graph.importers.contains_key(importer_path) {
             continue;
         }
-        let member_dir = importer_project_dir(workspace_root, importer_path);
-        let member_graph = match aube_lockfile::parse_lockfile(&member_dir, manifest) {
+        let member_graph = match parse_member_lockfile(workspace_root, importer_path, manifest) {
             Ok(member_graph) => member_graph,
             Err(e) => {
                 tracing::debug!(
@@ -244,6 +456,19 @@ pub(super) fn merge_member_lockfile_graphs(
                 continue;
             }
         };
+        if let Some(reason) = member_config_mismatch(graph, &member_graph, manifest) {
+            tracing::debug!(
+                "sharedWorkspaceLockfile=false: skipping member {importer_path} graph merge: {reason}"
+            );
+            mismatch.get_or_insert(format!("{importer_path}: {reason}"));
+            continue;
+        }
+        for (catalog, entries) in member_graph.catalogs {
+            let merged = graph.catalogs.entry(catalog).or_default();
+            for (name, entry) in entries {
+                merged.entry(name).or_insert(entry);
+            }
+        }
         if let Some(deps) = member_graph.importers.get(".") {
             graph.importers.insert(importer_path.clone(), deps.clone());
         }
@@ -251,9 +476,51 @@ pub(super) fn merge_member_lockfile_graphs(
             graph.packages.entry(dep_path).or_insert(pkg);
         }
     }
+    mismatch
 }
 
-pub(super) fn order_lifecycle_manifests(
+/// Why a member lockfile's recorded config no longer holds, if it doesn't.
+///
+/// pnpm scopes the rest of this config to each project: a member's `.npmrc`,
+/// `pnpm` manifest field and `.pnpmfile.cjs` give it its own settings,
+/// overrides, checksums, ignored optionals and patches, so they may differ
+/// from the root's. A catalog has one definition, so two ranges for an entry
+/// mean one is stale, and a runtime pin answers to its own project's manifest.
+fn member_config_mismatch(
+    graph: &aube_lockfile::LockfileGraph,
+    member: &aube_lockfile::LockfileGraph,
+    manifest: &aube_manifest::PackageJson,
+) -> Option<String> {
+    for (catalog, entries) in &member.catalogs {
+        for (name, entry) in entries {
+            // Projects resolve on their own, so only the range must agree.
+            if let Some(merged) = graph.catalogs.get(catalog).and_then(|c| c.get(name))
+                && merged.specifier != entry.specifier
+            {
+                return Some(format!(
+                    "lockfile records catalogs.{catalog}.{name} as {}, another workspace lockfile as {}",
+                    entry.specifier, merged.specifier
+                ));
+            }
+        }
+    }
+    // Earlier writers copied the root's pin into every member's lockfile.
+    let own = aube_lockfile::LockfileGraph {
+        runtimes: member
+            .runtimes
+            .iter()
+            .filter(|(name, pin)| graph.runtimes.get(*name) != Some(*pin))
+            .map(|(name, pin)| (name.clone(), pin.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    match own.check_runtimes_drift(manifest) {
+        aube_lockfile::DriftStatus::Stale { reason } => Some(reason),
+        aube_lockfile::DriftStatus::Fresh => None,
+    }
+}
+
+pub(crate) fn order_lifecycle_manifests(
     manifests: Vec<(String, aube_manifest::PackageJson)>,
 ) -> Vec<(String, aube_manifest::PackageJson)> {
     if manifests.len() < 2 {
@@ -355,7 +622,7 @@ pub(super) fn order_lifecycle_manifests(
 /// already ships a `pnpm-lock.yaml` (or any other supported lockfile)
 /// keeps getting that file rewritten in place instead of gaining a
 /// surprise `aube-lock.yaml` next to it. This mirrors the single-project
-/// write path ([`aube_lockfile::write_lockfile_preserving_existing`]) and
+/// write path ([`aube_lockfile::write_lockfile_as`]) and
 /// pnpm's own `sharedWorkspaceLockfile=false` behavior, where each
 /// member keeps its own `pnpm-lock.yaml`. `fallback_kind` is only used
 /// for projects (root or member) that have no lockfile yet (the
@@ -378,7 +645,32 @@ pub(super) fn write_per_project_lockfiles(
     fallback_kind: aube_lockfile::LockfileKind,
     write_selection: Option<&std::collections::BTreeSet<String>>,
 ) -> miette::Result<()> {
+    write_per_project_lockfiles_with(
+        workspace_root,
+        graph,
+        workspace_manifests,
+        fallback_kind,
+        write_selection,
+        false,
+    )
+}
+
+/// [`write_per_project_lockfiles`], where `rewrite` writes each member's file
+/// even when its resolved graph is unchanged (`--fix-lockfile`).
+pub(super) fn write_per_project_lockfiles_with(
+    workspace_root: &std::path::Path,
+    graph: &aube_lockfile::LockfileGraph,
+    workspace_manifests: &[(String, aube_manifest::PackageJson)],
+    fallback_kind: aube_lockfile::LockfileKind,
+    write_selection: Option<&std::collections::BTreeSet<String>>,
+    rewrite: bool,
+) -> miette::Result<()> {
     use miette::IntoDiagnostic;
+    let write = if rewrite {
+        aube_lockfile::rewrite_lockfile_as
+    } else {
+        aube_lockfile::write_lockfile_as
+    };
     for (importer_path, pkg_manifest) in workspace_manifests {
         // Filtered install: only (re)write the selected importers'
         // lockfiles. Without this an `aube install --filter <member>`
@@ -406,7 +698,9 @@ pub(super) fn write_per_project_lockfiles(
             );
             continue;
         }
-        let Some(subset) = graph.subset_to_importer(importer_path, |_| true) else {
+        let Some(subset) =
+            project_lockfile_graph(workspace_root, graph, importer_path, workspace_manifests)
+        else {
             tracing::debug!(
                 "sharedWorkspaceLockfile=false: skipping {importer_path} (no graph importer entry)"
             );
@@ -425,7 +719,7 @@ pub(super) fn write_per_project_lockfiles(
         // written alongside its (preserved) pnpm lockfile.
         let write_kind =
             aube_lockfile::detect_existing_lockfile_kind(&pkg_dir).unwrap_or(fallback_kind);
-        let written = aube_lockfile::write_lockfile_as(&pkg_dir, &subset, pkg_manifest, write_kind)
+        let written = write(&pkg_dir, &subset, pkg_manifest, write_kind)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to write per-project lockfile at {importer_path}"))?;
         tracing::debug!(
@@ -830,5 +1124,355 @@ mod member_graph_merge_tests {
         ];
         merge_member_lockfile_graphs(root.path(), &mut graph, &manifests);
         assert_eq!(graph.importers.len(), before);
+    }
+
+    /// A member's lockfile records its paths from the member, as pnpm 10
+    /// writes it: a sibling member as `link:../a`, a `file:` dep relative to
+    /// the member. A bare subset wrote the sibling as a registry `1.0.0` that
+    /// `pnpm install --frozen-lockfile` rejects, and `file:` root-relative.
+    /// Reading it back must return the root-relative graph the linker uses.
+    #[test]
+    fn member_lockfile_records_paths_from_the_member_and_reads_back_root_relative() {
+        use aube_lockfile::LocalSource;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("packages/a")).unwrap();
+        std::fs::create_dir_all(root.path().join("packages/b")).unwrap();
+
+        let ldir = LocalSource::Directory("ldir".into());
+        let ldir_key = ldir.dep_path("ldir");
+        let dep = |name: &str, dep_path: &str, specifier: &str| DirectDep {
+            name: name.to_string(),
+            dep_path: dep_path.to_string(),
+            dep_type: DepType::Production,
+            specifier: Some(specifier.to_string()),
+        };
+        let full = LockfileGraph {
+            importers: BTreeMap::from([
+                (".".to_string(), Vec::new()),
+                ("packages/a".to_string(), Vec::new()),
+                (
+                    "packages/b".to_string(),
+                    vec![
+                        dep("a", "a@1.0.0", "workspace:*"),
+                        dep("ldir", &ldir_key, "file:../../ldir"),
+                    ],
+                ),
+            ]),
+            packages: BTreeMap::from([(
+                ldir_key.clone(),
+                LockedPackage {
+                    name: "ldir".to_string(),
+                    version: "1.0.0".to_string(),
+                    dep_path: ldir_key.clone(),
+                    local_source: Some(ldir),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let manifests = vec![
+            (".".to_string(), manifest("root")),
+            ("packages/a".to_string(), manifest("a")),
+            ("packages/b".to_string(), manifest("b")),
+        ];
+        write_per_project_lockfiles(root.path(), &full, &manifests, LockfileKind::Pnpm, None)
+            .unwrap();
+
+        let written =
+            std::fs::read_to_string(root.path().join("packages/b/pnpm-lock.yaml")).unwrap();
+        for line in ["version: link:../a", "version: file:../../ldir"] {
+            assert!(
+                written.contains(line),
+                "member lockfile lacks `{line}`:\n{written}"
+            );
+        }
+
+        let mut root_only = LockfileGraph {
+            importers: BTreeMap::from([(".".to_string(), Vec::new())]),
+            ..Default::default()
+        };
+        merge_member_lockfile_graphs(root.path(), &mut root_only, &manifests);
+        let b = &root_only.importers["packages/b"];
+        let local = |name: &str| {
+            let dep = b.iter().find(|d| d.name == name).unwrap();
+            root_only.packages[&dep.dep_path].local_source.clone()
+        };
+        assert_eq!(local("a"), Some(LocalSource::Link("packages/a".into())));
+        assert_eq!(
+            b.iter().find(|d| d.name == "ldir").unwrap().dep_path,
+            ldir_key,
+            "a `file:` dep must read back under its root-relative key"
+        );
+    }
+
+    fn local_dir(name: &str, path: &str) -> (String, LockedPackage) {
+        let local = aube_lockfile::LocalSource::Directory(path.into());
+        let key = local.dep_path(name);
+        let pkg = LockedPackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: key.clone(),
+            local_source: Some(local),
+            ..Default::default()
+        };
+        (key, pkg)
+    }
+
+    fn file_dep(name: &str, key: &str, specifier: &str) -> DirectDep {
+        DirectDep {
+            name: name.to_string(),
+            dep_path: key.to_string(),
+            dep_type: DepType::Production,
+            specifier: Some(specifier.to_string()),
+        }
+    }
+
+    /// A member outside the workspace root (`../app`) still names the same
+    /// target: the path is worked out between the real directories, not by
+    /// stripping components off two root-relative strings.
+    #[test]
+    fn parent_relative_member_lockfile_round_trips_its_local_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(tmp.path().join("app")).unwrap();
+        let (key, pkg) = local_dir("dep", "vendor/dep");
+        let full = LockfileGraph {
+            importers: BTreeMap::from([
+                (".".to_string(), Vec::new()),
+                (
+                    "../app".to_string(),
+                    vec![file_dep("dep", &key, "file:../workspace/vendor/dep")],
+                ),
+            ]),
+            packages: BTreeMap::from([(key.clone(), pkg)]),
+            ..Default::default()
+        };
+        let manifests = vec![
+            (".".to_string(), manifest("root")),
+            ("../app".to_string(), manifest("app")),
+        ];
+        write_per_project_lockfiles(&root, &full, &manifests, LockfileKind::Pnpm, None).unwrap();
+        let written = std::fs::read_to_string(tmp.path().join("app/pnpm-lock.yaml")).unwrap();
+        assert!(
+            written.contains("version: file:../workspace/vendor/dep"),
+            "the member lockfile must point at the same directory:\n{written}"
+        );
+
+        let mut root_only = LockfileGraph {
+            importers: BTreeMap::from([(".".to_string(), Vec::new())]),
+            ..Default::default()
+        };
+        merge_member_lockfile_graphs(&root, &mut root_only, &manifests);
+        assert_eq!(root_only.importers["../app"][0].dep_path, key);
+    }
+
+    /// A member lockfile written before paths moved into the member's frame
+    /// is read as written, transitive local deps included: rebasing only the
+    /// ones the importer names would move `vendor/other` under the member.
+    #[test]
+    fn root_relative_member_lockfile_keeps_its_transitive_local_paths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("packages/app")).unwrap();
+        let (other_key, other) = local_dir("other", "vendor/other");
+        let (ldir_key, mut ldir) = local_dir("ldir", "vendor/ldir");
+        ldir.dependencies.insert(
+            "other".to_string(),
+            other_key.strip_prefix("other@").unwrap().to_string(),
+        );
+        let full = LockfileGraph {
+            importers: BTreeMap::from([(
+                "packages/app".to_string(),
+                vec![file_dep("ldir", &ldir_key, "file:../../vendor/ldir")],
+            )]),
+            packages: BTreeMap::from([(ldir_key.clone(), ldir), (other_key.clone(), other)]),
+            ..Default::default()
+        };
+        // The earlier writer: a bare subset, paths left root-relative.
+        let legacy = full.subset_to_importer("packages/app", |_| true).unwrap();
+        aube_lockfile::write_lockfile_as(
+            &root.path().join("packages/app"),
+            &legacy,
+            &manifest("app"),
+            LockfileKind::Pnpm,
+        )
+        .unwrap();
+
+        let manifests = vec![("packages/app".to_string(), manifest("app"))];
+        let mut root_only = LockfileGraph::default();
+        merge_member_lockfile_graphs(root.path(), &mut root_only, &manifests);
+        assert_eq!(root_only.importers["packages/app"][0].dep_path, ldir_key);
+        let paths: Vec<_> = root_only
+            .packages
+            .values()
+            .filter_map(|pkg| pkg.local_source.as_ref()?.path().map(|p| p.to_path_buf()))
+            .collect();
+        assert!(
+            paths.contains(&"vendor/other".into()),
+            "the transitive local dep must stay at vendor/other, got {paths:?}"
+        );
+    }
+
+    const PNPM_HEADER: &str = "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\n";
+
+    fn write_member_lockfile(root: &std::path::Path, member: &str, body: &str) {
+        let dir = root.join(member);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pnpm-lock.yaml"), format!("{PNPM_HEADER}{body}")).unwrap();
+    }
+
+    fn catalog_member_lockfile(range: &str) -> String {
+        format!(
+            "catalogs:\n  default:\n    post-only:\n      specifier: {range}\n      version: 1.0.0\n\n\
+             importers:\n\n  .:\n    dependencies:\n      post-only:\n        specifier: 'catalog:'\n        version: 1.0.0\n\n\
+             packages:\n\n  post-only@1.0.0:\n    resolution: {{integrity: sha512-AAAA}}\n\n\
+             snapshots:\n\n  post-only@1.0.0: {{}}\n"
+        )
+    }
+
+    /// pnpm records a catalog entry only in the lockfile of a project that
+    /// uses it, so a member's catalogs must reach the freshness check, and two
+    /// ranges for one entry leave the later member out. Everything else pnpm
+    /// scopes to the project may differ from the root (`packages/c`).
+    #[test]
+    fn member_lockfile_config_reaches_the_freshness_check() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pnpm-lock.yaml"),
+            format!("{PNPM_HEADER}importers:\n\n  .: {{}}\n"),
+        )
+        .unwrap();
+        write_member_lockfile(
+            root.path(),
+            "packages/a",
+            &catalog_member_lockfile("^1.0.0"),
+        );
+        write_member_lockfile(
+            root.path(),
+            "packages/b",
+            &catalog_member_lockfile("^2.0.0"),
+        );
+        write_member_lockfile(
+            root.path(),
+            "packages/c",
+            "overrides:\n  post-only: 1.0.0\n\npackageExtensionsChecksum: sha256-AAAA\n\npnpmfileChecksum: sha256-BBBB\n\nimporters:\n\n  .: {}\n\nignoredOptionalDependencies:\n  - fsevents\n",
+        );
+        let manifests = vec![
+            (".".to_string(), manifest("root")),
+            ("packages/a".to_string(), manifest("a")),
+            ("packages/b".to_string(), manifest("b")),
+            ("packages/c".to_string(), manifest("c")),
+        ];
+        let mut graph = aube_lockfile::parse_lockfile(root.path(), &manifests[0].1).unwrap();
+        let mismatch = merge_member_lockfile_graphs(root.path(), &mut graph, &manifests);
+
+        let catalog = |range: &str| {
+            BTreeMap::from([(
+                "default".to_string(),
+                BTreeMap::from([("post-only".to_string(), range.to_string())]),
+            )])
+        };
+        assert!(graph.importers.contains_key("packages/a"));
+        assert!(matches!(
+            graph.check_catalogs_drift(&catalog("^1.0.0")),
+            aube_lockfile::DriftStatus::Fresh
+        ));
+        assert!(
+            matches!(
+                graph.check_catalogs_drift(&catalog("^2.0.0")),
+                aube_lockfile::DriftStatus::Stale { .. }
+            ),
+            "a catalog range only a member lockfile records must be checked"
+        );
+        let mismatch = mismatch.expect("packages/b records another catalog range");
+        assert!(mismatch.starts_with("packages/b: "), "{mismatch}");
+        assert!(!graph.importers.contains_key("packages/b"));
+        assert!(
+            graph.importers.contains_key("packages/c"),
+            "a member's own overrides, checksums and ignored optionals may differ from the root's"
+        );
+    }
+
+    fn runtime_manifest(version: &str) -> aube_manifest::PackageJson {
+        serde_json::from_str(&format!(
+            r#"{{"name":"a","version":"1.0.0","devEngines":{{"runtime":{{"name":"node","version":"{version}"}}}}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// A runtime pin answers to its own project's manifest: a member's pin may
+    /// be absent from the root's lockfile, but not from the member's manifest.
+    /// The writer keeps it there too, leaving the root's pin out of a member.
+    #[test]
+    fn member_runtime_pin_answers_to_its_own_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let lockfile = "importers:\n\n  .:\n    devDependencies:\n      node:\n        specifier: runtime:24.4.0\n        version: runtime:24.4.0\n";
+        for member in ["packages/a", "packages/b"] {
+            write_member_lockfile(root.path(), member, lockfile);
+        }
+        let manifests = vec![
+            ("packages/a".to_string(), runtime_manifest("24.4.0")),
+            ("packages/b".to_string(), manifest("b")),
+        ];
+        let mut graph = LockfileGraph::default();
+        let mismatch = merge_member_lockfile_graphs(root.path(), &mut graph, &manifests)
+            .expect("packages/b no longer pins the runtime");
+        assert!(mismatch.starts_with("packages/b: "), "{mismatch}");
+        assert!(graph.importers.contains_key("packages/a"));
+        assert!(graph.runtimes.is_empty());
+
+        let pinned =
+            aube_lockfile::parse_lockfile(&root.path().join("packages/a"), &manifests[0].1)
+                .unwrap();
+        let full = LockfileGraph {
+            importers: BTreeMap::from([("packages/b".to_string(), Vec::new())]),
+            runtimes: pinned.runtimes,
+            ..Default::default()
+        };
+        write_per_project_lockfiles(
+            root.path(),
+            &full,
+            &manifests[1..],
+            LockfileKind::Pnpm,
+            None,
+        )
+        .unwrap();
+        let written =
+            std::fs::read_to_string(root.path().join("packages/b/pnpm-lock.yaml")).unwrap();
+        assert!(!written.contains("runtime:"), "{written}");
+    }
+
+    /// pnpm keys a transitive-only local package by its spelling from the
+    /// lockfile (`foo@file:../lib`), which names a different directory in
+    /// each member: both must survive the merge as separate packages.
+    #[test]
+    fn members_spelling_a_transitive_local_alike_keep_their_own_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let body = "importers:\n\n  .:\n    dependencies:\n      parent:\n        specifier: file:../parent\n        version: file:../parent\n\n\
+                    packages:\n\n  foo@file:../lib:\n    resolution: {directory: ../lib, type: directory}\n\n  \
+                    parent@file:../parent:\n    resolution: {directory: ../parent, type: directory}\n\n\
+                    snapshots:\n\n  foo@file:../lib: {}\n\n  parent@file:../parent:\n    dependencies:\n      foo: file:../lib\n";
+        let mut manifests = Vec::new();
+        for group in ["a", "b"] {
+            let member = format!("groups/{group}/app");
+            write_member_lockfile(root.path(), &member, body);
+            manifests.push((member, manifest(&format!("app-{group}"))));
+        }
+        let mut graph = LockfileGraph::default();
+        assert_eq!(
+            merge_member_lockfile_graphs(root.path(), &mut graph, &manifests),
+            None
+        );
+
+        for group in ["a", "b"] {
+            let parent =
+                &graph.packages[&graph.importers[&format!("groups/{group}/app")][0].dep_path];
+            let foo = &graph.packages[&format!("foo@{}", parent.dependencies["foo"])];
+            assert_eq!(
+                foo.local_source.as_ref().and_then(|l| l.path()),
+                Some(std::path::Path::new(&format!("groups/{group}/lib"))),
+                "groups/{group}/app's foo"
+            );
+        }
     }
 }

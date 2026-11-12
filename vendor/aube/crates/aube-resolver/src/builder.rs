@@ -38,11 +38,14 @@ impl Resolver {
             ignored_optional_dependencies: BTreeSet::new(),
             resolution_mode: ResolutionMode::Highest,
             project_root: PathBuf::from("."),
+            workspace_member_importers: BTreeMap::new(),
             ignore_scripts: false,
             minimum_release_age: None,
             catalogs: BTreeMap::new(),
+            named_registries: BTreeMap::new(),
             read_package_hook: None,
             dependency_policy: DependencyPolicy::default(),
+            keep_importer_pins: false,
             vulnerable_ranges: BTreeMap::new(),
             git_shallow_hosts: Vec::new(),
             peers_suffix_max_length: 1000,
@@ -84,11 +87,14 @@ impl Resolver {
                 ignored_optional_dependencies: BTreeSet::new(),
                 resolution_mode: ResolutionMode::Highest,
                 project_root: PathBuf::from("."),
+                workspace_member_importers: BTreeMap::new(),
                 ignore_scripts: false,
                 minimum_release_age: None,
                 catalogs: BTreeMap::new(),
+                named_registries: BTreeMap::new(),
                 read_package_hook: None,
                 dependency_policy: DependencyPolicy::default(),
+                keep_importer_pins: false,
                 vulnerable_ranges: BTreeMap::new(),
                 git_shallow_hosts: Vec::new(),
                 peers_suffix_max_length: 1000,
@@ -123,7 +129,8 @@ impl Resolver {
 
     /// Set the resolution mode. Defaults to `Highest` (pnpm's classic
     /// behavior). `TimeBased` switches direct deps to lowest-satisfying
-    /// and constrains transitives by a publish-date cutoff.
+    /// and constrains transitives by a publish-date cutoff; `LowestDirect`
+    /// switches only direct dependencies to lowest-satisfying.
     pub fn with_resolution_mode(mut self, mode: ResolutionMode) -> Self {
         self.resolution_mode = mode;
         self
@@ -276,12 +283,34 @@ impl Resolver {
         self
     }
 
+    /// Provide the `namedRegistries` alias→URL map (pnpm-compat). Empty (the
+    /// default) leaves the named-registry branch inert — a `<alias>:<spec>`
+    /// task is rewritten and its registry route recorded only when its prefix
+    /// is a key here.
+    pub fn with_named_registries(mut self, named_registries: BTreeMap<String, String>) -> Self {
+        self.named_registries = named_registries;
+        self
+    }
+
     /// Set the project root used to resolve `file:` / `link:` paths.
     /// `file:./vendor/foo` resolves against this directory, and a
     /// matching directory / tarball is read to drive resolution of the
     /// local package's transitive deps.
     pub fn with_project_root(mut self, project_root: PathBuf) -> Self {
         self.project_root = project_root;
+        self
+    }
+
+    /// Seed the workspace member `name` → importer-path map for a
+    /// caller that resolves only a subset of the workspace's
+    /// manifests, so a `workspace:<name>@<range>` alias can still find
+    /// a member the `manifests` slice omits. Paths are relative to the
+    /// project root, matching the importer keys.
+    pub fn with_workspace_member_importers(
+        mut self,
+        workspace_member_importers: BTreeMap<String, String>,
+    ) -> Self {
+        self.workspace_member_importers = workspace_member_importers;
         self
     }
 
@@ -311,6 +340,15 @@ impl Resolver {
     /// and `blockExoticSubdeps`.
     pub fn with_dependency_policy(mut self, policy: DependencyPolicy) -> Self {
         self.dependency_policy = policy;
+        self
+    }
+
+    /// Keep each importer's locked pick for its direct dependencies. Without
+    /// this, a direct dependency takes the first locked version of that name
+    /// that satisfies its range, which can be a nested copy another package
+    /// needed rather than the one the importer was locked to.
+    pub fn with_keep_importer_pins(mut self, value: bool) -> Self {
+        self.keep_importer_pins = value;
         self
     }
 

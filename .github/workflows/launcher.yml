@@ -14,11 +14,16 @@ name: Launcher heal
 
 on:
   push:
+    # Trunk only. Without the filter a push to ANY branch ran this, which walked
+    # straight around the opt-in gate on the pull_request trigger below.
+    branches: [main]
     paths:
       - npm/nub/**
       - tests/launcher/**
       - .github/workflows/launcher.yml
   pull_request:
+    # PR CI is opt-in — request a run with `gh pr edit <n> --add-label ci`. Rationale: ci.yml.
+    types: [labeled]
     paths:
       - npm/nub/**
       - tests/launcher/**
@@ -31,7 +36,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event.label.name != 'ci' && github.event.label.name != 'ci-full' && github.event.label.name || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -40,6 +45,7 @@ permissions:
 jobs:
   heal:
     name: heal · ${{ matrix.os }}
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full'
     strategy:
       fail-fast: false
       # On pull_request: ubuntu only (the dash leg) — macOS is dropped from PRs
@@ -50,7 +56,9 @@ jobs:
         os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: 22
@@ -59,9 +67,12 @@ jobs:
 
   non-owner:
     name: non-owner staged copy · docker
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci' || github.event.label.name == 'ci-full'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5
         with:
           node-version: 22

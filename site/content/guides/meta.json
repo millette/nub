@@ -3,6 +3,8 @@
   "pages": [
     "index",
     "bun-to-nub",
-    "turborepo"
+    "nestjs",
+    "turborepo",
+    "vite-plus"
   ]
 }

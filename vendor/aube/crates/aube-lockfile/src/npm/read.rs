@@ -2,20 +2,34 @@ use crate::{DepType, DirectDep, Error, LocalSource, LockedPackage, LockfileGraph
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use super::raw::{InstallPathInfo, RawNpmLockfile};
+use super::raw::{
+    InstallPathInfo, RawNpmLegacyDep, RawNpmLegacyLockfile, RawNpmLockfile, RawNpmPackage,
+};
 /// Parse a package-lock.json or npm-shrinkwrap.json file into a LockfileGraph.
-pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
+///
+/// `manifest` is consulted only on the legacy (`lockfileVersion < 2` or
+/// absent) path, where the lockfile carries no `""` root entry marking
+/// which packages are direct deps — those come from package.json, the
+/// same way the yarn-classic reader recovers importers. The v2/v3 path
+/// ignores it.
+pub fn parse(path: &Path, manifest: &aube_manifest::PackageJson) -> Result<LockfileGraph, Error> {
     let content = crate::read_lockfile(path)?;
     let mut raw: RawNpmLockfile = crate::parse_json(path, content)?;
 
-    if raw.lockfile_version < 2 {
-        return Err(Error::parse(
-            path,
-            format!(
-                "package-lock.json lockfileVersion {} is not supported (need v2 or v3)",
-                raw.lockfile_version
-            ),
-        ));
+    // Pre-npm-7 lockfiles — `package-lock.json` `lockfileVersion 1`
+    // (npm 5/6) and pre-2017 `npm-shrinkwrap.json` (no `lockfileVersion`,
+    // hence the `unwrap_or(1)` default) — use a nested `dependencies`
+    // tree and have no flat `packages` map. Lift either into the same
+    // flat install-path-keyed representation the v2/v3 reader below
+    // consumes, then fall through unchanged. This is the whole legacy
+    // story: one pre-pass, the battle-tested nested-resolution / hoist /
+    // importer pipeline reused verbatim. Re-reading the file on this
+    // rare path keeps the common v2/v3 path a single allocation-free
+    // parse.
+    if raw.lockfile_version.unwrap_or(1) < 2 {
+        let content = crate::read_lockfile(path)?;
+        let legacy: RawNpmLegacyLockfile = crate::parse_json(path, content)?;
+        raw = lift_legacy_to_packages(&legacy, manifest);
     }
 
     // `npm install --prefix <proj>` (run from a different cwd than the
@@ -40,6 +54,25 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         ..Default::default()
     };
 
+    // npm does not tag remote-tarball package entries separately from
+    // registry packages: both use an HTTP(S) `resolved` URL. The declared
+    // dependency specifier is the discriminator. Collect every URL spec so
+    // matching entries retain their non-registry identity instead of later
+    // being sent through packument validation.
+    let remote_tarball_specs: BTreeSet<&str> = raw
+        .packages
+        .values()
+        .flat_map(|entry| {
+            entry
+                .dependencies
+                .values()
+                .chain(entry.dev_dependencies.values())
+                .chain(entry.optional_dependencies.values())
+        })
+        .map(String::as_str)
+        .filter(|spec| LocalSource::looks_like_remote_tarball_url(spec))
+        .collect();
+
     // npm workspace links come in pairs:
     // - `node_modules/@scope/pkg: { resolved: "packages/pkg", link: true }`
     // - `packages/pkg: { name, version, dependencies, ... }`
@@ -48,11 +81,32 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // the target path entry carries the package metadata. Skip the target-path
     // record during the main loop and let the link entry synthesize a local
     // package from it.
+    //
+    // One more shape, which is neither: a `link` whose target is a registry
+    // package inside `node_modules`. npm writes it to point a nested
+    // dependent's peer at the copy above it — puppeteer's lockfile has
+    // `…/browserslist/node_modules/browserslist` linking back to
+    // `…/browserslist` for update-browserslist-db's peer. The target is a
+    // registry package and stays one; the link is only an install path
+    // that resolves to it, so it creates no package of its own.
+    let pointer_link_target = |entry: &super::raw::RawNpmPackage| -> Option<String> {
+        if !entry.link {
+            return None;
+        }
+        let target = entry.resolved.as_deref()?;
+        if !target.split('/').any(|segment| segment == "node_modules") {
+            return None;
+        }
+        let target_entry = raw.packages.get(target)?;
+        (!target_entry.link && target_entry.version.is_some()).then(|| target.to_string())
+    };
     let link_targets: BTreeSet<String> = raw
         .packages
         .values()
+        .filter(|entry| pointer_link_target(entry).is_none())
         .filter_map(|entry| entry.link.then(|| entry.resolved.clone()).flatten())
         .collect();
+    let mut pointer_links: Vec<(String, String)> = Vec::new();
 
     // Map each install_path to the locked dep_path it resolves to. We need
     // this for the nested-resolution walk, including local/workspace links
@@ -91,6 +145,10 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             .as_ref()
             .filter(|real| real.as_str() != install_name.as_str())
             .cloned();
+        if let Some(target) = pointer_link_target(entry) {
+            pointer_links.push((install_path.clone(), target));
+            continue;
+        }
         let (package_entry, version, dep_path, local_source) = if entry.link {
             let target = entry.resolved.as_ref().ok_or_else(|| {
                 Error::parse(
@@ -104,12 +162,16 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                     format!("linked package '{install_name}' points to missing target '{target}'"),
                 )
             })?;
-            let version = target_entry.version.clone().ok_or_else(|| {
-                Error::parse(
-                    path,
-                    format!("linked package '{install_name}' target '{target}' has no version"),
-                )
-            })?;
+            // npm writes no `version` on a local package whose manifest
+            // declares none (a test fixture linked as `file:test/fixture`
+            // is the common shape — mocha ships one). The resolver
+            // defaults such a package to `0.0.0` (`install::workspace`);
+            // mirror that so a read graph matches a fresh resolve instead
+            // of refusing a lockfile npm itself wrote.
+            let version = target_entry
+                .version
+                .clone()
+                .unwrap_or_else(|| "0.0.0".to_string());
             let local = LocalSource::Link(PathBuf::from(target));
             (
                 target_entry,
@@ -124,6 +186,15 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             let local_source = entry.resolved.as_deref().and_then(|r| {
                 crate::npm::source::local_git_source_from_resolved(r)
                     .or_else(|| crate::npm::source::local_file_source_from_resolved(r))
+                    .or_else(|| {
+                        remote_tarball_specs.contains(r).then(|| {
+                            LocalSource::RemoteTarball(crate::RemoteTarballSource {
+                                url: r.to_string(),
+                                integrity: entry.integrity.clone().unwrap_or_default(),
+                                git_hosted: false,
+                            })
+                        })
+                    })
             });
             let dep_path = local_source.as_ref().map_or_else(
                 || format!("{install_name}@{version}"),
@@ -218,6 +289,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 alias_of,
                 tarball_url,
                 declared_dependencies: declared,
+                declared_dependencies_known: true,
                 engines: package_entry.engines.clone(),
                 bin: package_entry.bin.clone(),
                 license: package_entry.license.as_ref().and_then(|l| l.value.clone()),
@@ -251,6 +323,18 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // npm.rs's data model doesn't express that, and in practice npm
     // dedupes only when the transitives match anyway.
     type ResolvedDepMap = BTreeMap<String, String>;
+    // A pointer link resolves to whatever its target resolves to, whichever
+    // of the two the map visited first.
+    for (install_path, target) in pointer_links {
+        if let Some(target_info) = install_path_info.get(&target) {
+            let info = InstallPathInfo {
+                name: target_info.name.clone(),
+                dep_path: target_info.dep_path.clone(),
+            };
+            install_path_info.insert(install_path, info);
+        }
+    }
+
     let mut resolved_by_dep_path: BTreeMap<String, (ResolvedDepMap, ResolvedDepMap)> =
         BTreeMap::new();
     for (install_path, entry) in &raw.packages {
@@ -289,15 +373,15 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
 
         let mut resolved: BTreeMap<String, String> = BTreeMap::new();
         let mut resolved_optional: BTreeMap<String, String> = BTreeMap::new();
-        for (dep_name, is_optional) in package_entry
+        for (dep_name, range, is_optional) in package_entry
             .dependencies
-            .keys()
-            .map(|name| (name, false))
+            .iter()
+            .map(|(name, range)| (name, range, false))
             .chain(
                 package_entry
                     .optional_dependencies
-                    .keys()
-                    .map(|name| (name, true)),
+                    .iter()
+                    .map(|(name, range)| (name, range, true)),
             )
         {
             if let Some(target_install_path) =
@@ -309,6 +393,58 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                 resolved.insert(dep_name.clone(), tail.clone());
                 if is_optional {
                     resolved_optional.insert(dep_name.clone(), tail);
+                }
+            } else if !is_optional
+                && !package_entry.in_bundle
+                && !package_entry.bundle_dependencies.contains(dep_name)
+                && !package_entry.optional_dependencies.contains_key(dep_name)
+            {
+                // A required child with no entry: the lockfile is broken. Keep
+                // the edge, pointing at nothing, as a pnpm lockfile missing the
+                // same entry does. A resolver seeded with this graph then fetches
+                // the child, where a dropped edge would lose the dependency from
+                // the parent on the next write. An optional child is legitimately
+                // absent, pruned for another platform.
+                resolved.insert(dep_name.clone(), range.clone());
+            }
+        }
+        // Peers, by placement. npm records the copy of a peer each dependent
+        // sees — auto-installed and hoisted to the root, or nested beside the
+        // dependent when the root's copy does not satisfy it — and ties it to
+        // no regular dependency edge. The graph carries that placement as a
+        // dependency edge so two downstream passes see it. `filter_graph`'s
+        // reachability walk keeps a peer-only package alive: `react-dom`
+        // reached solely through a transitive package's peer edge was pruned,
+        // and the package died at runtime with `Cannot find package`. And
+        // `apply_peer_contexts` takes the recorded copy when no ancestor
+        // provides a satisfying one, where it used to fall back to the newest
+        // version in the graph or to an ancestor's out-of-range copy
+        // (eslint-plugin-react was handed xo's eslint 10 with npm's nested
+        // eslint 9 sitting in the lockfile). An ancestor that satisfies the
+        // range still wins, as it does for every lockfile shape. The range is
+        // deliberately not added to `declared`: the npm writer emits only
+        // declared names under `dependencies`, so the round trip stays
+        // byte-identical. An optional peer (`peerDependenciesMeta`) is an
+        // optional edge, so a provider that is otherwise only optionally
+        // reachable keeps that classification and platform pruning can still
+        // drop it.
+        for peer_name in package_entry.peer_dependencies.keys() {
+            if resolved.contains_key(peer_name) {
+                continue;
+            }
+            if let Some(target_install_path) =
+                crate::npm::layout::resolve_nested(lookup_path, peer_name, &install_path_info)
+                && let Some(target_info) = install_path_info.get(&target_install_path)
+            {
+                let tail =
+                    crate::npm::dep_path_tail(&target_info.name, &target_info.dep_path).to_string();
+                let optional = package_entry
+                    .peer_dependencies_meta
+                    .get(peer_name)
+                    .is_some_and(|meta| meta.optional);
+                resolved.insert(peer_name.clone(), tail.clone());
+                if optional {
+                    resolved_optional.insert(peer_name.clone(), tail);
                 }
             }
         }
@@ -333,10 +469,23 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // frozen install rejects the lockfile with
     // `specifiers in the lockfile don't match package.json` — the same
     // way the non-root workspace importers below already thread it.
-    let push_direct =
+    //
+    // One row per name, first section wins, in the resolver's own
+    // priority (`dependencies` > `devDependencies` >
+    // `optionalDependencies`, `seed_direct_deps`). A manifest may list
+    // one package under two sections — promptfoo carries
+    // `@anthropic-ai/claude-agent-sdk` as both a dev and an optional dep,
+    // and npm mirrors both onto the root entry. Recording both rows made
+    // the section check read the optional row as
+    // `manifest section is devDependencies, lockfile section is
+    // optionalDependencies` and refuse every frozen install.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut push_direct =
         |dep_name: &str, specifier: &str, dep_type: DepType, direct: &mut Vec<DirectDep>| {
             let root_path = format!("node_modules/{dep_name}");
-            if let Some(info) = install_path_info.get(&root_path) {
+            if let Some(info) = install_path_info.get(&root_path)
+                && seen.insert(info.name.clone())
+            {
                 direct.push(DirectDep {
                     name: info.name.clone(),
                     dep_path: info.dep_path.clone(),
@@ -353,6 +502,9 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     }
     for (dep_name, specifier) in &root.optional_dependencies {
         push_direct(dep_name, specifier, DepType::Optional, &mut direct);
+    }
+    for (dep_name, specifier) in required_peers_not_declared(&root) {
+        push_direct(dep_name, specifier, DepType::Production, &mut direct);
     }
 
     // npm symlinks every workspace member (and any other top-level
@@ -411,14 +563,56 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // `packages/app`, ...) carries that package's own dependency sections.
     // Preserve those target paths as graph importers so install/link and a
     // later package-lock rewrite keep each workspace's node_modules tree.
+    //
+    // But only for targets that are actually MEMBERS. npm writes the very
+    // same pair for a local directory dependency — `vendor/local` gets a
+    // bare `name`/`version` entry plus a `link: true` record — so taking
+    // every link target registered phantom importers for paths outside the
+    // workspace. `drift` then compared them against the real member list
+    // and failed every `--frozen-lockfile` with `workspace importer
+    // vendor/local is in the lockfile but not in the workspace`, including
+    // against lockfiles npm itself had written.
+    //
+    // The shapes are identical in the lockfile — a root importer's own
+    // `file:./dep` also produces a root link record — so the manifest's
+    // `workspaces` patterns are the only thing that can decide. A
+    // non-member still becomes a proper local-source package via the link
+    // entry's own synthesis pass above; it just stops pretending to be an
+    // importer.
+    // The LOCKFILE's own copy comes first: npm mirrors `workspaces` into
+    // `packages[""]`, so a lockfile is self-describing and a caller that
+    // passes a bare manifest still gets the right answer. The manifest is
+    // the fallback for a lockfile written before that field was emitted.
+    //
+    // When NEITHER carries patterns, keep every link target, exactly as
+    // before. That is the conservative direction on purpose: dropping a
+    // real member costs it its importer entry and breaks its install,
+    // while keeping a stray one only reproduces the pre-existing
+    // behaviour. It is also the case for a workspace whose members are
+    // declared outside package.json (a `pnpm-workspace.yaml` project
+    // converted to npm format), where absence of patterns says nothing
+    // about whether members exist.
+    let member_patterns: Vec<String> = raw
+        .packages
+        .get("")
+        .and_then(|root| root.workspaces.as_ref())
+        .or(manifest.workspaces.as_ref())
+        .map(|w| w.patterns().to_vec())
+        .unwrap_or_default();
     for target in &link_targets {
         if target.is_empty() {
+            continue;
+        }
+        if !member_patterns.is_empty()
+            && !aube_workspace::matches_member_patterns(target, &member_patterns)
+        {
             continue;
         }
         let Some(package_entry) = raw.packages.get(target) else {
             continue;
         };
         let mut direct = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         for (dep_name, specifier, dep_type) in package_entry
             .dependencies
             .iter()
@@ -435,10 +629,15 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                     .iter()
                     .map(|(name, spec)| (name, spec, DepType::Optional)),
             )
+            .chain(
+                required_peers_not_declared(package_entry)
+                    .map(|(name, spec)| (name, spec, DepType::Production)),
+            )
         {
             if let Some(target_install_path) =
                 crate::npm::layout::resolve_nested(target, dep_name, &install_path_info)
                 && let Some(info) = install_path_info.get(&target_install_path)
+                && seen.insert(info.name.clone())
             {
                 direct.push(DirectDep {
                     name: info.name.clone(),
@@ -451,6 +650,194 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         graph.importers.insert(target.clone(), direct);
     }
     Ok(graph)
+}
+
+/// An importer's required peers that no dependency section already
+/// declares, as (name, range) — the ones npm 7+ auto-installs into an
+/// ancestor `node_modules/` and that aube's own resolver seeds onto the
+/// importer as a `Production` direct dep carrying the peer range
+/// (`auto_install_peers`). The reader has to surface them the same way:
+/// the freshness check compares the manifest's required peers against the
+/// importer's recorded specifiers, so leaving them out read every
+/// workspace member with a peer as `manifest adds <peer>@<range>` under
+/// `--frozen-lockfile` (apollo-server's `@apollo/cache-control-types`,
+/// socket.io's cluster adapter). An optional peer (`peerDependenciesMeta`)
+/// is never auto-installed, so it stays out.
+fn required_peers_not_declared(
+    entry: &RawNpmPackage,
+) -> impl Iterator<Item = (&String, &String)> + '_ {
+    entry.peer_dependencies.iter().filter(|(name, _)| {
+        !entry
+            .peer_dependencies_meta
+            .get(*name)
+            .is_some_and(|meta| meta.optional)
+            && !entry.dependencies.contains_key(*name)
+            && !entry.dev_dependencies.contains_key(*name)
+            && !entry.optional_dependencies.contains_key(*name)
+    })
+}
+
+/// Lift a pre-npm-7 nested-`dependencies` tree into the flat,
+/// install-path-keyed `RawNpmLockfile.packages` representation the
+/// v2/v3 reader consumes. npm's nesting encodes the install path
+/// exactly as the v2/v3 `packages` keys do — a top-level
+/// `dependencies.foo` lives at `node_modules/foo`; a nested
+/// `dependencies.foo.dependencies.bar` (npm nests only the conflicting
+/// version, hoisting the shared one to the top) lives at
+/// `node_modules/foo/node_modules/bar` — so the synthesized paths feed
+/// `resolve_nested` and the hoist walk with no special-casing.
+///
+/// v1 lockfiles list every resolved package (direct + hoisted
+/// transitive) flat at the top level and carry no `""` root entry
+/// marking which are direct, so the root importer's deps are taken from
+/// the manifest (the yarn-classic precedent). Reading the manifest is
+/// the *correct* source, not a shortcut: mislabeling a hoisted
+/// transitive as a root direct dep would over-hoist it into aube's
+/// isolated root `node_modules/` and break the phantom-dep guarantee.
+pub(super) fn lift_legacy_to_packages(
+    legacy: &RawNpmLegacyLockfile,
+    manifest: &aube_manifest::PackageJson,
+) -> RawNpmLockfile {
+    let mut packages: BTreeMap<String, RawNpmPackage> = BTreeMap::new();
+
+    // The `""` root entry: the v2/v3 reader reads the project's direct
+    // deps (and their declared ranges, used as importer specifiers) from
+    // its `dependencies`/`devDependencies`/`optionalDependencies`
+    // sections. Synthesize them from the manifest. name/version are
+    // unused by the reader for the root entry, so they stay defaulted.
+    packages.insert(
+        String::new(),
+        RawNpmPackage {
+            dependencies: manifest.dependencies.clone(),
+            dev_dependencies: manifest.dev_dependencies.clone(),
+            optional_dependencies: manifest.optional_dependencies.clone(),
+            ..Default::default()
+        },
+    );
+
+    lift_legacy_tree(&legacy.dependencies, "node_modules", &mut packages);
+
+    // Honesty diagnostic for the pre-npm-5 flat-shrinkwrap limitation
+    // (see `legacy_unreferenced_top_level`): a fully-hoisted npm 3/4
+    // shrinkwrap omits `requires`, so a top-level transitive whose incoming
+    // edge is recorded nowhere is unreachable and the writer's reachability
+    // walk drops it — it will not install. Surface it rather than silently
+    // shipping a broken tree. Legacy-path-only: never runs for v2/v3.
+    let orphans = legacy_unreferenced_top_level(legacy, &packages, manifest);
+    if !orphans.is_empty() {
+        let list = orphans.join(", ");
+        tracing::warn!(
+            code = aube_codes::warnings::WARN_AUBE_LOCKFILE_LEGACY_INCOMPLETE_GRAPH,
+            "legacy lockfile omits dependency edges for {} hoisted package(s) ({list}); they are unreachable from the project's dependencies and will not be installed. Re-lock with a modern npm for a complete graph.",
+            orphans.len(),
+        );
+    }
+
+    RawNpmLockfile {
+        lockfile_version: Some(1),
+        packages,
+    }
+}
+
+/// Top-level legacy packages with NO incoming edge — referenced by neither
+/// the project manifest nor any lifted package's recorded dependencies
+/// (`requires` plus nesting-derived edges). Such a package is unreachable
+/// from the project's dependencies, so the reachability-pruning writer drops
+/// it and it never installs. The cause is structural: a fully-hoisted npm
+/// 3/4 `npm-shrinkwrap.json` records transitives at the top level but omits
+/// the `requires` links that say which package needs them, so the edge
+/// exists nowhere in the file and is unrecoverable from the lockfile alone
+/// (npm 3 rebuilt it by reading each fetched package.json — a thing a
+/// lockfile reader cannot do). Returning the list lets the caller warn.
+pub(super) fn legacy_unreferenced_top_level(
+    legacy: &RawNpmLegacyLockfile,
+    packages: &BTreeMap<String, RawNpmPackage>,
+    manifest: &aube_manifest::PackageJson,
+) -> Vec<String> {
+    let mut referenced: BTreeSet<&str> = BTreeSet::new();
+    for k in manifest
+        .dependencies
+        .keys()
+        .chain(manifest.dev_dependencies.keys())
+        .chain(manifest.optional_dependencies.keys())
+    {
+        referenced.insert(k.as_str());
+    }
+    for (install_path, pkg) in packages {
+        if install_path.is_empty() {
+            continue;
+        }
+        for dep_name in pkg.dependencies.keys() {
+            referenced.insert(dep_name.as_str());
+        }
+    }
+    legacy
+        .dependencies
+        .keys()
+        .filter(|name| !referenced.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Recursively flatten one level of the legacy `dependencies` tree at
+/// install-path `prefix` (`node_modules` for the top level), pushing one
+/// `RawNpmPackage` per entry and recursing into nested `dependencies`
+/// one `node_modules` level deeper.
+fn lift_legacy_tree(
+    deps: &BTreeMap<String, RawNpmLegacyDep>,
+    prefix: &str,
+    out: &mut BTreeMap<String, RawNpmPackage>,
+) {
+    for (name, dep) in deps {
+        let install_path = format!("{prefix}/{name}");
+        // Edges come from `requires` (declared name → range), which the
+        // reader uses to seed forward-refs and preserve declared ranges;
+        // the second pass resolves the actual target via the nested-tree
+        // walk. Pre-npm-5 shrinkwraps omit `requires` entirely and
+        // express edges ONLY through nesting, so a nested child IS a
+        // declared dependency of its parent — fold those names in (a `*`
+        // range stands in for the unrecorded specifier; the resolved
+        // target still comes from the nested-tree walk). A hoisted-to-root
+        // transitive of a no-`requires` shrinkwrap has no edge anywhere in
+        // the file and stays unrecoverable — a flat-layout limitation
+        // documented in the PR.
+        let mut dependencies = dep.requires.clone();
+        for child_name in dep.dependencies.keys() {
+            dependencies
+                .entry(child_name.clone())
+                .or_insert_with(|| "*".to_string());
+        }
+        // v1 records bundled deps only as a per-entry `bundled: true`
+        // flag on each nested child; it has no parent-level
+        // `bundleDependencies` array the way v3 does. The install path
+        // keys off the parent's `bundled_dependencies` to avoid fetching
+        // the bundled closure (it ships inside the parent's tarball), so
+        // reconstruct that array here from the direct `bundled` children
+        // — otherwise a v1 restore promotes the whole bundled subtree to
+        // registry-fetch nodes and breaks `--offline`.
+        let bundle_dependencies: Vec<String> = dep
+            .dependencies
+            .iter()
+            .filter(|(_, child)| child.bundled)
+            .map(|(child_name, _)| child_name.clone())
+            .collect();
+        out.insert(
+            install_path.clone(),
+            RawNpmPackage {
+                version: dep.version.clone(),
+                resolved: dep.resolved.clone(),
+                integrity: dep.integrity.clone(),
+                dependencies,
+                in_bundle: dep.bundled,
+                bundle_dependencies,
+                ..Default::default()
+            },
+        );
+        if !dep.dependencies.is_empty() {
+            let child_prefix = format!("{install_path}/node_modules");
+            lift_legacy_tree(&dep.dependencies, &child_prefix, out);
+        }
+    }
 }
 
 /// Canonical project-relative form of an npm `packages` install path

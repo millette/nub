@@ -20,7 +20,7 @@ concurrency:
 jobs:
   publish:
     name: Publish Homebrew formula
-    runs-on: namespace-profile-endev-linux-amd64
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
@@ -58,7 +58,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ steps.tag.outputs.tag }}
           persist-credentials: false
@@ -78,6 +78,21 @@ jobs:
         run: |
           mkdir -p dist
           ./packaging/homebrew/render-formula.sh > dist/aube.rb
+
+      - name: Check tap token access
+        env:
+          GH_TOKEN: ${{ secrets.AUBE_GH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::AUBE_GH_TOKEN is required to push ${TAP_REPO}"
+            exit 1
+          fi
+
+          CAN_PUSH=$(gh api "repos/${TAP_REPO}" --jq '.permissions.push // false' 2>/dev/null || echo "api-error")
+          if [ "$CAN_PUSH" != "true" ]; then
+            echo "::error::AUBE_GH_TOKEN must have Contents write access to ${TAP_REPO}; GitHub reported push permission: ${CAN_PUSH}"
+            exit 1
+          fi
 
       - name: Publish to tap
         env:

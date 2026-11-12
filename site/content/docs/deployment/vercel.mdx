@@ -1,0 +1,109 @@
+---
+title: Vercel
+description: Vercel ships no preinstalled Nub, but the install command is yours to replace, so one line puts the CLI on PATH for the rest of the build.
+---
+
+[Vercel](https://vercel.com) does not ship Nub in its build image, but it lets you replace the install command. Nub then runs the install and the build; deployed Functions still run on Vercel's Node runtime.
+
+## Build settings
+
+Set both commands in `vercel.json`. The installer fetches a static binary, then Nub installs the dependencies and runs the build:
+
+```json title="vercel.json" wide
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "curl -fsSL https://nubjs.com/install.sh | bash && export PATH=$HOME/.nub/bin:$PATH && nub ci",
+  "buildCommand": "export PATH=$HOME/.nub/bin:$PATH && nub run build"
+}
+```
+
+The clean install needs a committed lockfile that matches the manifest.
+
+<Callout type="warn" title="Export PATH — don't call the binary by path">
+  Calling `$HOME/.nub/bin/nub` directly leaves Nub off `PATH` for everything it starts, so a script that calls `nub` or `nubx` fails with `nub: command not found`. The install and build commands run in separate shells, so both need the export.
+</Callout>
+
+<Callout>
+Read the [full docs](https://vercel.com/docs/builds/configure-a-build) on vercel.com.
+</Callout>
+
+## HTTP endpoint
+
+Files under `api/` become Vercel Functions. This one makes the deployment testable:
+
+```ts title="api/alive.ts"
+export default function handler(
+  _request: unknown,
+  response: {
+    status(code: number): { json(body: unknown): void };
+  },
+) {
+  response.status(200).json({
+    alive: true,
+    provider: "vercel",
+    runtime: "vercel-node",
+  });
+}
+```
+
+## Deploy
+
+Connect the repository from the Vercel dashboard, or deploy from the CLI:
+
+```bash
+nubx -y vercel deploy --prod
+curl --fail https://PROJECT.vercel.app/api/alive
+# {"alive":true,"provider":"vercel","runtime":"vercel-node"}
+```
+
+The build log shows the Nub version the installer fetched and the Node the build ran on. Here the project's `build` script is `nub build.ts`:
+
+```console
+Installed nub v{{NUB_VERSION}} (with nubx) to /vercel/.nub/bin/nub
+Removing existing node_modules...
+dependencies:
++ kleur@4.1.5
+$ nub build.ts
+Built with nub-on-node on v24.15.0
+Build Completed in /vercel/output [4s]
+```
+
+## Node version
+
+Vercel selects the Node version and Nub runs on it, so pin it on Vercel's side:
+
+- Project Settings → Node.js Version
+- `engines.node` in `package.json`
+
+Nub reads `engines.node` too, so that spelling pins both from one place.
+
+<Callout>
+Read the [full docs](https://vercel.com/docs/functions/runtimes/node-js) on vercel.com.
+</Callout>
+
+## The devDependency alternative
+
+Adding the CLI as a devDependency also works, leaves `vercel.json` empty, and pins the Nub version in the manifest:
+
+```json title="package.json"
+{
+  "devDependencies": {
+    "@nubjs/nub": "^{{NUB_VERSION}}"
+  },
+  "scripts": {
+    "build": "nubx vite build"
+  }
+}
+```
+
+Vercel's auto-detected install links `nub` and `nubx` into `node_modules/.bin`. See [Managed builders](/docs/deployment#managed-builders) for the full pattern.
+
+<Callout>
+  An install that excludes devDependencies drops the CLI with them. Replace the install command instead when a project builds without devDependencies.
+</Callout>
+
+## Runtime boundary
+
+A deployed Vercel Function runs on Vercel's Node runtime, because Vercel owns the function entrypoint and does not run the project's Dockerfile. Static output and frameworks that emit ordinary Node functions work normally.
+
+Use a [container provider](/docs/deployment#container-services) when request-time code needs Nub's runtime augmentation.

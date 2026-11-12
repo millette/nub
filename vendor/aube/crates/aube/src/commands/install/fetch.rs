@@ -1,5 +1,11 @@
 use super::critical_path::is_likely_native_build;
-use super::git_prepare::{prepare_scratch_copy, run_git_dep_prepare};
+use super::git_prepare::{
+    archive_has_path, checkout_build_allowed, checkout_needs_build, prepare_scratch_copy,
+    run_git_dep_prepare,
+};
+#[cfg(test)]
+use super::index_remap::remap_indices_to_contextualized;
+use super::index_remap::strip_peer_context_suffix;
 use super::lifecycle::run_import_on_blocking;
 use super::settings::{
     default_lockfile_network_concurrency, resolve_network_concurrency,
@@ -13,7 +19,22 @@ use crate::progress::InstallProgress;
 use aube_lockfile::dep_path_filename::dep_path_to_filename;
 use miette::{Context, IntoDiagnostic, miette};
 use rayon::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// `failed to fetch …` as a report, carrying the sandbox help when the
+/// registry client classified the failure as a network deny — the one case
+/// where the remedy is environmental and "check auth" would mislead an agent.
+pub(crate) fn fetch_failure(e: &aube_registry::Error, message: String) -> miette::Report {
+    match e {
+        aube_registry::Error::NetworkDenied(_) => {
+            miette!(
+                help = aube_util::agent_sandbox::network_denied_help(),
+                "{message}"
+            )
+        }
+        _ => miette!("{message}"),
+    }
+}
 
 /// Materialize a local-source package into the store.
 ///
@@ -69,7 +90,7 @@ pub(super) async fn import_local_source(
             let script = aube_resolver::resolve_exec_script_path(local, project_root)
                 .map_err(|e| miette!("exec dependency {}: {e}{chain}", local.specifier()))?;
             let temp = tempfile::Builder::new()
-                .prefix("aube-exec-")
+                .prefix(&format!("{}-exec-", aube_util::prog()))
                 .tempdir()
                 .into_diagnostic()
                 .wrap_err_with(|| format!("create temp dir for {}{chain}", local.specifier()))?;
@@ -90,7 +111,7 @@ pub(super) async fn import_local_source(
                 "buildDir": build_dir,
                 "locator": format!("{pkg_name}@{}", local.specifier()),
             });
-            let status = tokio::process::Command::new(crate::runtime::node_program())
+            let status = tokio::process::Command::new(crate::runtime::internal_node_program())
                 .arg("-e")
                 .arg(aube_resolver::YARN_EXEC_WRAPPER)
                 .arg(&script)
@@ -273,61 +294,27 @@ pub(super) async fn import_local_source(
                 }
             }
 
-            // If the cloned repo defines a `prepare` script, treat
-            // it as a source checkout that needs to be built before
-            // we snapshot it. Matches npm/pnpm: a TypeScript repo
-            // installed from git has devDependencies + a `prepare`
-            // that compiles `src/` into `dist/`, and consumers
-            // expect the built output. We run a nested `aube
-            // install` inside the clone, which installs its deps
-            // and runs its own root lifecycle hooks (including
-            // `prepare`), then `aube pack`'s file-selection logic
-            // snapshots exactly what would be published (honors
-            // `files`, `.npmignore`, and skips `node_modules`).
-            //
-            // `--ignore-scripts` short-circuits the whole branch:
-            // the only reason we'd pay the cost of a nested install
-            // is to run `prepare`, so with scripts disabled we fall
-            // through to the plain directory import. Matches pnpm,
-            // which skips `prepare` for git deps under
-            // `--ignore-scripts` as well.
-            let manifest_path = pkg_root.join("package.json");
-            let needs_prepare = !ignore_scripts
-                && aube_manifest::PackageJson::from_path(&manifest_path)
-                    .ok()
-                    .is_some_and(|pj| pj.scripts.contains_key("prepare"));
-
-            if needs_prepare {
-                // Run `prepare` on a private copy of the checkout,
-                // not on the shared `git_shallow_clone` cache
-                // directory. The cache is keyed by (url, commit)
-                // and reused across installs; mutating it in place
-                // would leave `node_modules/`, `aube-lock.yaml`,
-                // and any generated `dist/` behind, so a later
-                // `aube install --ignore-scripts` — which falls
-                // through to the plain directory-import path —
-                // would silently pull those build artifacts into
-                // the store even though the user asked for a
-                // scripts-free install. Copying also isolates
-                // concurrent installs of the same git dep from
-                // clobbering each other's in-progress prepare.
-                //
-                // `ScratchDir` removes the copy on drop, including
-                // on the error path.
-                let scratch = prepare_scratch_copy(&pkg_root, &spec)?;
-                run_git_dep_prepare(
-                    scratch.path(),
+            let manifest = aube_manifest::PackageJson::from_path(&pkg_root.join("package.json"));
+            let build = match &manifest {
+                Ok(manifest)
+                    if !ignore_scripts
+                        && checkout_needs_build(manifest, |p| pkg_root.join(p).exists()) =>
+                {
+                    checkout_build_allowed(inherited_build_policy.as_deref(), local, manifest)?
+                }
+                _ => false,
+            };
+            if build {
+                let index = prepare_git_checkout(
+                    store,
+                    &pkg_root,
                     &spec,
                     ignore_scripts,
                     git_prepare_depth,
                     inherited_build_policy,
+                    &chain,
                 )
                 .await?;
-                let archive = crate::commands::pack::build_archive(scratch.path())
-                    .wrap_err_with(|| format!("failed to pack prepared git dep {spec}{chain}"))?;
-                let index = store
-                    .import_tarball(&archive.tarball)
-                    .map_err(|e| miette!("failed to import prepared {spec}: {e}{chain}"))?;
                 return Ok(Some(index));
             }
 
@@ -352,9 +339,12 @@ pub(super) async fn import_local_source(
                 )
             })?;
             let bytes = client.fetch_tarball_bytes(&t.url).await.map_err(|e| {
-                miette!(
-                    "failed to fetch {}: {e}{chain}",
-                    aube_util::url::redact_url(&t.url)
+                fetch_failure(
+                    &e,
+                    format!(
+                        "failed to fetch {}: {e}{chain}",
+                        aube_util::url::redact_url(&t.url)
+                    ),
                 )
             })?;
             if t.integrity.is_empty() {
@@ -371,9 +361,126 @@ pub(super) async fn import_local_source(
             let index = store
                 .import_tarball(&bytes)
                 .map_err(|e| miette!("failed to import {}: {e}{chain}", local.specifier()))?;
+
+            // A hosted git dep pinned to a commit is recorded as its
+            // codeload archive (`hosted_git_local_source` in the
+            // resolver), so it arrives here rather than in the `Git`
+            // arm. It is still a source checkout and gets the same
+            // build, under the same gate. The manifest is read from the
+            // just-imported index so a dep with nothing to build costs
+            // one small file read, not an extract.
+            let hosted_git = if ignore_scripts {
+                None
+            } else {
+                t.as_hosted_git_source()
+            };
+            let manifest = hosted_git.as_ref().and_then(|_| index_manifest(&index));
+            let build = match &manifest {
+                Some(manifest)
+                    if checkout_needs_build(manifest, |p| archive_has_path(&index, p)) =>
+                {
+                    checkout_build_allowed(inherited_build_policy.as_deref(), local, manifest)?
+                }
+                _ => false,
+            };
+            if build && let Some(g) = hosted_git {
+                let spec = format!("{}#{}", g.url, g.resolved);
+                let integrity = (!t.integrity.is_empty()).then(|| t.integrity.clone());
+                let (checkout, _) = tokio::task::spawn_blocking(move || {
+                    aube_store::extract_codeload_tarball(
+                        &bytes,
+                        &g.url,
+                        &g.resolved,
+                        integrity.as_deref(),
+                    )
+                })
+                .await
+                .map_err(|e| miette!("codeload extract task panicked: {e}"))?
+                .map_err(|e| miette!("git dep {spec}: extract codeload archive: {e}{chain}"))?;
+                let index = prepare_git_checkout(
+                    store,
+                    &checkout,
+                    &spec,
+                    ignore_scripts,
+                    git_prepare_depth,
+                    inherited_build_policy,
+                    &chain,
+                )
+                .await?;
+                return Ok(Some(index));
+            }
             Ok(Some(index))
         }
     }
+}
+
+fn index_manifest(index: &aube_store::PackageIndex) -> Option<aube_manifest::PackageJson> {
+    index
+        .get("package.json")
+        .and_then(|stored| std::fs::read(&stored.store_path).ok())
+        .and_then(|bytes| aube_manifest::PackageJson::from_slice(&bytes).ok())
+}
+
+/// Build a git dep's source checkout and import what it would publish.
+///
+/// A TypeScript repo installed from git has devDependencies plus a
+/// `prepare` that compiles `src/` into `dist/`, and consumers expect
+/// the built output (npm and pnpm both build it). A nested install
+/// inside the checkout links its deps and runs its own root lifecycle,
+/// `prepare` included; then `pack`'s file selection snapshots exactly
+/// what would be published (honors `files` and `.npmignore`, skips
+/// `node_modules`). Callers gate this as pnpm does: with
+/// `--ignore-scripts`, or a build the allowlist denies, they import the
+/// checkout as-is, and one it does not mention fails the install
+/// (`checkout_build_allowed`).
+///
+/// The build runs on a private copy, never on `checkout` itself, which
+/// is the shared `(url, commit)` git or codeload cache. Building in
+/// place would leave `node_modules/`, a lockfile and `dist/` behind, so
+/// a later `--ignore-scripts` install, which imports the cache
+/// directory directly, would silently pick up those build artifacts.
+/// The copy also keeps concurrent installs of the same dep from
+/// clobbering each other's build, and `ScratchDir` removes it on drop,
+/// error path included.
+async fn prepare_git_checkout(
+    store: &std::sync::Arc<aube_store::Store>,
+    checkout: &std::path::Path,
+    spec: &str,
+    ignore_scripts: bool,
+    git_prepare_depth: u32,
+    inherited_build_policy: Option<std::sync::Arc<aube_scripts::BuildPolicy>>,
+    chain: &str,
+) -> miette::Result<aube_store::PackageIndex> {
+    let scratch = prepare_scratch_copy(checkout, spec)?;
+    run_git_dep_prepare(
+        scratch.path(),
+        spec,
+        ignore_scripts,
+        git_prepare_depth,
+        inherited_build_policy,
+    )
+    .await?;
+    let archive = crate::commands::pack::build_archive(scratch.path())
+        .wrap_err_with(|| format!("failed to pack prepared git dep {spec}{chain}"))?;
+    store
+        .import_tarball(&archive.tarball)
+        .map_err(|e| miette!("failed to import prepared {spec}: {e}{chain}"))
+}
+
+/// The warm-classifier index read key for `pkg`: its lockfile SRI when
+/// present, else this project's computed-sha512 binding for the
+/// coordinate (a no-integrity package). `None` means a no-integrity
+/// package with no binding yet — the caller must re-fetch rather than
+/// fall back to the content-free `None` selector.
+fn warm_read_key<'a>(
+    pkg: &'a aube_lockfile::LockedPackage,
+    no_integrity_index: &'a BTreeMap<String, String>,
+) -> Option<&'a str> {
+    pkg.integrity.as_deref().or_else(|| {
+        no_integrity_index
+            .get(&format!("{}@{}", pkg.registry_name(), pkg.version))
+            .map(String::as_str)
+    })
 }
 
 /// Fetch tarballs for resolved packages, checking the index cache first.
@@ -391,8 +498,8 @@ pub(in crate::commands) async fn fetch_packages(
 ) -> miette::Result<(BTreeMap<String, aube_store::PackageIndex>, usize, usize)> {
     // Eager-client caller (`aube fetch`): the command only exists to
     // download tarballs, so there's no point deferring construction.
-    // `skip_already_linked_shortcut=true` because `aube fetch`'s entire
-    // job is to verify/populate the global store — it must not be
+    // No already-linked shortcut because `aube fetch`'s entire job is
+    // to verify/populate the global store — it must not be
     // short-circuited by a stale `node_modules/.aube/<dep>` from a
     // prior install, which could leave the store empty on a setup
     // that wipes the global aube store but not `node_modules/` (e.g.
@@ -419,15 +526,17 @@ pub(in crate::commands) async fn fetch_packages(
     let strict_pkg_content_check = resolve_strict_store_pkg_content_check(&ctx);
     let virtual_store_dir_max_length = resolve_virtual_store_dir_max_length(&ctx);
     let aube_dir = resolve_virtual_store_dir(&ctx, &cwd);
-    fetch_packages_with_root(
+    let (indices, cached, fetched, _) = fetch_packages_with_root(
         packages,
         store,
         || client,
         progress,
         &cwd,
         &aube_dir,
+        &packument_cache_dir(),
         /*materialize_tx=*/ None,
-        /*skip_already_linked_shortcut=*/ true,
+        /*already_linked_shortcut=*/ None,
+        /*force_index_dep_paths=*/ &std::collections::BTreeSet::new(),
         virtual_store_dir_max_length,
         ignore_scripts,
         network_concurrency,
@@ -438,7 +547,8 @@ pub(in crate::commands) async fn fetch_packages(
         None,
         git_shallow_hosts,
     )
-    .await
+    .await?;
+    Ok((indices, cached, fetched))
 }
 
 // `network_concurrency`: override for the tarball-fetch semaphore.
@@ -460,29 +570,35 @@ pub(super) async fn fetch_packages_with_root<F>(
     progress: Option<&InstallProgress>,
     project_root: &std::path::Path,
     aube_dir: &std::path::Path,
+    packument_cache_dir: &std::path::Path,
     // Some streams every successful (dep_path, index) so a concurrent
     // GVS-prewarm materializer can start reflinks before the full
     // batch finishes. None keeps batch-then-return for `aube fetch`.
     // Sender drops on function exit so consumer sees channel close.
     materialize_tx: Option<tokio::sync::mpsc::Sender<(String, aube_store::PackageIndex)>>,
-    // When true, every package classifies as `Cached` or `NeedsFetch`
-    // based on `store.load_index`, regardless of whether
-    // `.aube/<dep>` already exists on disk. Callers pass true when
-    // either:
+    // The virtual-store layout the linker will produce, when the
+    // already-linked shortcut is in play. `Some` lets a package whose
+    // `.aube/<dep>` entry already matches what the linker expects skip
+    // the store index entirely; `None` disables the shortcut, so every
+    // package classifies as `Cached` or `NeedsFetch` through
+    // `store.load_index_verified` regardless of what is on disk.
     //
-    //   - the linker will wipe `node_modules/` before running
-    //     (`link_workspace`), so the `AlreadyLinked` classification
-    //     would be immediately invalidated; or
-    //   - the caller needs `load_index` to actually run as its store
-    //     verification step (`aube fetch`, which treats the act of
-    //     walking the store-file existence check as the operation's
-    //     primary side effect).
+    // Callers pass `None` when either:
     //
-    // Both cases share the same implementation: skip the `.aube/`
-    // existence check entirely so every package goes through
-    // `store.load_index` → either `Cached` (store has it) or
-    // `NeedsFetch` (store is missing the file, download fresh).
-    skip_already_linked_shortcut: bool,
+    //   - the shortcut has not been turned on for that install shape
+    //     yet. Workspaces are the live case: `link_workspace`'s step 1b
+    //     mirrors `link_all`'s state machine exactly, so the
+    //     classification below is as sound there as it is here, but
+    //     switching monorepos over is a perf change that wants its own
+    //     measurement rather than a ride on a correctness fix; or
+    //   - the caller needs the verified index load to actually run as
+    //     its store verification step (`aube fetch`, which treats the
+    //     act of walking the store-file existence check as the
+    //     operation's primary side effect).
+    already_linked_shortcut: Option<&super::materialize::VirtualStorePlan>,
+    // Packages selected for project-local compatibility materialization
+    // need an index even when their prior GVS entry still exists.
+    force_index_dep_paths: &std::collections::BTreeSet<String>,
     virtual_store_dir_max_length: usize,
     ignore_scripts: bool,
     network_concurrency: Option<usize>,
@@ -492,13 +608,19 @@ pub(super) async fn fetch_packages_with_root<F>(
     git_prepare_depth: u32,
     inherited_build_policy: Option<std::sync::Arc<aube_scripts::BuildPolicy>>,
     git_shallow_hosts: Vec<String>,
-) -> miette::Result<(BTreeMap<String, aube_store::PackageIndex>, usize, usize)>
+) -> miette::Result<(
+    BTreeMap<String, aube_store::PackageIndex>,
+    usize,
+    usize,
+    BTreeMap<String, String>,
+)>
 where
     F: FnOnce() -> std::sync::Arc<aube_registry::client::RegistryClient>,
 {
+    let packument_cache_dir = packument_cache_dir.to_path_buf();
     // No-op fast path: for every package whose per-project
-    // `node_modules/.aube/<dep_path>` entry already resolves to an
-    // existing target, skip the package-index load entirely. The
+    // `node_modules/.aube/<dep_path>` entry is already the one the
+    // linker will accept, skip the package-index load entirely. The
     // linker's only consumer of a `PackageIndex` is
     // `materialize_into` — if the package is already materialized
     // (either as a real directory here in per-project mode, or as a
@@ -509,35 +631,27 @@ where
     // fixture drops from ~38 ms of parallel index reads to a handful
     // of `stat(2)`s.
     //
-    // Two call sites disable the fast path entirely via
-    // `skip_already_linked_shortcut=true`:
+    // "The one the linker will accept" is what
+    // `VirtualStorePlan::entry_is_current` decides, and it is stricter
+    // than mere resolvability. Under the global virtual store the
+    // local `.aube/<dep_path>` name is keyed by dep_path alone while
+    // the shared subdir folds in graph hashes (`aube_dir_entry_name`
+    // vs `virtual_store_subdir`), so a build-state change moves the
+    // expected target while the entry keeps resolving to the old one.
+    // A shortcut keyed on resolvability alone would classify that
+    // package `AlreadyLinked`; `classify_entry_state` would then report
+    // `Stale`, the linker would need an index it was never handed, and
+    // its fallback is the *unverified* `store.load_index` — which
+    // happily returns a stale index whose CAS shards are gone, failing
+    // the link instead of re-fetching. Comparing against the expected
+    // subdir keeps that case self-healing: it misses the shortcut,
+    // takes the verified index load below, and a stale index drops to
+    // `NeedsFetch` so the tarball is re-downloaded while the network is
+    // still available. The linker has no such option — only fetch can
+    // re-download, which is why the check belongs here.
     //
-    //   - **Workspace installs.** `link_workspace` unconditionally
-    //     wipes `node_modules/` (including `.aube/`) before
-    //     rebuilding, so every `AlreadyLinked` classification would
-    //     be invalidated by the time the linker runs. With the fast
-    //     path enabled, the linker would then fall back to
-    //     `self.store.load_index` *serially* inside `link_workspace`'s
-    //     for-loop, which is strictly slower than loading them here
-    //     in parallel via rayon.
-    //
-    //   - **`aube fetch`.** The command exists to populate the
-    //     global store (typical use: Docker layer caching, warming
-    //     a CI mirror, or recovering from a wiped aube store).
-    //     If `node_modules/.aube/<dep>` happens to exist from a
-    //     previous install, the `AlreadyLinked` shortcut would skip
-    //     both `load_index` and the tarball fetch — which silently
-    //     leaves the store empty even though the user explicitly
-    //     asked for it to be repopulated. Disabling the shortcut
-    //     makes every package flow through `store.load_index`,
-    //     which does a first-file existence check on the CAS and
-    //     correctly downgrades to `NeedsFetch` when the store entry
-    //     has been wiped.
-    //
-    // `Path::exists` follows symlinks, so a per-project entry pointing
-    // at a global virtual-store target that no longer exists correctly
-    // falls through to the slow path. The linker re-derives the entry
-    // name through `aube_dir_entry_name(dep_path)`, which is just
+    // The linker re-derives the entry name through
+    // `aube_dir_entry_name(dep_path)`, which is just
     // `dep_path_to_filename(dep_path, max_length)` — we take the max
     // length as a parameter (instead of reaching for
     // `DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH`) so the fast path checks
@@ -563,16 +677,76 @@ where
         NeedsFetch,
     }
 
-    // Parallel index check (rayon)
-    let check_results: Vec<_> = packages
+    // URL-keyed content-address bindings for no-integrity packages,
+    // projected to the `name@version` lookup the warm classifier uses
+    // (see `state::read_no_integrity_index_for`). The read keys each
+    // no-integrity coordinate by the sha512 bound for the registry URL it
+    // resolves to, never a content-free shared-store selector.
+    let no_integrity_index =
+        crate::state::read_no_integrity_index_for(project_root, packages.values());
+
+    // Verify each distinct store entry once, before the per-dep_path
+    // check. Peer placements re-enter the same (registry name, version,
+    // read key) once per dep_path, and every verified load stats one
+    // file per index entry (or the first file under fast-trust);
+    // grouping the loads means the verification runs a single time no
+    // matter how many placements share the package. Packages that will
+    // take the already-linked shortcut never needed a load, so they
+    // are excluded here to keep the shortcut's zero-read behavior. The
+    // shortcut test is a `read_link` + `exists` per package, so it stays
+    // on rayon like the per-dep_path check it was hoisted out of.
+    let packages_refs: Vec<(&String, &aube_lockfile::LockedPackage)> = packages.iter().collect();
+    let needs_check: Vec<bool> = packages_refs
         .par_iter()
-        .filter(|(_, pkg)| pkg.local_source.is_none())
-        .map(|(dep_path, pkg)| {
-            if !skip_already_linked_shortcut {
-                let entry_name = dep_path_to_filename(dep_path, virtual_store_dir_max_length);
-                if aube_dir.join(&entry_name).exists() {
-                    return (dep_path.clone(), pkg, CheckResult::AlreadyLinked);
+        .map(|&(dep_path, pkg)| {
+            if pkg.local_source.is_some() {
+                return false;
+            }
+            match already_linked_shortcut {
+                // `force_index_dep_paths` is the project-local closure the
+                // linker materializes as real directories rather than
+                // shared-store symlinks, so its freshness test is a
+                // different one; those always take the verified path.
+                Some(plan) if !force_index_dep_paths.contains(dep_path) => {
+                    let entry_name = dep_path_to_filename(dep_path, virtual_store_dir_max_length);
+                    let entry = aube_dir.join(&entry_name);
+                    !plan.entry_is_current(&entry, dep_path, virtual_store_dir_max_length)
                 }
+                _ => true,
+            }
+        })
+        .collect();
+    let mut store_keys: Vec<(&str, &str, Option<&str>)> = Vec::new();
+    let mut seen_keys: std::collections::HashSet<(&str, &str, Option<&str>)> =
+        std::collections::HashSet::new();
+    for (&(_, pkg), &needs) in packages_refs.iter().zip(&needs_check) {
+        if !needs {
+            continue;
+        }
+        let read_key = warm_read_key(pkg, &no_integrity_index);
+        // `None` must re-fetch (see `warm_read_key`), never a load.
+        if read_key.is_none() {
+            continue;
+        }
+        let key = (pkg.registry_name(), pkg.version.as_str(), read_key);
+        if seen_keys.insert(key) {
+            store_keys.push(key);
+        }
+    }
+    let verified: HashMap<(&str, &str, Option<&str>), Option<aube_store::PackageIndex>> =
+        store_keys
+            .par_iter()
+            .map(|key| (*key, super::warm_load_index(store, key.0, key.1, key.2)))
+            .collect();
+
+    // Parallel index check (rayon)
+    let check_results: Vec<_> = packages_refs
+        .par_iter()
+        .enumerate()
+        .filter(|(_, (_, pkg))| pkg.local_source.is_none())
+        .map(|(i, (dep_path, pkg))| {
+            if !needs_check[i] {
+                return (dep_path.to_string(), pkg, CheckResult::AlreadyLinked);
             }
             // Keyed by registry name so two npm-aliases of the same
             // real package share one store index entry instead of
@@ -598,14 +772,20 @@ where
             // `ERR_AUBE_MISSING_STORE_FILE`, forcing a whole-install
             // retry. Independent of import-time SRI / `verifyStoreIntegrity`,
             // which is enforced on fetch regardless of this flag.
-            match super::warm_load_index(
-                store,
-                pkg.registry_name(),
-                &pkg.version,
-                pkg.integrity.as_deref(),
-            ) {
-                Some(index) => (dep_path.clone(), pkg, CheckResult::Cached(index)),
-                None => (dep_path.clone(), pkg, CheckResult::NeedsFetch),
+            // Content-address the lookup: a no-integrity package keys by
+            // the sha512 this project bound for the coordinate, not the
+            // bare `None` selector. No binding yet (first install, or a
+            // store predating this index) → re-fetch rather than read the
+            // content-free selector that, in a shared store, could return
+            // a different project's bytes for the same name@version.
+            // The grouped verification above keeps the staleness window
+            // the same size as a single pass: every dep_path of one
+            // store entry now sees the same verified snapshot.
+            let read_key = warm_read_key(pkg, &no_integrity_index);
+            let key = (pkg.registry_name(), pkg.version.as_str(), read_key);
+            match verified.get(&key).cloned().flatten() {
+                Some(index) => (dep_path.to_string(), pkg, CheckResult::Cached(index)),
+                None => (dep_path.to_string(), pkg, CheckResult::NeedsFetch),
             }
         })
         .collect();
@@ -709,6 +889,7 @@ where
     if let Some(p) = progress {
         p.inc_reused(cached_count);
     }
+    let mut computed_integrities: BTreeMap<String, String> = BTreeMap::new();
 
     // Critical-path fetch order: float likely-native-build packages
     // (sharp, esbuild, @swc/*, sqlite3, lmdb, bcrypt, etc) to the
@@ -776,8 +957,9 @@ where
         // instead of detaching them into the background. Detached
         // tasks keep writing to the CAS after the install command
         // has already errored out.
-        let mut handles: tokio::task::JoinSet<miette::Result<(String, aube_store::PackageIndex)>> =
-            tokio::task::JoinSet::new();
+        let mut handles: tokio::task::JoinSet<
+            miette::Result<(String, aube_store::PackageIndex, Option<String>)>,
+        > = tokio::task::JoinSet::new();
 
         for (dep_path, display_name, registry_name, version, tarball_url_override, integrity) in
             to_fetch
@@ -785,10 +967,11 @@ where
             let sem = semaphore.clone();
             let store = store.clone();
             let client = client.clone();
+            let packument_cache_dir = packument_cache_dir.clone();
             let row = progress.map(|p| p.start_fetch(&display_name, &version));
             let bytes_progress = progress.cloned();
 
-            handles.spawn(async move {
+            handles.spawn(crate::dep_chain::scope_current(async move {
                 let _row = row;
                 let task_start = std::time::Instant::now();
                 let permit = sem.acquire().await;
@@ -802,8 +985,42 @@ where
                     .clone()
                     .unwrap_or_else(|| client.tarball_url(&registry_name, &version));
                 if let Some(lockfile_url) = tarball_url_override.as_deref() {
-                    verify_lockfile_tarball_url(&client, &registry_name, &version, lockfile_url)
-                        .await?;
+                    // The recheck re-fetches the packument via `registry_name`,
+                    // which resolves to the config (DEFAULT/scoped) registry. A
+                    // pnpm `namedRegistries` package lives on a host recorded
+                    // ONLY in the lockfile URL — a frozen install skips the
+                    // resolve that would record the route — so re-fetching would
+                    // hit the wrong registry and 404. Skip the recheck when the
+                    // locked host isn't the one we'd resolve to; the tarball is
+                    // still fetched directly from the persisted URL with
+                    // URL-keyed auth, and the SHA-512 integrity check validates
+                    // the CONTENT, so dropping the URL-consistency recheck is safe.
+                    let config_registry = client.config_registry_for(&registry_name);
+                    let host_matches = aube_registry::registry_host_key(lockfile_url)
+                        == aube_registry::registry_host_key(&config_registry);
+                    match locked_tarball_url_action(host_matches, integrity.is_some()) {
+                        LockedTarballUrlAction::Verify => {
+                            verify_lockfile_tarball_url(
+                                &client,
+                                &registry_name,
+                                &version,
+                                lockfile_url,
+                                &packument_cache_dir,
+                            )
+                            .await?;
+                        }
+                        LockedTarballUrlAction::Skip => {}
+                        LockedTarballUrlAction::Refuse => {
+                            return Err(miette!(
+                                code = aube_codes::errors::ERR_AUBE_TARBALL_URL_MISMATCH,
+                                "{}@{}: lockfile pins tarball {} on a host that differs from its configured registry but records no integrity hash; refusing to fetch an unverifiable tarball (run `{} --no-frozen-lockfile` to refresh the lockfile)",
+                                registry_name,
+                                version,
+                                aube_util::url::redact_url(lockfile_url),
+                                aube_util::cmd("install"),
+                            ));
+                        }
+                    }
                 }
 
                 let dl_start = std::time::Instant::now();
@@ -830,10 +1047,29 @@ where
                         strict_pkg_content_check,
                     )
                     .await;
-                    let (index, bytes_len) = match streamed {
-                        Ok(v) => {
+                    match streamed {
+                        Ok((index, bytes_len, computed_integrity)) => {
                             permit.record_success();
-                            v
+                            let dl_time = dl_start.elapsed();
+                            if let Some(p) = bytes_progress.as_ref() {
+                                p.inc_downloaded_bytes(bytes_len);
+                            }
+                            tracing::trace!(
+                                "fetch (stream) {display_name}@{version}: wait={:.0?} total={:.0?} ({} bytes)",
+                                wait_time,
+                                dl_time,
+                                bytes_len
+                            );
+                            return Ok::<_, miette::Report>((dep_path, index, computed_integrity));
+                        }
+                        // Falls through to the buffered fetch below, which
+                        // downloads the whole body again and records the permit.
+                        Err(e) if e.retry_buffered => {
+                            tracing::warn!(
+                                error = %e.report,
+                                code = aube_codes::warnings::WARN_AUBE_HTTP_RETRY_TRANSPORT,
+                                "retrying HTTP request after transport error",
+                            );
                         }
                         Err(e) => {
                             if e.is_throttle {
@@ -843,18 +1079,7 @@ where
                             }
                             return Err(e.into());
                         }
-                    };
-                    let dl_time = dl_start.elapsed();
-                    if let Some(p) = bytes_progress.as_ref() {
-                        p.inc_downloaded_bytes(bytes_len);
                     }
-                    tracing::trace!(
-                        "fetch (stream) {display_name}@{version}: wait={:.0?} total={:.0?} ({} bytes)",
-                        wait_time,
-                        dl_time,
-                        bytes_len
-                    );
-                    return Ok::<_, miette::Report>((dep_path, index));
                 }
 
                 // Buffered SHA-512 path. Streaming SHA-512 hashes
@@ -870,9 +1095,12 @@ where
                         .map_err(|e| {
                             let throttled = e.is_throttle();
                             (
-                                miette!(
-                                    "failed to fetch {display_name}@{version}: {e}{}",
-                                    crate::dep_chain::format_chain_for(&display_name, &version)
+                                fetch_failure(
+                                    &e,
+                                    format!(
+                                        "failed to fetch {display_name}@{version}: {e}{}",
+                                        crate::dep_chain::format_chain_for(&display_name, &version)
+                                    ),
                                 ),
                                 throttled,
                             )
@@ -881,9 +1109,12 @@ where
                     client.fetch_tarball_bytes(&url).await.map(|b| (b, None)).map_err(|e| {
                         let throttled = e.is_throttle();
                         (
-                            miette!(
-                                "failed to fetch {display_name}@{version}: {e}{}",
-                                crate::dep_chain::format_chain_for(&display_name, &version)
+                            fetch_failure(
+                                &e,
+                                format!(
+                                    "failed to fetch {display_name}@{version}: {e}{}",
+                                    crate::dep_chain::format_chain_for(&display_name, &version)
+                                ),
                             ),
                             throttled,
                         )
@@ -908,6 +1139,12 @@ where
                 if let Some(p) = bytes_progress.as_ref() {
                     p.inc_downloaded_bytes(bytes.len() as u64);
                 }
+                let computed_integrity = integrity
+                    .is_none()
+                    .then(|| match streamed_digest.as_ref() {
+                        Some(digest) => aube_store::sha512_integrity_from_digest(digest),
+                        None => aube_store::sha512_integrity(&bytes),
+                    });
 
                 // Keep the semaphore permit through import, not just
                 // download. `import_tarball` fans out into gzip/tar
@@ -938,6 +1175,15 @@ where
                     strict_pkg_content_check,
                 )
                 .await?;
+                if let Some(integrity) = computed_integrity.as_deref()
+                    && let Err(e) =
+                        store.save_index(&registry_name, &version, Some(integrity), &index)
+                {
+                    tracing::warn!(
+                        code = aube_codes::warnings::WARN_AUBE_CACHE_WRITE_FAILED,
+                        "Failed to cache index for {display_name}@{version} with computed integrity: {e}"
+                    );
+                }
 
                 tracing::trace!(
                     "fetch {display_name}@{version}: wait={:.0?} dl={:.0?} ({} bytes) import={:.0?}",
@@ -947,12 +1193,12 @@ where
                     import_time
                 );
 
-                Ok::<_, miette::Report>((dep_path, index))
-            });
+                Ok::<_, miette::Report>((dep_path, index, computed_integrity))
+            }));
         }
 
         while let Some(joined) = handles.join_next().await {
-            let (dep_path, index) = joined.into_diagnostic()??;
+            let (dep_path, index, computed_integrity) = joined.into_diagnostic()??;
             if let Some(tx) = materialize_tx.as_ref() {
                 // Time channel send so back-pressure events show up in
                 // the trace. The materialize channel is bounded; if the
@@ -977,6 +1223,10 @@ where
                     }
                 }
             }
+            if let Some(integrity) = computed_integrity {
+                computed_integrities
+                    .insert(strip_peer_context_suffix(&dep_path).to_owned(), integrity);
+            }
             indices.insert(dep_path, index);
         }
     }
@@ -988,7 +1238,44 @@ where
         sem.persist(&state, "tarball:default");
     }
 
-    Ok((indices, cached_count, fetch_count))
+    // Bind every no-integrity package we imported this run to the sha512
+    // we computed, keyed in the GLOBAL store by the registry tarball URL it
+    // resolves to (derived from this project's `.npmrc` registry config),
+    // so the next frozen warm install — including one whose `node_modules`
+    // was wiped, and any other project on the same registry — content-
+    // addresses the store lookup instead of re-fetching, without ever
+    // relying on a content-free shared-store selector. Keying by the
+    // configured-registry URL is the #212/#220 closure: a different
+    // registry yields a different key. Only no-integrity entries need it;
+    // `computed_integrities` already holds exactly those (populated only
+    // when the lockfile carried no SRI). The client closure may already be
+    // consumed by the fetches above, so derive URLs from a fresh sync
+    // client; this only runs when there are no-integrity packages to bind.
+    if !computed_integrities.is_empty() {
+        let url_client = crate::commands::make_client(project_root);
+        let bindings: BTreeMap<String, String> = packages
+            .iter()
+            .filter(|(_, pkg)| pkg.integrity.is_none() && pkg.local_source.is_none())
+            .filter_map(|(dep_path, pkg)| {
+                computed_integrities
+                    .get(strip_peer_context_suffix(dep_path))
+                    .map(|sri| {
+                        (
+                            url_client.tarball_url(pkg.registry_name(), &pkg.version),
+                            sri.clone(),
+                        )
+                    })
+            })
+            .collect();
+        if let Err(e) = crate::state::write_no_integrity_bindings(
+            &crate::state::no_integrity_dir(project_root),
+            &bindings,
+        ) {
+            tracing::debug!("failed to persist no-integrity content-address index: {e}");
+        }
+    }
+
+    Ok((indices, cached_count, fetch_count, computed_integrities))
 }
 
 async fn verify_lockfile_tarball_url(
@@ -996,9 +1283,10 @@ async fn verify_lockfile_tarball_url(
     registry_name: &str,
     version: &str,
     lockfile_url: &str,
+    packument_cache_dir: &std::path::Path,
 ) -> miette::Result<()> {
     let packument = client
-        .fetch_packument_cached(registry_name, &packument_cache_dir())
+        .fetch_packument_cached(registry_name, packument_cache_dir)
         .await
         .map_err(|e| {
             miette!(
@@ -1040,6 +1328,33 @@ async fn verify_lockfile_tarball_url(
     Ok(())
 }
 
+/// What to do with a lockfile-pinned tarball URL before fetching it.
+#[derive(Debug, PartialEq, Eq)]
+enum LockedTarballUrlAction {
+    /// Host matches the config-derived registry: re-verify the URL against
+    /// that registry's metadata.
+    Verify,
+    /// Host differs but a content hash still guards the bytes: skip the URL
+    /// recheck and fetch straight from the persisted URL (the frozen-install
+    /// path for a pnpm `namedRegistries` package).
+    Skip,
+    /// Host differs AND no integrity hash: skipping the recheck would leave
+    /// the bytes — and their lifecycle scripts — fully unverified. Refuse.
+    Refuse,
+}
+
+/// Decide how to treat a lockfile-pinned tarball URL. The verify-SKIP that a
+/// host mismatch enables is safe ONLY while the SHA-512 content hash still
+/// guards the bytes; without integrity a host-mismatched entry would bypass
+/// both the URL recheck and the content check, so it is refused.
+fn locked_tarball_url_action(host_matches: bool, has_integrity: bool) -> LockedTarballUrlAction {
+    match (host_matches, has_integrity) {
+        (true, _) => LockedTarballUrlAction::Verify,
+        (false, true) => LockedTarballUrlAction::Skip,
+        (false, false) => LockedTarballUrlAction::Refuse,
+    }
+}
+
 fn lockfile_tarball_url_matches_metadata(lockfile_url: &str, expected_url: &str) -> bool {
     lockfile_url == expected_url
         || (is_public_npm_registry_tarball(lockfile_url)
@@ -1073,63 +1388,34 @@ pub(super) fn version_from_dep_path(dep_path: &str, name: &str) -> String {
     tail.split('(').next().unwrap_or(tail).to_string()
 }
 
-/// Re-key a canonical-indexed indices map to match the peer-contextualized
-/// dep_paths in `graph`. Each contextualized entry points at the same
-/// underlying files as its canonical name@version, so we look each graph
-/// entry up by canonical and clone the index — a no-op when canonical ==
-/// contextualized (i.e. the package has no peer deps).
-pub(super) fn remap_indices_to_contextualized(
-    canonical_indices: &BTreeMap<String, aube_store::PackageIndex>,
-    graph: &aube_lockfile::LockfileGraph,
-) -> BTreeMap<String, aube_store::PackageIndex> {
-    let mut out = BTreeMap::new();
-    for (dep_path, pkg) in &graph.packages {
-        let canonical_key = pkg.spec_key();
-        // The peer-context pass appends a `(peer@ver)` suffix (or a
-        // parenthesized `(<short-hash>)` when it exceeds the cap) onto a
-        // package's canonical dep_path. Source-backed deps (git /
-        // remote tarball / file) are streamed from the resolver — and
-        // therefore keyed in `canonical_indices` — under their
-        // *source-coordinate* dep_path (`name@git+<short>`), not their
-        // semver `spec_key()`. So once such a dep picks up a peer
-        // suffix, neither the contextualized `dep_path` (carries the
-        // suffix) nor `spec_key()` (semver, not the git coordinate)
-        // matches the streamed key, and the index would be silently
-        // dropped — later tripping `ERR_AUBE_MISSING_PACKAGE_INDEX` in
-        // the linker's global-virtual-store pass. Stripping the suffix
-        // recovers the exact canonical coordinate the index was stored
-        // under (the peer-context pass builds the key as
-        // `{canonical_base}{suffix}`, so this is its precise inverse).
-        let canonical_dep_path = strip_peer_context_suffix(dep_path);
-        if let Some(idx) = canonical_indices
-            .get(dep_path)
-            .or_else(|| canonical_indices.get(canonical_dep_path))
-            .or_else(|| canonical_indices.get(&canonical_key))
-        {
-            out.insert(dep_path.clone(), idx.clone());
-        }
-    }
-    out
-}
-
-/// Strip the peer-context suffix from a `dep_path`, recovering the
-/// canonical dep_path the resolver streamed it under (and that
-/// `canonical_indices` is keyed by). The peer-context pass in
-/// `aube-resolver` appends either a parenthesized `(peer@ver)…` tail
-/// or, when the suffix body exceeds the length cap, a single
-/// parenthesized short hash `(<short-hash>)` (pnpm's
-/// `createPeerDepGraphHash`). Both forms begin at the first `(`, so
-/// cutting there is the exact inverse and recovers the canonical
-/// coordinate. A `dep_path` with no suffix is returned unchanged — a
-/// bare `_<hex>` tail belongs to a `git+`/`url+`/`file+` source
-/// coordinate and is never a peer marker, so it is preserved.
-fn strip_peer_context_suffix(dep_path: &str) -> &str {
-    dep_path.split('(').next().unwrap_or(dep_path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::lockfile_tarball_url_matches_metadata;
+    use super::{LockedTarballUrlAction, locked_tarball_url_action};
+
+    #[test]
+    fn locked_tarball_url_refuses_host_mismatch_without_integrity() {
+        // Host matches → always re-verify, integrity irrelevant.
+        assert_eq!(
+            locked_tarball_url_action(true, false),
+            LockedTarballUrlAction::Verify
+        );
+        assert_eq!(
+            locked_tarball_url_action(true, true),
+            LockedTarballUrlAction::Verify
+        );
+        // Host differs with a content hash → skip the URL recheck safely.
+        assert_eq!(
+            locked_tarball_url_action(false, true),
+            LockedTarballUrlAction::Skip
+        );
+        // Host differs AND no content hash → refuse; the bytes would run
+        // unverified.
+        assert_eq!(
+            locked_tarball_url_action(false, false),
+            LockedTarballUrlAction::Refuse
+        );
+    }
 
     #[test]
     fn tarball_url_match_accepts_exact_url() {
@@ -1254,7 +1540,7 @@ mod tests {
             .packages
             .insert(contextualized.clone(), git_pkg(&contextualized));
 
-        let out = super::remap_indices_to_contextualized(&canonical_indices, &graph);
+        let out = super::remap_indices_to_contextualized(canonical_indices, &graph);
         assert!(
             out.contains_key(&contextualized),
             "git dep with peer suffix should recover its canonical index; got {:?}",
@@ -1278,7 +1564,7 @@ mod tests {
             .packages
             .insert(contextualized.clone(), git_pkg(&contextualized));
 
-        let out = super::remap_indices_to_contextualized(&canonical_indices, &graph);
+        let out = super::remap_indices_to_contextualized(canonical_indices, &graph);
         assert!(
             out.contains_key(&contextualized),
             "git dep with hashed peer suffix should recover its canonical index; got {:?}",
@@ -1300,7 +1586,7 @@ mod tests {
             .packages
             .insert(canonical.to_string(), git_pkg(canonical));
 
-        let out = super::remap_indices_to_contextualized(&canonical_indices, &graph);
+        let out = super::remap_indices_to_contextualized(canonical_indices, &graph);
         assert!(out.contains_key(canonical));
     }
 }

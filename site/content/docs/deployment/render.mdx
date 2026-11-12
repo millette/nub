@@ -1,0 +1,117 @@
+---
+title: Render
+description: Deploy a Nub web service with Render's Docker runtime and the official Nub image.
+---
+
+Render can [build a repository's Dockerfile](https://render.com/docs/docker) or pull a prebuilt image. The Docker runtime keeps Nub available for the install, the build scripts, and the running service.
+
+## Dockerfile
+
+```dockerfile title="Dockerfile"
+FROM ghcr.io/nubjs/nub:{{NUB_VERSION}}
+
+COPY --chown=node:node package.json package-lock.json ./
+RUN nub ci
+
+COPY --chown=node:node . .
+CMD ["nub", "run", "start"]
+```
+
+Change `package-lock.json` to the lockfile the project already uses. Render runs the Dockerfile's `CMD` unless the **Docker Command** setting overrides it.
+
+## HTTP endpoint
+
+The start script's server must listen on `0.0.0.0` at `PORT`. Render's default port is `10000`, and reading `PORT` also covers a custom value:
+
+```ts title="server.ts"
+import { createServer } from "node:http";
+
+const port = Number(process.env.PORT || 10000);
+
+createServer((request, response) => {
+  response.writeHead(200, { "content-type": "application/json" });
+  response.end(JSON.stringify({ alive: true, runtime: "nub-on-node" }));
+}).listen(port, "0.0.0.0");
+```
+
+## Deploy
+
+Deploy from the dashboard, with the Render CLI, or from a `render.yaml` Blueprint.
+
+### Dashboard
+
+1. Select **New → Web Service** and connect the repository.
+2. Set **Language** to **Docker**.
+3. Leave **Dockerfile Path** empty for a root `Dockerfile`.
+4. Set **Health Check Path** to `/alive`.
+5. Create the service and request `/alive` on its `*.onrender.com` URL.
+
+### CLI
+
+Authenticate the Render CLI, then create the same repository-backed service:
+
+```bash
+render login
+render workspace set WORKSPACE_ID
+render services create \
+  --name nub-app \
+  --type web_service \
+  --repo https://github.com/OWNER/REPOSITORY \
+  --branch main \
+  --runtime docker \
+  --plan free \
+  --region oregon \
+  --health-check-path /alive \
+  --confirm \
+  --output json
+
+SERVICE_URL=$(render services --output json \
+  | jq -r '.[] | select(.service.name == "nub-app")
+                 | .service.serviceDetails.url')
+curl --fail "$SERVICE_URL/alive"
+# {"alive":true,"runtime":"nub-on-node"}
+```
+
+<Callout>
+Read the [full docs](https://render.com/docs/cli) on render.com.
+</Callout>
+
+### Blueprint
+
+A `render.yaml` in the repository declares the same service:
+
+```yaml title="render.yaml"
+services:
+  - type: web
+    name: nub-app
+    runtime: docker
+    plan: free          # omit for the workspace's default paid plan
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /alive
+```
+
+<Callout>
+Read the [full docs](https://render.com/docs/blueprint-spec) on render.com.
+</Callout>
+
+## Prebuilt images
+
+Select **Existing Image** to deploy an image published to GHCR instead of building on Render. A private image needs a registry credential in the Render workspace. An image-backed service does not redeploy on source commits, so trigger a redeploy after GitHub Actions publishes a new image.
+
+From the CLI, create the service from the image instead of the repository:
+
+```bash
+render services create \
+  --name nub-app \
+  --type web_service \
+  --image ghcr.io/OWNER/nub-app:COMMIT_SHA \
+  --plan free \
+  --region oregon \
+  --health-check-path /alive \
+  --confirm \
+  --output json
+```
+
+<Callout>
+Read the [full docs](https://render.com/docs/deploying-an-image) on render.com.
+</Callout>

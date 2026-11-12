@@ -1,0 +1,119 @@
+---
+title: Running NestJS with Nub
+description: Run a NestJS application on Nub with no build step, including the decorator metadata Nest depends on and the Nest CLI plugins you give up.
+---
+
+NestJS runs on Nub with no compile step. Point Nub at the entry file instead of building to `dist/` first:
+
+```bash
+nest start            # before
+nub src/main.ts       # after
+```
+
+Nub emits the decorator metadata that Nest's dependency injection reads at runtime. Runners built on esbuild do not, so a Nest app under one of them boots and then fails on the first request that needs an injected dependency.
+
+## Decorators and metadata
+
+Nest resolves constructor dependencies by type, reading `design:paramtypes` metadata that the transpiler emits. Two compiler flags control it, and Nub reads both from your tsconfig:
+
+```jsonc
+// tsconfig.json
+{
+  "compilerOptions": {
+    // ...
+    "experimentalDecorators": true,  // the form Nest is written against
+    "emitDecoratorMetadata": true    // design:paramtypes for the DI
+  }
+}
+```
+
+The tsconfig that `nest new` generates sets both. Without `emitDecoratorMetadata`, an injected parameter is `undefined`, and the failure surfaces on the first request that touches it. Without `experimentalDecorators`, Nub refuses the file:
+
+```console
+Error: Nub: Stage 3 decorators are not supported by the transpiler yet.
+This is an upstream limitation in oxc (oxc-project/oxc#9170).
+  in src/main.ts
+
+Workarounds:
+  1. Set "decorators": "legacy" in nub.jsonc, or set
+     "experimentalDecorators": true in tsconfig.json
+     (the shape NestJS / TypeORM / class-validator are written against).
+```
+
+The metadata also needs `reflect-metadata` at runtime, which Nest imports for you.
+
+## Replacing the Nest CLI
+
+| Nest CLI | Nub |
+| --- | --- |
+| `nest start` | `nub src/main.ts` |
+| `nest start --watch` | `nub watch src/main.ts` |
+| `nest build` | not needed to run the app |
+
+Watch mode restarts on any change to the entry file's import graph, with no glob list:
+
+```console
+$ nub watch src/main.ts
+Change detected in 'src/main.ts'
+Restarting 'src/main.ts'
+```
+
+Nest's generated tsconfig uses `nodenext` resolution, so relative imports end in `.js` while the files on disk are `.ts`. Nub resolves the `.js` specifier to the `.ts` file.
+
+## Nest CLI plugins
+
+The Nest CLI plugins are the one capability you give up. The Swagger and GraphQL plugins are compile-time transforms declared in `nest-cli.json`:
+
+```jsonc
+// nest-cli.json
+{
+  "compilerOptions": {
+    "plugins": ["@nestjs/swagger"]   // only under nest build / start
+  }
+}
+```
+
+Only `nest build` and `nest start` run them. Without the Swagger plugin, the generated OpenAPI schema silently loses every DTO property you did not annotate by hand with `@ApiProperty`.
+
+If your project depends on either plugin, keep `nest build` for the build that produces the schema, or annotate the DTOs explicitly. Nest gives the same guidance for its SWC builder.
+
+## Type checking
+
+Nub transpiles TypeScript without type checking it, so a file with a type error still runs:
+
+```ts
+// src/bad.ts
+const n: number = "not a number";
+console.log("ran anyway:", n);
+```
+
+```console
+$ nub src/bad.ts
+ran anyway: not a number
+```
+
+The Nest CLI type checked as part of building. Without it, add an explicit check:
+
+```jsonc
+// package.json
+{
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+## Deploying
+
+Either keep `nest build` and deploy the compiled output, with Nub as your dev loop only, or deploy the source and start it the way you do locally:
+
+```jsonc
+// package.json
+{
+  "scripts": {
+    "start": "nub src/main.ts"
+  }
+}
+```
+
+For a Nest app in a Turborepo monorepo, see [Using Nub with Turborepo](/guides/turborepo).

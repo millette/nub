@@ -45,15 +45,15 @@ pub enum DiscoveryError {
 
     #[error(
         "no Node binary found on PATH\n\
-         \x20\x20Install one with: nub node install (or `nub node install <version>` to pick a version)\n\
-         \x20\x20(nub augments your Node — it doesn't bundle one; a pin in .node-version / .nvmrc / engines.node is provisioned automatically.)"
+         \x20\x20nub augments your installed Node — it doesn't bundle one.\n\
+         \x20\x20Pin a version and nub provisions it on demand: nub node pin <version>"
     )]
     NoNodeOnPath,
 
     /// The discovered Node is older than `NodeVersion::MIN_SUPPORTED`
     /// (18.19.0). No hook API exists below this floor that can carry
     /// Nub's feature surface, so Nub refuses to run. Canonical wording
-    /// per `wiki/research/supported-node-versions.md` line 52.
+    /// per `internal/research/supported-node-versions.md` line 52.
     /// Replaces the prior `TooOld` variant, which gated on the 22.15
     /// fast-path floor — that boundary is now a tier classifier
     /// (sync vs. async hook registration), not an error.
@@ -90,12 +90,112 @@ pub enum DiscoveryError {
         pin_source: String,
         reason: String,
     },
+
+    /// The zero-config runner path (no PATH node, no project pin) tried to
+    /// auto-provision the latest Node and failed. Distinct from
+    /// [`ProvisionFailed`] because there is no pin to name — the "pinned via"
+    /// framing wouldn't apply.
+    #[error(
+        "no Node on PATH and no project pin — tried to provision the latest Node and failed: {reason}\n\
+         \x20\x20Check your network / proxy, or install Node and put it on PATH."
+    )]
+    UnpinnedProvisionFailed { reason: String },
+
+    /// A `nodeExecutable` written as `$(command)` ran and failed. The run stops
+    /// here rather than falling back to the pin chain: a project that delegates
+    /// its Node to an external toolchain has said which binary it wants, and
+    /// substituting a different one is the silent fallback the field exists to
+    /// prevent. Names the command, the file that carries it, and the tool's own
+    /// stderr, because the fix is almost always in the toolchain rather than in
+    /// nub (an unbootstrapped machine, a missing `mise`).
+    #[error("{}", format_node_executable_failure(.command, .file, .failure, .stderr))]
+    NodeExecutableCommandFailed {
+        command: String,
+        // Not named `source`: thiserror reads that name as the error's cause.
+        file: String,
+        failure: String,
+        stderr: String,
+    },
+
+    /// An explicit binary override named a `node` that is really nub. Resolving
+    /// through it re-enters discovery, which reads the same override again, so
+    /// nub calls itself until something kills the process. Refused by name
+    /// because the alternative is a hang with no output at all, which no user
+    /// can debug and no error text can be read out of.
+    #[error(
+        "ERR_NUB_NODE_EXECUTABLE_SELF: `{path}` (from {origin}) is nub's own `node`, not a Node binary.\n\
+         \x20\x20Resolving through it would re-enter nub. Name a real Node binary, or remove the \
+         setting to use the project's pin."
+    )]
+    NodeExecutableIsNub {
+        path: String,
+        // Not named `source`: thiserror reads that name as the error's cause.
+        origin: String,
+    },
+
+    /// Every `node` left on PATH leads back to nub: probing it started nub again
+    /// ([`DiscoveryError::ReentersNub`]).
+    #[error(
+        "ERR_NUB_NODE_SHIM_LOOP: `{shim}` is the first `node` on PATH, and it runs nub's own `node` \
+         instead of a Node binary, so no Node is reachable through it.\n\
+         \x20\x20A link or copy of nub, a wrapper script that runs it, or a version manager with no \
+         Node active here (which falls back to the next `node` on PATH) does this. Put a Node \
+         binary on PATH, activate one in that manager, or pin one with `nub node pin <version>`."
+    )]
+    NodeShimLoop { shim: String },
+
+    /// Probing `candidate` started nub again: nub refused the probe at its
+    /// recursion bound ([`crate::node::nesting`]). The PATH walk skips such a
+    /// candidate; an explicit binary turns this into [`Self::NodeExecutableIsNub`].
+    #[error("`{candidate}` starts nub again instead of running Node")]
+    ReentersNub { candidate: String },
+}
+
+/// Format the `NodeExecutableCommandFailed` text. The tool's own stderr is the
+/// actionable half and is usually where the real fix is named, so it rides its
+/// own line — omitted entirely when the command said nothing.
+fn format_node_executable_failure(
+    command: &str,
+    file: &str,
+    failure: &str,
+    stderr: &str,
+) -> String {
+    // Every line, not just the first: a toolchain's error is routinely several
+    // lines, and indenting only the first leaves the rest hanging at column 0
+    // against nub's own message.
+    let detail: String = stderr
+        .lines()
+        .map(|line| format!("\n\x20\x20{line}"))
+        .collect();
+    format!(
+        "ERR_NUB_NODE_EXECUTABLE_FAILED: `{command}` (nodeExecutable in {file}) {failure}{detail}"
+    )
 }
 
 /// Format the `Unsupported` error text. Centralized so the canonical
-/// wording (per `wiki/research/supported-node-versions.md` line 52)
+/// wording (per `internal/research/supported-node-versions.md` line 52)
 /// lives in one place; tests pin to the output of this function.
 fn format_unsupported(version: &NodeVersion, pin_source: Option<&str>) -> String {
+    // 19.x and 20.0–20.5 are above the floor, so the floor sentence would read
+    // as a contradiction; name the missing API and the nearest working release.
+    if version.in_register_gap() {
+        let (cause, action) = match pin_source {
+            Some(src) => (
+                format!(
+                    "This project pins Node {version} via {src}, which predates `module.register()`."
+                ),
+                "update the pin",
+            ),
+            None => (
+                format!("Node {version} predates `module.register()`."),
+                "upgrade Node",
+            ),
+        };
+        return format!(
+            "Nub requires Node 18.19+ on the 18.x line, or 20.6 or newer, for runtime augmentation. \
+             {cause} To run it: {action} to 20.6+, or run plain `node` directly for this project."
+        );
+    }
     match pin_source {
         Some(src) => format!(
             "Nub requires Node 18.19 or newer for runtime augmentation. \
@@ -111,13 +211,13 @@ fn format_unsupported(version: &NodeVersion, pin_source: Option<&str>) -> String
 }
 
 /// Discover the Node binary to use, following the resolution order in
-/// `wiki/runtime/node-version-management.md`.
+/// `internal/runtime/node-version-management.md`.
 ///
 /// 1. Resolve the pin chain: `package.json#devEngines.runtime` (#1, may refuse
 ///    when the declared runtime isn't Node) → `.node-version` (#2) → `.nvmrc`
-///    (#3) → `package.json#engines.node` (#4, a resolution range).
-///    `devEngines.runtime` `onFail: "warn"` notices print here (once per
-///    invocation), then resolution falls through.
+///    (#3) → `.tool-versions` (#4, asdf/mise) → `package.json#engines.node`
+///    (#5, a resolution range). `devEngines.runtime` `onFail: "warn"` notices
+///    print here (once per invocation), then resolution falls through.
 /// 2. If no pin: use `node` on PATH.
 /// 3. If pinned: PATH node satisfies → nub's own download store
 ///    (`~/.cache/nub/node/<version>/`) → nvm scan → error. (The download +
@@ -129,10 +229,10 @@ fn format_unsupported(version: &NodeVersion, pin_source: Option<&str>) -> String
 /// floor-agnostic so callers like `nub --version` (which only need
 /// the binary path) don't trip the version gate.
 pub fn discover_node(cwd: &Path) -> Result<ResolvedNode, DiscoveryError> {
-    // NODE_EXECUTABLE — the sole version-management override surface
-    // (node-version-management.md). An absolute path bypasses pin-file reading,
-    // cache, nvm, and download: use that binary directly. Its version is still
-    // detected, so the floor check + tier dispatch apply (a Node-16 NODE_EXECUTABLE
+    // The explicit-binary override — `NODE_EXECUTABLE`, else `nub.jsonc`'s
+    // `nodeExecutable` (node-version-management.md). A path bypasses pin-file
+    // reading, cache, nvm, and download: use that binary directly. Its version is
+    // still detected, so the floor check + tier dispatch apply (a Node-16 override
     // hard-errors exactly like a Node-16 pin). Brand-compliant: Node doesn't claim
     // the NODE_EXECUTABLE name, so piggybacking on NODE_* is the prescribed hatch.
     if let Some(node) = node_executable_override()? {
@@ -150,8 +250,11 @@ pub fn discover_node(cwd: &Path) -> Result<ResolvedNode, DiscoveryError> {
             shell_path_node(None)
         }
         Some((pin_str, parsed_pin, pin_source)) => {
+            let parsed_pin = concretize_alias(parsed_pin, &pin_str);
             // Try shell PATH first (covers fnm/Volta/mise auto-switch).
-            if let Ok(node) = shell_path_node(Some(pin_source.clone())) {
+            let path_node = shell_path_node(Some(pin_source.clone()));
+            if let Ok(node) = &path_node {
+                let node = node.clone();
                 if node.version.satisfies(&parsed_pin) {
                     return Ok(node);
                 }
@@ -169,7 +272,7 @@ pub fn discover_node(cwd: &Path) -> Result<ResolvedNode, DiscoveryError> {
                     shell_version: format!("v{}", node.version),
                 });
             }
-            // No node on PATH at all — try nub's own store, then nvm.
+            // No usable node on PATH — try nub's own store, then nvm.
             if let Some(mut node) = nub_store_node(&parsed_pin) {
                 node.pin_source = Some(pin_source.clone());
                 return Ok(node);
@@ -178,7 +281,10 @@ pub fn discover_node(cwd: &Path) -> Result<ResolvedNode, DiscoveryError> {
                 node.pin_source = Some(pin_source);
                 return Ok(node);
             }
-            Err(DiscoveryError::NoNodeOnPath)
+            match path_node {
+                Err(error @ DiscoveryError::NodeShimLoop { .. }) => Err(error),
+                _ => Err(DiscoveryError::NoNodeOnPath),
+            }
         }
     }
 }
@@ -201,19 +307,13 @@ pub fn discover_node(cwd: &Path) -> Result<ResolvedNode, DiscoveryError> {
 /// informational line rather than paying for resolution. NEVER use this on a run
 /// path: it deliberately under-reports rather than spawn.
 pub fn discover_node_cached(cwd: &Path) -> Option<ResolvedNode> {
-    // Honor the same NODE_EXECUTABLE override surface, but only when its version
-    // is already cached (no spawn).
-    if let Some(raw) = env::var_os("NODE_EXECUTABLE")
-        && !raw.is_empty()
-    {
-        let path = PathBuf::from(&raw);
-        let version = read_version_cache(&path)?;
-        let utf8_path = Utf8PathBuf::try_from(path).ok()?;
-        return Some(ResolvedNode {
-            path: utf8_path,
-            version,
-            pin_source: Some("NODE_EXECUTABLE".to_string()),
-        });
+    // Honor the same explicit-binary override surfaces, but only when the path is
+    // free to learn and its version is already cached (no spawn). A configured
+    // `$(command)` is therefore honored only once something else has already run
+    // it this process; until then this reports nothing rather than shelling out
+    // for an informational line.
+    if let Some(node) = cached_node_executable_override() {
+        return Some(node);
     }
 
     // resolve_pin_chain can error (RuntimeNotNode); a version query never fails on
@@ -222,7 +322,8 @@ pub fn discover_node_cached(cwd: &Path) -> Option<ResolvedNode> {
 
     match chain.pin {
         None => shell_path_node_cached(None),
-        Some((_, parsed_pin, pin_source)) => {
+        Some((pin_str, parsed_pin, pin_source)) => {
+            let parsed_pin = concretize_alias(parsed_pin, &pin_str);
             // PATH node, version from cache only — and only if it satisfies the pin.
             if let Some(node) = shell_path_node_cached(Some(pin_source.clone())) {
                 if node.version.satisfies(&parsed_pin) {
@@ -262,7 +363,7 @@ fn shell_path_node_cached(pin_source: Option<String>) -> Option<ResolvedNode> {
 /// and use it. This is the provisioning fire point — call it ONLY from
 /// `nub <file>` and the hijack-descendant `node` handler, never from
 /// `nub run` / `nub exec` (which keep plain [`discover_node`]), per
-/// `wiki/runtime/node-version-management.md` §"Where the version logic fires".
+/// `internal/runtime/node-version-management.md` §"Where the version logic fires".
 ///
 /// Exact pins provision the named version directly; range pins (`22`, `22.13`)
 /// and aliases (`latest`, `lts`, `lts/<codename>`) resolve to a concrete version
@@ -271,16 +372,28 @@ fn shell_path_node_cached(pin_source: Option<String>) -> Option<ResolvedNode> {
 pub fn discover_or_provision_node(cwd: &Path) -> Result<ResolvedNode, DiscoveryError> {
     // Fast path: PATH / nub's store / nvm already satisfy the pin (or there's no
     // pin). Aliases never satisfy a concrete check, so they always fall through.
-    let discover_err = match discover_node(cwd) {
+    // Only PinnedNotFound / NoNodeOnPath are recoverable here (provision the pin,
+    // or auto-provision when unpinned); every other error propagates unchanged. So
+    // is a `node` that leads back to nub when a pin names the version to use. With
+    // no pin it stays an error: that `node` is most likely a version manager with
+    // nothing active, so downloading a Node would hide the setup problem it names.
+    let looped = match discover_node(cwd) {
         Ok(node) => return Ok(node),
-        Err(e @ (DiscoveryError::PinnedNotFound { .. } | DiscoveryError::NoNodeOnPath)) => e,
+        Err(DiscoveryError::PinnedNotFound { .. } | DiscoveryError::NoNodeOnPath) => None,
+        Err(error @ DiscoveryError::NodeShimLoop { .. }) => Some(error),
         Err(other) => return Err(other),
     };
     // Re-resolve the chain for the pin to provision. Warnings are deliberately
     // not re-printed — the discover_node call above already emitted them; a
     // refusal can't reach here (discover_node returned it as `other`).
     let Some((raw, pin, pin_source)) = resolve_pin_chain(cwd)?.pin else {
-        return Err(discover_err); // no pin → nothing to provision
+        // No pin AND no node on PATH (discover_node's no-pin branch returns Ok
+        // when PATH has a node). Rather than dead-ending on a fresh machine,
+        // auto-provision so the zero-config "default node runner" just works.
+        return match looped {
+            Some(error) => Err(error),
+            None => provision_unpinned_node(),
+        };
     };
 
     let fail = |reason: String| DiscoveryError::ProvisionFailed {
@@ -343,13 +456,78 @@ pub fn discover_or_provision_node(cwd: &Path) -> Result<ResolvedNode, DiscoveryE
     })
 }
 
+/// Provision a Node when the project has NO pin and NO node is on PATH — the
+/// fresh-machine case (#294). Two states, cheapest first:
+///
+/// - **Store-first (silent):** reuse the highest version already in nub's store,
+///   so a warm store never triggers a surprise download and repeat runs stay
+///   instant. Matches the silent behavior of a pinned store hit.
+/// - **Empty store:** download `latest` from nodejs.org — the same on-demand
+///   fetch the pinned path uses (announced by [`provision_node`]'s Using /
+///   Installing lines, so the multi-hundred-MB download is never a silent hang).
+///
+/// Unpinned `latest` is a deliberate moving target: no pin is written, so each
+/// fresh-machine run picks up the newest secure release. A project that wants a
+/// reproducible version pins one (`nub node pin <version>`), which routes through
+/// the pinned provisioning path instead. `pin_source` stays `None` — the run is
+/// genuinely unpinned, so downstream pin-disagreement warnings don't fire.
+fn provision_unpinned_node() -> Result<ResolvedNode, DiscoveryError> {
+    if let Some(node) = highest_store_node() {
+        return Ok(node);
+    }
+
+    let fail = |reason: String| DiscoveryError::UnpinnedProvisionFailed { reason };
+    let host = crate::version_management::HostTarget::detect()
+        .ok_or_else(|| fail("this host is not a platform nodejs.org publishes".to_string()))?;
+    let store_root = cache_dir().ok_or_else(|| {
+        fail("could not locate a cache directory (no $HOME / $XDG_CACHE_HOME)".to_string())
+    })?;
+    let mirror = crate::version_management::resolve_mirror_base(&host);
+    let index = crate::version_management::node_index::load_index(&store_root, &mirror)
+        .map_err(|e| fail(format!("could not fetch the Node release index: {e:#}")))?;
+    let concrete = crate::version_management::node_index::resolve_spec("latest", &index)
+        .ok_or_else(|| fail("no published Node version to resolve `latest` to".to_string()))?;
+
+    let version_dir =
+        crate::version_management::provision_node(&concrete, &host, &store_root, Some("latest"))
+            .map_err(|e| fail(format!("{e:#}")))?;
+    let bin = store_node_binary(&version_dir).ok_or_else(|| {
+        fail("installed, but no node binary was found in the extracted tree".to_string())
+    })?;
+    Ok(ResolvedNode {
+        path: bin,
+        version: concrete,
+        pin_source: None,
+    })
+}
+
+/// The highest SUPPORTED version in nub's store, ignoring any pin (`*` satisfies
+/// every version). Backs the unpinned store-first path. Sub-floor cached versions
+/// (e.g. a leftover `nub node pin 16` the user later unpinned) are filtered out so
+/// an unpinned run falls through to downloading `latest` instead of dead-ending on
+/// `Unsupported`. The filter runs before selection: the 19.x / 20.0–20.5 gap sorts
+/// above a usable 18.19, so the highest cached version is not always a supported one.
+/// Parameterized over `store` for testability; `highest_store_node` is the wrapper.
+fn highest_store_node_in(store: &Path) -> Option<ResolvedNode> {
+    nub_store_node_where(
+        store,
+        &VersionPin::Range(vec![semver::VersionReq::STAR]),
+        NodeVersion::is_supported,
+    )
+}
+
+fn highest_store_node() -> Option<ResolvedNode> {
+    highest_store_node_in(&cache_dir()?.join("node"))
+}
+
 /// Enforce the hard floor: Node 18.19.0. Below that, Nub cannot
 /// deliver its feature surface (no hook API capable of carrying
 /// it exists pre-18.19; see
-/// `wiki/research/supported-node-versions.md`). At or above 18.19,
+/// `internal/research/supported-node-versions.md`). At or above 18.19,
 /// the spawn path proceeds and the JS preload picks the
 /// hook-registration shape based on the version tier (sync
-/// `registerHooks` at 22.15+, async `register()` at 18.19-22.14).
+/// `registerHooks` at 22.15+ except 23.0-23.4, async `register()` at
+/// 18.19-22.14 and 23.0-23.4 — see [`NodeVersion::supports_augmentation`]).
 ///
 /// Name kept as `check_min_version` to minimize churn at call sites;
 /// the semantics changed (floor moved from 22.15 to 18.19) but the
@@ -366,17 +544,22 @@ pub fn check_min_version(node: &ResolvedNode) -> Result<(), DiscoveryError> {
 }
 
 /// Walk up from `cwd` looking for a pin file. Returns the raw pin string, parsed
-/// pin, and the filename that produced it (`.node-version` or `.nvmrc`) for
-/// user-facing messages. Bounded by $HOME, filesystem root, and 16 ancestors.
+/// pin, and the filename that produced it (`.node-version`, `.nvmrc`, or
+/// `.tool-versions`) for user-facing messages. Bounded by $HOME, filesystem root,
+/// and 16 ancestors.
 ///
-/// Precedence within a directory is `.node-version` BEFORE `.nvmrc`, per
-/// `wiki/runtime/node-version-management.md` §"Resolution order" (#2 `.node-version`,
-/// #3 `.nvmrc`). `.node-version` is the tool-agnostic standard, so it wins when a
-/// project carries both. Precedence #1, `package.json#devEngines.runtime`, sits
-/// ABOVE both and #4, `package.json#engines.node`, BELOW both —
-/// [`resolve_pin_chain`] orders all four; this helper is only the pin-file
-/// middle of the chain.
-pub fn walk_up_for_pin(cwd: &Path) -> Option<(String, VersionPin, String)> {
+/// Precedence within a directory is `.node-version` BEFORE `.nvmrc` BEFORE
+/// `.tool-versions`, per `internal/runtime/node-version-management.md` §"Resolution
+/// order" (#2 `.node-version`, #3 `.nvmrc`, #4 `.tool-versions`). It is a
+/// specificity-of-intent gradient: the Node-specific pin files outrank the
+/// polyglot asdf/mise file, whose `nodejs`/`node` line is one tool among many, so
+/// a deliberately-added `.node-version` wins when a project carries both. (A
+/// project with only `.tool-versions` — the common asdf/mise case — never hits the
+/// conflict.) Precedence #1, `package.json#devEngines.runtime`, sits ABOVE all
+/// three and #5, `package.json#engines.node`, BELOW them — [`resolve_pin_chain`]
+/// orders all five; this helper is only the pin-file middle of the chain.
+// @lat: [[research/node-version-discovery#Node version discovery and pin-file resolution#2. Pin-file conventions matrix]]
+fn walk_up_for_pin(cwd: &Path) -> Option<(String, VersionPin, String)> {
     let home = dirs_next::home_dir();
     let mut dir = cwd.to_path_buf();
     let max_depth = 16;
@@ -415,6 +598,13 @@ pub fn walk_up_for_pin(cwd: &Path) -> Option<(String, VersionPin, String)> {
                     }
                 }
             }
+
+            // #4: `.tool-versions` (asdf/mise), checked AFTER the Node-specific pin
+            // files above so they win in a directory that carries both.
+            if let Some((raw, pin)) = tool_versions_node_pin(&dir) {
+                tracing::debug!(dir = %dir.display(), pin = raw, "found .tool-versions node pin");
+                return Some((raw, pin, ".tool-versions".to_string()));
+            }
         }
 
         // Stop at home dir or filesystem root.
@@ -426,16 +616,46 @@ pub fn walk_up_for_pin(cwd: &Path) -> Option<(String, VersionPin, String)> {
     None
 }
 
+/// Read the Node pin from an asdf/mise `.tool-versions` in `dir` (precedence #4).
+/// Returns the raw version token and parsed pin, or `None` when the file is
+/// absent, carries no Node line, or the version is one nub can't model.
+///
+/// `.tool-versions` is line-oriented — `<tool> <version...>`, `#` comments. The
+/// Node line's key is `nodejs` (asdf's plugin short-name) or `node` (a mise
+/// alias); accept either. A line may list fallback versions (`nodejs 20 18`); we
+/// take the first, matching how a single Node is provisioned. Non-modelable
+/// specifiers (`system`, `ref:<sha>`) fail [`VersionPin`] parsing and yield
+/// `None` here — the walk then falls through, exactly as an unparseable
+/// `.node-version` does. Only the Node line is read; every other tool in the file
+/// is ignored (nub provisions Node, not the whole toolchain).
+fn tool_versions_node_pin(dir: &Path) -> Option<(String, VersionPin)> {
+    let content = fs::read_to_string(dir.join(".tool-versions")).ok()?;
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+    for line in content.lines() {
+        // Drop an inline `# comment`; a version token never contains `#`.
+        let code = line.split('#').next().unwrap_or("");
+        let mut tokens = code.split_whitespace();
+        let Some(tool) = tokens.next() else { continue };
+        if tool != "nodejs" && tool != "node" {
+            continue;
+        }
+        let version = tokens.next()?;
+        let pin = version.parse::<VersionPin>().ok()?;
+        return Some((version.to_string(), pin));
+    }
+    None
+}
+
 /// Source label for the `devEngines.runtime` pin channel (precedence #1),
 /// shaped like the `package.json#engines.node` label.
 const DEV_ENGINES_RUNTIME_SOURCE: &str = "package.json#devEngines.runtime";
 
-/// Source label for the `engines.node` pin channel (precedence #4).
+/// Source label for the `engines.node` pin channel (precedence #5).
 const ENGINES_NODE_SOURCE: &str = "package.json#engines.node";
 
 /// The governing `package.json` for `cwd`, parsed: the WORKSPACE ROOT's manifest
 /// when one exists above `cwd`, else the nearest one. This is the one manifest
-/// both `devEngines.runtime` (#1) and `engines.node` (#4) read from.
+/// both `devEngines.runtime` (#1) and `engines.node` (#5) read from.
 ///
 /// Workspace-root, not nearest, deliberately: a monorepo pins its Node once at
 /// the root (pnpm — the field's model implementation — reads `devEngines.runtime`
@@ -450,13 +670,13 @@ fn project_manifest(cwd: &Path) -> Option<serde_json::Value> {
     match &project.workspace_root {
         Some(ws) if *ws != project.root => {
             let content = fs::read_to_string(ws.join("package.json")).ok()?;
-            serde_json::from_str(&content).ok()
+            serde_json::from_str(crate::strip_utf8_bom(&content)).ok()
         }
         _ => Some(project.manifest),
     }
 }
 
-/// Read `package.json#engines.node` (precedence #4, a semver *range*) from the
+/// Read `package.json#engines.node` (precedence #5, a semver *range*) from the
 /// governing manifest ([`project_manifest`]). Returns `(range, source_label)`,
 /// or `None` when the manifest has no `engines.node`.
 fn read_engines_node(cwd: &Path) -> Option<(String, String)> {
@@ -514,7 +734,7 @@ enum RuntimeOutcome {
 }
 
 /// Evaluate a `devEngines.runtime` value (object or array) per
-/// `wiki/runtime/node-version-management.md` §"Resolution order":
+/// `internal/runtime/node-version-management.md` §"Resolution order":
 ///
 /// - The entry whose `name` is `node` is the pin, regardless of array position;
 ///   non-node entries are then skipped entirely. Its `onFail` is not consulted
@@ -597,15 +817,16 @@ pub struct PinChain {
     /// `onFail: "warn"`, present-but-unusable version specs) — printed once per
     /// invocation by the entry point ([`discover_node`], or the `nub node`
     /// verbs when they resolve the chain themselves).
-    pub warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 /// The pin-source chain in spec precedence order
-/// (`wiki/runtime/node-version-management.md` §"Resolution order"):
+/// (`internal/runtime/node-version-management.md` §"Resolution order"):
 /// `package.json#devEngines.runtime` (#1) → `.node-version` (#2) → `.nvmrc`
-/// (#3) → `package.json#engines.node` (#4, a resolution range). Errs with
-/// [`DiscoveryError::RuntimeNotNode`] when `devEngines.runtime` declares a
-/// non-Node runtime that refuses (its default).
+/// (#3) → `.tool-versions` (#4, asdf/mise) → `package.json#engines.node`
+/// (#5, a resolution range). The middle three (#2–#4) resolve in
+/// [`walk_up_for_pin`]. Errs with [`DiscoveryError::RuntimeNotNode`] when
+/// `devEngines.runtime` declares a non-Node runtime that refuses (its default).
 pub fn resolve_pin_chain(cwd: &Path) -> Result<PinChain, DiscoveryError> {
     let mut warnings = Vec::new();
     let manifest = project_manifest(cwd);
@@ -633,7 +854,7 @@ pub fn resolve_pin_chain(cwd: &Path) -> Result<PinChain, DiscoveryError> {
             warnings,
         });
     }
-    // #4: engines.node — a resolution *range* ("resolve to the newest available
+    // #5: engines.node — a resolution *range* ("resolve to the newest available
     // version satisfying the range"). A PATH node inside the range satisfies it
     // like any range pin; provisioning resolves newest-satisfying.
     if let Some((range, source)) = read_engines_node(cwd) {
@@ -657,12 +878,18 @@ pub fn resolve_pin_chain(cwd: &Path) -> Result<PinChain, DiscoveryError> {
 }
 
 /// Warn when pin sources disagree — a project misconfiguration the user should
-/// see (`wiki/runtime/node-version-management.md`: "If sources disagree
+/// see (`internal/runtime/node-version-management.md`: "If sources disagree
 /// (`devEngines.runtime` vs pin file, pin file vs `engines.node`), warn"). Two
 /// checks, joined with a newline when both fire:
 ///
 /// - when `devEngines.runtime` won, the resolved version vs the pin file
 ///   (`.node-version`/`.nvmrc`) it overrode;
+/// - when an explicit-binary override won (`NODE_EXECUTABLE`,
+///   `nub.jsonc#nodeExecutable`), the version of that binary vs whatever the pin
+///   chain would have resolved. The override bypasses the chain entirely, so it
+///   is the one winner that can contradict every declared source at once —
+///   including `devEngines.runtime` and the pin files, which no other winner
+///   reaches;
 /// - the resolved version (whatever source won) vs `package.json#engines.node`.
 ///
 /// Returns `None` when nothing was pinned, there's nothing to compare against,
@@ -691,7 +918,27 @@ pub fn engines_disagreement_warning(cwd: &Path, node: &ResolvedNode) -> Option<S
         ));
     }
 
-    // The winning pin vs package.json#engines.node (#4) — unless engines.node
+    // An explicit-binary override (winner, above #1) vs the chain it bypassed.
+    // Compared against the chain's WINNER rather than every declared source: the
+    // chain's own precedence already decided which one would have run, and the
+    // losers' disagreement with it is a separate question this warning does not
+    // own. `engines.node` is left to the check below so a chain that bottoms out
+    // there is not reported twice.
+    if is_explicit_binary_source(pin_source)
+        && let Ok(chain) = resolve_pin_chain(cwd)
+        && let Some((raw, pin, chain_source)) = chain.pin
+        && chain_source != ENGINES_NODE_SOURCE
+        && !matches!(pin, VersionPin::Alias(_))
+        && !node.version.satisfies(&pin)
+    {
+        warnings.push(format!(
+            "Warning: Node {} is pinned via {pin_source}, but {chain_source} pins \"{raw}\". \
+             {pin_source} wins; update one so they agree.",
+            node.version
+        ));
+    }
+
+    // The winning pin vs package.json#engines.node (#5) — unless engines.node
     // IS the winning source (it can't disagree with itself).
     if pin_source != ENGINES_NODE_SOURCE
         && let Some((range, engines_source)) = read_engines_node(cwd)
@@ -715,61 +962,332 @@ pub fn engines_disagreement_warning(cwd: &Path, node: &ResolvedNode) -> Option<S
     }
 }
 
+/// The `node` on PATH with every pin ignored: the Node npm runs a project's
+/// scripts with. For the npm-routed install, whose contract is npm's, so a
+/// `.nvmrc` naming a Node the machine lacks is neither provisioned nor waited
+/// on. Skips nub's own shim directories like every PATH probe here.
+pub fn discover_shell_node() -> Result<ResolvedNode, DiscoveryError> {
+    shell_path_node(None)
+}
+
+/// Whether a bare `node` on PATH is Nub's own shim — the persistent one
+/// (`nub node shim`) or a per-invocation hijack dir — which resolves the
+/// project's pin on every call. [`discover_shell_node`] steps over those dirs to
+/// find the real binary, so a caller describing what a script's `node` will run
+/// under has to ask this first: with the shim in front, PATH semantics are the
+/// pin. A dependency's `node_modules/.bin/node` is skipped as in every probe.
+/// A `node` elsewhere that links back to nub counts too, since
+/// [`which_node_in`] steps over it for the same reason.
+pub fn shell_node_is_nub_shim() -> bool {
+    let persistent = crate::node::shim::node_shim_dir()
+        .ok()
+        .and_then(|d| d.canonicalize().ok());
+    shell_node_is_nub_shim_in(
+        &env::var_os("PATH").unwrap_or_default(),
+        persistent.as_deref(),
+    )
+}
+
+fn shell_node_is_nub_shim_in(path_var: &std::ffi::OsStr, persistent_shim: Option<&Path>) -> bool {
+    for dir in env::split_paths(path_var) {
+        if is_package_bin_dir(&dir) {
+            continue;
+        }
+        let node = [dir.join("node"), dir.join("node.exe")]
+            .into_iter()
+            .take(if cfg!(windows) { 2 } else { 1 })
+            .find(|candidate| candidate.is_file());
+        if let Some(node) = node {
+            return is_nub_shim_dir_with(&dir, persistent_shim)
+                || links_back_to_nub(&node, persistent_shim);
+        }
+    }
+    false
+}
+
 /// Resolve `node` from the shell PATH and detect its version.
 /// `pin_source` is threaded through so the resulting `ResolvedNode`
 /// carries the pin filename when one was found by the walk-up.
+///
+/// A candidate whose probe starts nub again is skipped and the walk goes on, so no
+/// link, copy or wrapper of nub has to be recognised up front, and each skip removes
+/// one distinct candidate, so the walk ends. A version manager's shim with nothing
+/// active for the directory is the common case (#832): it falls back to the next
+/// `node` on PATH, stepping over only its own directories (mise's
+/// `not_found_system_fallback`, Volta with no platform), and inside a nub run that is
+/// nub's shim. It cannot be told from a healthy shim by looking at it, since a healthy
+/// one is the same file, and one esbuild postinstall reached 2,137 processes this way.
 fn shell_path_node(pin_source: Option<String>) -> Result<ResolvedNode, DiscoveryError> {
-    let node_path = which_node()?;
-    let version = detect_version(&node_path)?;
-    let utf8_path = Utf8PathBuf::try_from(node_path)
-        .map_err(|e| DiscoveryError::VersionDetection(e.to_string()))?;
-    Ok(ResolvedNode {
-        path: utf8_path,
-        version,
-        pin_source,
-    })
+    loop {
+        let node_path = which_node()?;
+        let version = match detect_version(&node_path) {
+            Ok(version) => version,
+            Err(DiscoveryError::ReentersNub { .. }) => {
+                REENTERS_NUB
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(node_path);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let utf8_path = Utf8PathBuf::try_from(node_path)
+            .map_err(|e| DiscoveryError::VersionDetection(e.to_string()))?;
+        return Ok(ResolvedNode {
+            path: utf8_path,
+            version,
+            pin_source,
+        });
+    }
 }
 
-/// Find `node` on PATH, skipping nub's own PATH shim directories.
-fn which_node() -> Result<PathBuf, DiscoveryError> {
-    let path_var = env::var_os("PATH").unwrap_or_default();
+/// True for a `node_modules/.bin` directory, which the PATH walk must step
+/// over rather than treat as a source of Node itself.
+///
+/// `.bin` is a namespace of names a package DECLARED, so an entry called
+/// `node` there is a dependency's bin, not the project's runtime — the npm
+/// package `node` puts one there, and nub would otherwise adopt whatever
+/// version that package ships in place of the project's own pin. nub resolves
+/// Node from its pin chain (`devEngines.runtime` → `.node-version` → `.nvmrc`
+/// → `.tool-versions` → `engines.node`), which has never included `.bin`.
+///
+/// It is also a recursion guard, and the one that bites hardest: aube puts
+/// `.bin` on PATH for every lifecycle script, so a `.bin/node` wrapper is
+/// reachable from the very probe that runs `node --version` (#656).
+fn is_package_bin_dir(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n == ".bin")
+        && dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "node_modules")
+}
 
-    for dir in env::split_paths(&path_var) {
-        // Skip our own PATH shim directories.
-        if let Some(name) = dir.file_name()
-            && name.to_string_lossy().starts_with("nub-node-shim-")
-        {
+/// The PATH candidates this process has seen lead back to nub, so a later
+/// discovery pass in the same run skips them without spawning another probe.
+static REENTERS_NUB: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Find `node` on PATH, skipping nub's own PATH shim directories and the candidates
+/// already known to lead back to nub.
+fn which_node() -> Result<PathBuf, DiscoveryError> {
+    // The persistent global `node` shim (`~/.nub/node-shim`, `nub node shim`) is
+    // a `node` hardlink to nub sitting on PATH. When nub-as-node resolves the
+    // REAL node it must skip that dir, or it would find its own shim first →
+    // infinite recursion. Canonicalized so a symlinked `~/.nub` still matches.
+    let persistent_shim = crate::node::shim::node_shim_dir()
+        .ok()
+        .and_then(|d| d.canonicalize().ok());
+    which_node_in(
+        &env::var_os("PATH").unwrap_or_default(),
+        persistent_shim.as_deref(),
+        &REENTERS_NUB
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// [`which_node`] against an explicit PATH, persistent-shim dir and list of
+/// rejected candidates — the testable body. Three recursion guards: every directory
+/// holding nub wearing Node's name ([`is_nub_shim_dir_with`], which owns that rule
+/// for the whole module), any `node_modules/.bin` ([`is_package_bin_dir`]), and every
+/// `node` whose probe started nub again ([`REENTERS_NUB`]).
+fn which_node_in(
+    path_var: &std::ffi::OsStr,
+    persistent_shim: Option<&Path>,
+    reentrant: &[PathBuf],
+) -> Result<PathBuf, DiscoveryError> {
+    let mut skipped_loop = None;
+    for dir in env::split_paths(path_var) {
+        if is_nub_shim_dir_with(&dir, persistent_shim) {
+            continue;
+        }
+        if is_package_bin_dir(&dir) {
             continue;
         }
 
-        let candidate = dir.join("node");
-        if candidate.is_file() {
+        let mut candidates = vec![dir.join("node")];
+        if cfg!(windows) {
+            candidates.push(dir.join("node.exe"));
+        }
+        for candidate in candidates {
+            if !candidate.is_file() || links_back_to_nub(&candidate, persistent_shim) {
+                continue;
+            }
+            if reentrant
+                .iter()
+                .any(|shim| same_file_path(&candidate, shim))
+            {
+                skipped_loop.get_or_insert(candidate);
+                continue;
+            }
             return Ok(candidate);
         }
-        #[cfg(windows)]
-        {
-            let candidate_exe = dir.join("node.exe");
-            if candidate_exe.is_file() {
-                return Ok(candidate_exe);
-            }
-        }
     }
-    Err(DiscoveryError::NoNodeOnPath)
+    Err(match skipped_loop {
+        Some(shim) => DiscoveryError::NodeShimLoop {
+            shim: shim.display().to_string(),
+        },
+        None => DiscoveryError::NoNodeOnPath,
+    })
 }
 
-/// Run `node --version` and parse the output, with a disk cache
-/// keyed on the binary's path + mtime to avoid spawning on repeat calls.
-fn detect_version(node_path: &Path) -> Result<NodeVersion, DiscoveryError> {
-    if let Some(cached) = read_version_cache(node_path) {
-        return Ok(cached);
+/// A `node` in an ordinary directory that is a link back to nub: to this
+/// executable, or into one of nub's shim directories. The directory tests in
+/// [`which_node_in`] cannot see it, and resolving through it re-enters nub, which
+/// finds the same link again. A test bin dir holding `node -> <shim dir>/node`
+/// recursed without bound this way. A probe would catch this too, but only if the
+/// shim is new enough to refuse one ([`crate::node::nesting`]); probing a link to an
+/// older installed shim would start that recursion, so this looks before it probes.
+fn links_back_to_nub(candidate: &Path, persistent_shim: Option<&Path>) -> bool {
+    let Ok(target) = candidate.canonicalize() else {
+        return false;
+    };
+    if env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .is_ok_and(|exe| exe == target)
+    {
+        return true;
     }
+    target
+        .parent()
+        .is_some_and(|dir| is_nub_shim_dir_with(dir, persistent_shim))
+}
 
-    let output = Command::new(node_path)
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+/// Record a launch of `node` in nub's recursion count ([`crate::node::nesting`]): a
+/// Node known to be real ends the chain, and anything else stays in it. Not for a
+/// wrapper in front of Node (a `prefix`, an env-owner loader), which inherits the
+/// count like any other child.
+pub fn mark_node_launch(cmd: &mut Command, node: &Path) {
+    if is_real_node(node) {
+        super::nesting::clear(cmd);
+    } else {
+        super::nesting::mark_launch(cmd, node);
+    }
+}
+
+/// Paths this process has seen answer as the Node binary they are.
+static REAL_NODES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn remember_real_node(node: &Path) {
+    if let Ok(mut real) = REAL_NODES.lock() {
+        real.push(node.to_path_buf());
+    }
+}
+
+/// Whether `node` is known to be a Node binary rather than something that may lead
+/// back to nub, which is what ends a chain for [`crate::node::nesting`]: the file
+/// answered with its own `process.execPath`, or it sits in a store of real binaries
+/// and was picked by version. An unknown path, a shim's above all, is not.
+fn is_real_node(node: &Path) -> bool {
+    REAL_NODES
+        .lock()
+        .is_ok_and(|real| real.iter().any(|known| known == node))
+        || node_store_dir().is_some_and(|store| node.starts_with(store))
+        || nvm_dir().is_some_and(|nvm| node.starts_with(nvm.join("versions")))
+}
+
+/// The version of the Node at `node_path`, from a disk cache keyed on the binary's
+/// path + mtime when that key can be trusted.
+///
+/// It cannot be trusted for a version manager's shim (mise, asdf, nodenv, Volta):
+/// one path whose Node depends on the directory it runs in, so a version recorded
+/// in one project was handed to another, and nub injected a flag only the recorded
+/// Node accepts into the real one — `node: bad option`, exit 9. The first probe
+/// therefore also asks for `process.execPath`, the way uv asks a Python for
+/// `sys.executable` before caching anything about a pyenv shim: a path that is
+/// not the binary that answered is remembered as a shim, and read fresh each time.
+fn detect_version(node_path: &Path) -> Result<NodeVersion, DiscoveryError> {
+    match read_version_entry(node_path) {
+        Some(VersionEntry::Binary(version)) => return Ok(version),
+        Some(VersionEntry::Shim) => return probe_version_flag(node_path),
+        None => {}
+    }
+    match probe_identity(node_path)? {
+        Some((version, exec_path)) => {
+            let direct = is_same_binary(node_path, &exec_path);
+            write_version_cache(node_path, direct.then_some(&version));
+            if direct {
+                remember_real_node(node_path);
+            }
+            Ok(version)
+        }
+        // A binary that could not say where it lives still has a version to report;
+        // nothing is cached, since nothing about its identity was learned.
+        None => probe_version_flag(node_path),
+    }
+}
+
+/// `node -e` printing `process.version` and `process.execPath`, one per line. `None`
+/// when the probe fails or answers in any other shape; an error when it started nub
+/// again.
+fn probe_identity(node_path: &Path) -> Result<Option<(NodeVersion, PathBuf)>, DiscoveryError> {
+    let mut probe = Command::new(node_path);
+    super::nesting::mark_probe(&mut probe, node_path);
+    // NODE_OPTIONS is cleared for the reason `accepted_env_flags` gives: `-e`, unlike
+    // `--version`, runs its preloads.
+    let Ok(output) = probe
+        .arg("-e")
+        .arg("process.stdout.write(process.version + \"\\n\" + process.execPath)")
+        .env_remove("NODE_OPTIONS")
+        .output()
+    else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        if super::nesting::probe_reentered_nub(&output.stderr) {
+            return Err(DiscoveryError::ReentersNub {
+                candidate: node_path.display().to_string(),
+            });
+        }
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some((version, exec_path)) = stdout.split_once('\n') else {
+        return Ok(None);
+    };
+    let exec_path = exec_path.trim();
+    if exec_path.is_empty() {
+        return Ok(None);
+    }
+    Ok(version
+        .trim()
+        .parse()
+        .ok()
+        .map(|version| (version, PathBuf::from(exec_path))))
+}
+
+/// Whether two paths name one file. Hard links count, which a canonical-path
+/// comparison misses; where the inode test is unavailable a miss only costs a
+/// re-probe per launch.
+fn is_same_binary(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (fs::metadata(a), fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    same_file_path(a, b)
+}
+
+/// `node --version`, uncached.
+fn probe_version_flag(node_path: &Path) -> Result<NodeVersion, DiscoveryError> {
+    let mut probe = Command::new(node_path);
+    super::nesting::mark_probe(&mut probe, node_path);
+    let output = probe
         .arg("--version")
         .output()
         .map_err(|e| DiscoveryError::VersionDetection(format!("{node_path:?}: {e}")))?;
 
     if !output.status.success() {
+        if super::nesting::probe_reentered_nub(&output.stderr) {
+            return Err(DiscoveryError::ReentersNub {
+                candidate: node_path.display().to_string(),
+            });
+        }
         return Err(DiscoveryError::VersionDetection(format!(
             "{node_path:?} --version exited with {}",
             output.status
@@ -781,47 +1299,514 @@ fn detect_version(node_path: &Path) -> Result<NodeVersion, DiscoveryError> {
         .trim()
         .parse::<NodeVersion>()
         .map_err(|e| DiscoveryError::VersionDetection(e.to_string()))?;
-
-    write_version_cache(node_path, &version);
     Ok(version)
 }
 
-/// Resolve the `NODE_EXECUTABLE` override, if set. Split from the env read so the
-/// resolution is unit-testable without mutating the process environment.
+/// Resolve an explicit-binary override to a [`ResolvedNode`]. Split from the env
+/// read so the resolution is unit-testable without mutating the process
+/// environment. `source` names the surface that supplied the path, and becomes
+/// the node's `pin_source` so the floor error and the disagreement warnings
+/// attribute it.
 fn node_executable_from(
     raw: Option<std::ffi::OsString>,
+    source: &str,
 ) -> Result<Option<ResolvedNode>, DiscoveryError> {
     let Some(raw) = raw else { return Ok(None) };
     if raw.is_empty() {
         return Ok(None);
     }
     let path = PathBuf::from(raw);
+    if is_nub_as_node(&path) {
+        return Err(DiscoveryError::NodeExecutableIsNub {
+            path: path.display().to_string(),
+            origin: source.to_string(),
+        });
+    }
     // Detect the version (spawns `<path> --version`, mtime-cached). A bad path /
-    // non-Node binary surfaces a clear VersionDetection error.
-    let version = detect_version(&path)?;
+    // non-Node binary surfaces a clear VersionDetection error, and one whose probe
+    // starts nub again is nub by behavior even when no path test above saw it.
+    let version = match detect_version(&path) {
+        Err(DiscoveryError::ReentersNub { .. }) => {
+            return Err(DiscoveryError::NodeExecutableIsNub {
+                path: path.display().to_string(),
+                origin: source.to_string(),
+            });
+        }
+        result => result?,
+    };
     let utf8_path =
         Utf8PathBuf::try_from(path).map_err(|e| DiscoveryError::VersionDetection(e.to_string()))?;
     Ok(Some(ResolvedNode {
         path: utf8_path,
         version,
-        // Name the override as the source so the floor error attributes it.
-        pin_source: Some("NODE_EXECUTABLE".to_string()),
+        pin_source: Some(source.to_string()),
     }))
 }
 
 fn node_executable_override() -> Result<Option<ResolvedNode>, DiscoveryError> {
-    node_executable_from(env::var_os("NODE_EXECUTABLE"))
+    // Environment first: `NODE_EXECUTABLE` outranks the configured field, and
+    // reading it here rather than trusting the CLI's overlay keeps that true for
+    // a value the overlay cannot model (a non-UTF-8 path) and for a command path
+    // that never resolves a config snapshot at all.
+    if let Some(raw) = env::var_os(NODE_EXECUTABLE_SOURCE).filter(|raw| !raw.is_empty()) {
+        return node_executable_from(Some(raw), NODE_EXECUTABLE_SOURCE);
+    }
+    let Some(setting) = NODE_EXECUTABLE.get() else {
+        return Ok(None);
+    };
+    let path = resolve_node_executable(setting)?;
+    node_executable_from(Some(path.into_os_string()), CONFIG_NODE_EXECUTABLE_SOURCE)
+}
+
+/// True when `path` is a `node` that is really nub — the persistent global shim,
+/// a per-invocation temp shim, or the binary reached under another name. Nub
+/// resolving a Node through one of those re-enters discovery, which reads the
+/// same override again, so it recurses until something kills it.
+///
+/// [`which_node_in`] already skips these dirs while scanning PATH, and for this
+/// exact reason. An explicit override is the one route that still reaches them —
+/// `$(which node)` being the likely spelling, since the user's `which` does not
+/// share nub's skip list — so the same rule is applied here.
+///
+/// The same three directory tests as [`which_node_in`], for the same reasons,
+/// plus an identity check against this executable that catches a SYMLINK to nub
+/// living outside any shim dir. The directory tests stay necessary regardless:
+/// the installed shim is a HARDLINK, which `canonicalize` does not resolve back
+/// to a shared path.
+fn is_nub_as_node(path: &Path) -> bool {
+    if let Ok(exe) = env::current_exe().and_then(|exe| exe.canonicalize())
+        && path.canonicalize().is_ok_and(|target| target == exe)
+    {
+        return true;
+    }
+    path.parent().is_some_and(is_nub_shim_dir)
+}
+
+/// A directory holding a `node` that is really nub: a per-invocation temp shim,
+/// or the persistent global one — the latter matched BOTH by canonical path and
+/// by its `<nub|.nub>/node-shim` shape, since `node_shim_dir` depends on
+/// `XDG_DATA_HOME` and that variable need not be set in the shell that ends up
+/// running nub.
+///
+/// The single answer to "is this nub wearing Node's name", used by the PATH scan
+/// ([`which_node_in`]), the override guard ([`is_nub_as_node`]) and the command
+/// PATH filter ([`node_executable_command_path`]). Three copies of this rule
+/// could disagree, and a directory one of them skipped while another accepted is
+/// how nub resolves its own shim and recurses.
+///
+/// The temp-shim prefix is delegated to [`spawn::is_path_shim_candidate`] rather
+/// than re-matched here, because on Windows it must be case-INSENSITIVE: PATH
+/// lookup there is, so a `NUB-NODE-SHIM-…` entry names the same directory a
+/// case-sensitive test would let through.
+///
+/// `persistent_shim` is injected so [`which_node_in`] stays testable without
+/// moving the real shim dir; [`is_nub_shim_dir`] resolves it for callers that
+/// have no reason to.
+fn is_nub_shim_dir_with(dir: &Path, persistent_shim: Option<&Path>) -> bool {
+    if crate::node::spawn::is_path_shim_candidate(dir) {
+        return true;
+    }
+    let Ok(canonical) = dir.canonicalize() else {
+        return false;
+    };
+    if persistent_shim == Some(canonical.as_path()) {
+        return true;
+    }
+    crate::node::shim::is_node_shim_dir_shape(&canonical)
+}
+
+/// [`is_nub_shim_dir_with`] against the real persistent shim dir.
+fn is_nub_shim_dir(dir: &Path) -> bool {
+    let persistent = crate::node::shim::node_shim_dir()
+        .ok()
+        .and_then(|d| d.canonicalize().ok());
+    is_nub_shim_dir_with(dir, persistent.as_deref())
+}
+
+/// `PATH` with nub's own shim directories removed, for the shell a `$(command)`
+/// runs in.
+///
+/// `$(which node)` is the documented way to say "whatever Node is first on my
+/// PATH", and on a machine with `nub node shim` installed the literal first
+/// answer is nub's shim — which is nub, not a Node. Refusing that would break the
+/// recipe for exactly the users who opted into the shim, and honouring it would
+/// recurse. Removing the shim from the PATH the command SEES resolves it without
+/// nub second-guessing the answer: the tool is asked the same question with nub's
+/// own impersonation taken off the table, and whatever it then prints is used
+/// verbatim.
+///
+/// `node_modules/.bin` is deliberately NOT filtered, unlike in [`which_node_in`]:
+/// this is the user's own command, and a project-local tool on its PATH is
+/// legitimate.
+fn node_executable_command_path() -> std::ffi::OsString {
+    let path = env::var_os("PATH").unwrap_or_default();
+    let kept: Vec<PathBuf> = env::split_paths(&path)
+        .filter(|dir| !is_nub_shim_dir(dir))
+        .collect();
+    env::join_paths(kept).unwrap_or(path)
+}
+
+/// Source label for the `NODE_EXECUTABLE` override, doubling as the variable's
+/// own name — the two must not drift.
+const NODE_EXECUTABLE_SOURCE: &str = "NODE_EXECUTABLE";
+
+/// Source label for the `nub.jsonc` `nodeExecutable` field, shaped like the
+/// `package.json#…` labels.
+const CONFIG_NODE_EXECUTABLE_SOURCE: &str = "nub.jsonc#nodeExecutable";
+
+/// True for either explicit-binary override. Both bypass the whole pin chain, so
+/// the disagreement warnings — and `nub node which`, which must not credit a
+/// source that had no say — treat them identically.
+pub fn is_explicit_binary_source(source: &str) -> bool {
+    source == NODE_EXECUTABLE_SOURCE || source == CONFIG_NODE_EXECUTABLE_SOURCE
+}
+
+/// The `nodeExecutable` field as the CLI resolved it through config precedence.
+/// Only a FILE-backed value is published here: `NODE_EXECUTABLE` outranks the
+/// field and is read straight from the environment, so the two layers never
+/// compete inside this module.
+#[derive(Debug, Clone)]
+pub struct NodeExecutable {
+    /// The value exactly as authored — a path, or a `$(command)` to run.
+    pub spec: String,
+    /// The directory holding the `nub.jsonc` that carried it. A relative PATH
+    /// anchors here, so one committed value names one binary however deep in the
+    /// tree the user is standing.
+    pub root: PathBuf,
+    /// The invocation's working directory, where a `$(command)` runs — the same
+    /// anchor discovery itself uses. A toolchain manager answers per directory,
+    /// so asking it from the config file's directory would report the repo root's
+    /// Node for a monorepo member, and a GLOBAL file's command would report the
+    /// machine's Node for every project on it.
+    pub cwd: PathBuf,
+    /// The file's path, for error attribution.
+    pub file: PathBuf,
+}
+
+static NODE_EXECUTABLE: std::sync::OnceLock<NodeExecutable> = std::sync::OnceLock::new();
+
+/// The `$(command)` form spawns, so its result is memoized for the invocation —
+/// discovery runs on several paths per run and the command is the user's own
+/// toolchain, not something to re-shell for each of them. Held in a cloneable
+/// shape because [`DiscoveryError`] is not `Clone`: the memo owns the facts, and
+/// each read builds the error from them.
+static NODE_EXECUTABLE_RESOLVED: std::sync::OnceLock<Result<PathBuf, NodeExecutableFailure>> =
+    std::sync::OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct NodeExecutableFailure {
+    command: String,
+    file: String,
+    failure: String,
+    stderr: String,
+}
+
+impl From<NodeExecutableFailure> for DiscoveryError {
+    fn from(failure: NodeExecutableFailure) -> Self {
+        DiscoveryError::NodeExecutableCommandFailed {
+            command: failure.command,
+            file: failure.file,
+            failure: failure.failure,
+            stderr: failure.stderr,
+        }
+    }
+}
+
+/// Publish the configured `nodeExecutable` for this invocation. Called once by
+/// the CLI after config precedence resolves; a second call is a no-op, matching
+/// the config snapshot it mirrors.
+pub fn set_node_executable(setting: NodeExecutable) {
+    let _ = NODE_EXECUTABLE.set(setting);
+}
+
+/// A whole-value `$(…)` is the substitution form; anything else is a path. Only
+/// the whole value, never an embedded fragment: the command's exit status is
+/// what decides whether the run continues, and that is answerable for one
+/// command and not for a string that splices several together.
+fn command_substitution(spec: &str) -> Option<&str> {
+    let spec = spec.trim();
+    spec.strip_prefix("$(")?.strip_suffix(')')
+}
+
+/// Turn a `nodeExecutable` spec into a binary path — running its `$(command)`
+/// once per invocation, or resolving a literal path against the file that
+/// carried it.
+fn resolve_node_executable(setting: &NodeExecutable) -> Result<PathBuf, DiscoveryError> {
+    let Some(command) = command_substitution(&setting.spec) else {
+        return Ok(resolve_against(&setting.root, &setting.spec));
+    };
+    NODE_EXECUTABLE_RESOLVED
+        .get_or_init(|| run_node_executable_command(command, setting))
+        .clone()
+        .map_err(DiscoveryError::from)
+}
+
+fn run_node_executable_command(
+    command: &str,
+    setting: &NodeExecutable,
+) -> Result<PathBuf, NodeExecutableFailure> {
+    let fail = |failure: String, stderr: &str| NodeExecutableFailure {
+        command: command.to_string(),
+        file: setting.file.display().to_string(),
+        failure,
+        stderr: stderr.trim().to_string(),
+    };
+
+    let mut shell = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.arg("/C");
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c");
+        c
+    };
+    let output = shell
+        .arg(command)
+        .current_dir(&setting.cwd)
+        .env("PATH", node_executable_command_path())
+        .output()
+        .map_err(|error| fail(format!("could not run: {error}"), ""))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        let code = match output.status.code() {
+            Some(code) => format!("exited {code}"),
+            None => "was killed by a signal".to_string(),
+        };
+        return Err(fail(code, &stderr));
+    }
+    // STRICT, not lossy. A tool that emits bytes nub cannot read as UTF-8 — a
+    // `cmd.exe` builtin on a non-UTF-8 Windows console codepage is the realistic
+    // case — would otherwise reach `detect_version` as a path carrying U+FFFD in
+    // place of the user's non-ASCII profile name, and fail there naming a binary
+    // the user never wrote. Nub cannot negotiate the encoding (a third-party tool
+    // picks its own, and `cmd /U` governs only cmd's OWN builtins), so it refuses
+    // the ambiguity where the fix is legible instead of corrupting the path.
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return Err(fail(
+            "printed a path that is not valid UTF-8".to_string(),
+            &stderr,
+        ));
+    };
+    // The FIRST non-empty line, not the whole output. A which-style tool prints
+    // one candidate per line and the first is the one PATH would have picked —
+    // Windows `where node` prints every match, so a box with two Nodes on PATH
+    // emits two lines. Trimming the lot instead would build a path with a newline
+    // inside it and fail naming a string the user never wrote.
+    let path = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    if path.is_empty() {
+        return Err(fail("printed no path".to_string(), &stderr));
+    }
+    // Anchored where the command RAN, which is the convention every shell already
+    // gives its user, rather than where the value was written.
+    Ok(resolve_against(&setting.cwd, &path))
+}
+
+/// The [`node_executable_override`] surfaces, resolved without spawning
+/// anything — the no-spawn half of [`discover_node_cached`]. `None` whenever the
+/// answer would cost a process: an unrun `$(command)`, or a path whose version
+/// is not in the mtime-valid cache.
+fn cached_node_executable_override() -> Option<ResolvedNode> {
+    let (path, source) = match env::var_os(NODE_EXECUTABLE_SOURCE).filter(|raw| !raw.is_empty()) {
+        Some(raw) => (PathBuf::from(raw), NODE_EXECUTABLE_SOURCE),
+        None => {
+            let setting = NODE_EXECUTABLE.get()?;
+            let path = match command_substitution(&setting.spec) {
+                Some(_) => NODE_EXECUTABLE_RESOLVED.get()?.clone().ok()?,
+                None => resolve_against(&setting.root, &setting.spec),
+            };
+            (path, CONFIG_NODE_EXECUTABLE_SOURCE)
+        }
+    };
+    let version = read_version_cache(&path)?;
+    Some(ResolvedNode {
+        path: Utf8PathBuf::try_from(path).ok()?,
+        version,
+        pin_source: Some(source.to_string()),
+    })
+}
+
+/// Anchor a `nodeExecutable` path to the file that declared it: `~/` is the
+/// home dir, a relative path is relative to that file's directory (never the
+/// ambient cwd, which would make one committed value mean different binaries
+/// depending on where the user stood), and an absolute path is used as written.
+fn resolve_against(root: &Path, raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = dirs_next::home_dir()
+    {
+        return windows_exe(home.join(rest));
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return windows_exe(path.to_path_buf());
+    }
+    // Pushed component by component rather than joined whole: the portable
+    // spelling of a committed value is `./tools/node` on every platform, and
+    // joining that verbatim carries its `/` into a Windows path that otherwise
+    // uses `\`, so `nub node which` would print one path spelled two ways.
+    // Dropping a leading `.` keeps that output a path rather than an echo of how
+    // the config value happened to be written.
+    let mut resolved = root.to_path_buf();
+    for component in path.strip_prefix(".").unwrap_or(path).components() {
+        resolved.push(component);
+    }
+    windows_exe(resolved)
+}
+
+/// The `.exe` a Windows `node` actually lives under. The extension-less spelling
+/// is the one a `nub.jsonc` shared across a mixed-platform team can commit, and
+/// it already RUNS there because `CreateProcess` appends `.exe` itself — so the
+/// gap is invisible until something treats the value as a FILE. Two things do,
+/// and both fail quietly: [`read_version_cache`] stats it, so an extension-less
+/// path misses the cache on every single invocation and re-spawns
+/// `node --version` forever; and `nub node which` prints a path that is not on
+/// disk. Resolved once, here, so execution, the cache, and the reported path all
+/// name the same file.
+///
+/// Applies to the CONFIGURED value only. `NODE_EXECUTABLE` is set per shell on
+/// one machine, so it carries no portability problem to solve, and its semantics
+/// predate this field — it is used exactly as written.
+fn windows_exe(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if path.extension().is_none() && !path.is_file() {
+            let with_exe = path.with_extension("exe");
+            if with_exe.is_file() {
+                return with_exe;
+            }
+        }
+    }
+    path
 }
 
 /// nub's cache root (`$XDG_CACHE_HOME/nub` or `~/.cache/nub`). Public so the
 /// `nub node` command group can locate the store + index cache without
 /// reimplementing the path logic.
+///
+/// Windows fallback: under a service/SYSTEM account (e.g. sshd) `home_dir()` can
+/// resolve to a system directory (`C:\WINDOWS`, the SYSTEM profile) or fail
+/// outright, either of which makes `~/.cache/nub` unusable and bricked `nub
+/// node` / `nub pm shim`. There we fall back to `%LOCALAPPDATA%\nub` — the
+/// platform-correct per-user store the service account can actually write. A
+/// normal Windows user profile keeps the established `~/.cache/nub` so existing
+/// caches aren't orphaned; an explicit `XDG_CACHE_HOME` still wins everywhere.
 pub fn cache_dir() -> Option<PathBuf> {
-    let base = std::env::var("XDG_CACHE_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| dirs_next::home_dir().map(|h| h.join(".cache")))?;
-    Some(base.join("nub"))
+    if let Some(xdg) = env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("nub"));
+    }
+
+    #[cfg(windows)]
+    {
+        windows_cache_dir(
+            dirs_next::home_dir(),
+            env::var_os("LOCALAPPDATA")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .or_else(dirs_next::cache_dir),
+            env::var_os("SystemRoot")
+                .or_else(|| env::var_os("windir"))
+                .map(PathBuf::from),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        dirs_next::home_dir().map(|h| h.join(".cache").join("nub"))
+    }
+}
+
+/// nub's config root (`$XDG_CONFIG_HOME/nub` or `~/.config/nub`) — the home of
+/// the global settings file `nub.jsonc`. Deliberately NOT `dirs_next::config_dir`,
+/// which resolves to macOS `~/Library/Preferences`: nub follows the XDG `~/.config`
+/// convention on every unix (the norm for developer-facing config, e.g. gh/git/
+/// starship) so the file lands where users expect it. Config and cache live in
+/// separate XDG roots (`~/.config/nub` vs `~/.cache/nub`), by design.
+///
+/// Windows fallback mirrors [`cache_dir`] but uses `%APPDATA%` (roaming per-user
+/// settings) rather than `%LOCALAPPDATA%` (machine-local cache) — config is the
+/// kind of state that should roam.
+pub fn config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("nub"));
+    }
+
+    #[cfg(windows)]
+    {
+        windows_config_dir(
+            dirs_next::home_dir(),
+            env::var_os("APPDATA")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .or_else(dirs_next::config_dir),
+            env::var_os("SystemRoot")
+                .or_else(|| env::var_os("windir"))
+                .map(PathBuf::from),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        dirs_next::home_dir().map(|h| h.join(".config").join("nub"))
+    }
+}
+
+/// Resolve nub's Windows config dir when there is no `XDG_CONFIG_HOME` override.
+/// Same service/SYSTEM-account guard as [`windows_cache_dir`] (an unusable
+/// `~/.config` under a service profile falls back to `%APPDATA%\nub`), differing
+/// only in the fallback root. Pure so it is unit-testable off Windows.
+#[cfg(any(windows, test))]
+fn windows_config_dir(
+    home: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+    system_root: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match home {
+        Some(home) if !is_windows_system_home(&home, system_root.as_deref()) => {
+            Some(home.join(".config").join("nub"))
+        }
+        _ => app_data.map(|p| p.join("nub")),
+    }
+}
+
+/// Resolve nub's Windows cache dir when there is no `XDG_CACHE_HOME` override.
+/// Pure (takes its env inputs) so the decision is unit-testable off Windows.
+/// See [`cache_dir`] for the rationale.
+#[cfg(any(windows, test))]
+fn windows_cache_dir(
+    home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    system_root: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match home {
+        Some(home) if !is_windows_system_home(&home, system_root.as_deref()) => {
+            Some(home.join(".cache").join("nub"))
+        }
+        _ => local_app_data.map(|p| p.join("nub")),
+    }
+}
+
+/// True when `home` is, or lives under, the Windows system root — the tell of a
+/// service/SYSTEM account (`C:\WINDOWS`, `C:\WINDOWS\system32\config\systemprofile`)
+/// whose `~/.cache` is not a usable per-user location. Case-insensitive (Windows
+/// paths are), and boundary-aware so a sibling like `C:\WINDOWS.old\me` never
+/// matches.
+#[cfg(any(windows, test))]
+fn is_windows_system_home(home: &Path, system_root: Option<&Path>) -> bool {
+    let root_l = system_root
+        .unwrap_or_else(|| Path::new("C:\\Windows"))
+        .to_string_lossy()
+        .to_lowercase();
+    if root_l.is_empty() {
+        return false;
+    }
+    let home_l = home.to_string_lossy().to_lowercase();
+    home_l == root_l
+        || home_l.starts_with(&format!("{root_l}\\"))
+        || home_l.starts_with(&format!("{root_l}/"))
 }
 
 /// nub's own Node download store (`<cache_dir>/node/`), where each subdirectory
@@ -831,33 +1816,73 @@ pub fn node_store_dir() -> Option<PathBuf> {
     Some(cache_dir()?.join("node"))
 }
 
+/// What the discovery cache remembers about one `node` path.
+enum VersionEntry {
+    /// The path is the Node binary that answered, so its version holds until it is
+    /// replaced.
+    Binary(NodeVersion),
+    /// The path handed the probe to a different binary: a version manager's shim,
+    /// whose version is read fresh on every launch.
+    Shim,
+}
+
+/// The cached version of a path that is itself a Node binary. A shim has none.
 fn read_version_cache(node_path: &Path) -> Option<NodeVersion> {
+    match read_version_entry(node_path)? {
+        VersionEntry::Binary(version) => Some(version),
+        VersionEntry::Shim => None,
+    }
+}
+
+fn read_version_entry(node_path: &Path) -> Option<VersionEntry> {
     let cache = cache_dir()?.join("node-discovery.json");
     let content = fs::read_to_string(&cache).ok()?;
     let data: serde_json::Value = serde_json::from_str(&content).ok()?;
     let key = node_path.to_string_lossy();
     let entry = data.get(key.as_ref())?;
-    let cached_mtime = entry.get("mtime")?.as_u64()?;
-    let cached_version = entry.get("version")?.as_str()?;
-
-    let actual_mtime = fs::metadata(node_path)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-
-    if cached_mtime == actual_mtime {
-        cached_version.parse().ok()
-    } else {
-        None
+    if entry.get("mtime")?.as_u64()? != node_mtime_secs(node_path)? {
+        return None;
+    }
+    // An entry with no `kind` predates the shim check and may hold a version a
+    // shim reported for some other directory, so it is a miss.
+    match entry.get("kind")?.as_str()? {
+        "binary" => {
+            let version = entry.get("version")?.as_str()?.parse().ok()?;
+            remember_real_node(node_path);
+            Some(VersionEntry::Binary(version))
+        }
+        "shim" => Some(VersionEntry::Shim),
+        _ => None,
     }
 }
 
-fn write_version_cache(node_path: &Path, version: &NodeVersion) {
+/// The cache directory to write into, validated and owner-only where that check is
+/// compiled in. `None` means the base is not ours; a cache is an optimization, so
+/// the caller skips it rather than writing somewhere unvalidated.
+fn safe_cache_dir(dir: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    #[cfg(feature = "embed-runtime")]
+    {
+        super::runtime_cache::ensure_safe_cache_dir(&dir)
+    }
+    #[cfg(not(feature = "embed-runtime"))]
+    {
+        let _ = fs::create_dir_all(&dir);
+        Some(dir)
+    }
+}
+
+/// Record `node_path` as a Node binary of `version`, or as a shim when `None`.
+fn write_version_cache(node_path: &Path, version: Option<&NodeVersion>) {
     let Some(dir) = cache_dir() else { return };
-    let _ = fs::create_dir_all(&dir);
+    // Share the runtime cache's validated base rather than creating this one
+    // ourselves: this write is what used to reach the root FIRST and leave it with
+    // its parent's inherited permissions, which every later validated caller then
+    // refused. The validator lives behind `embed-runtime`, which every shipped
+    // binary enables (release.yml builds `embed-runtime,compile`), so users always
+    // get the checked path; a feature-off dev build keeps the old create.
+    let Some(dir) = safe_cache_dir(dir) else {
+        return;
+    };
     let cache = dir.join("node-discovery.json");
 
     let mut data: serde_json::Value = fs::read_to_string(&cache)
@@ -873,15 +1898,321 @@ fn write_version_cache(node_path: &Path, version: &NodeVersion) {
         .unwrap_or(0);
 
     let key = node_path.to_string_lossy().to_string();
-    data[key] = serde_json::json!({
-        "version": version.to_string(),
-        "mtime": mtime,
-    });
+    data[key] = match version {
+        Some(version) => serde_json::json!({
+            "kind": "binary",
+            "version": version.to_string(),
+            "mtime": mtime,
+        }),
+        None => serde_json::json!({ "kind": "shim", "mtime": mtime }),
+    };
 
     let _ = fs::write(
         &cache,
         serde_json::to_string_pretty(&data).unwrap_or_default(),
     );
+}
+
+/// The set of flag NAMES the given Node binary accepts (its
+/// `process.allowedNodeEnvironmentFlags`) — the authoritative universe of flags
+/// nub may inject or propagate via `NODE_OPTIONS`. Spawns the binary once with a
+/// tiny `-e` probe and caches the result on disk keyed by (path, version, mtime),
+/// so every repeat call is spawn-free (one probe per binary, ever). Returns `None` if the
+/// probe cannot run or produces nothing usable — callers then fall back to plain
+/// version-band gating rather than dropping flags they still need.
+///
+/// ## Why an authoritative probe and not a static binary byte-scan
+/// The option names ARE embedded as string literals in the Node binary, so a
+/// `strings | grep` would appear to work — but a string match is not proof the
+/// option is a LIVE accepted flag (it can sit in help text or unrelated data), and
+/// injecting a non-accepted flag is the exact `node: bad option` startup abort this
+/// guards against. `allowedNodeEnvironmentFlags` is Node's own ground truth.
+///
+/// ## Why this is needed (the open-ended-`Unflag`-band hazard)
+/// Node does NOT keep every experimental flag forever. Most unflagged flags survive
+/// as accepted no-ops (`--experimental-fetch`, `--experimental-modules`, …), but
+/// some are HARD-REMOVED on a later major — `--experimental-policy` and
+/// `--experimental-network-imports` are gone, and `--experimental-permission` was
+/// accepted through Node 23.11 then deleted at 24.0 (it stabilized to
+/// `--permission`). An open-ended `Unflag [lo, ∞)` band in the feature matrix would
+/// keep injecting such a flag into every future Node and abort it at startup.
+/// Intersecting the version-band inject set with this probe makes injection
+/// self-correcting: a flag the running Node no longer accepts is simply dropped, no
+/// nub release required.
+// @lat: [[research/node-experimental-flag-lifecycle#Node experimental-flag lifecycle#Decision / mitigation (implemented)]]
+pub fn accepted_env_flags(
+    node_path: &Path,
+    version: &NodeVersion,
+) -> Option<std::collections::BTreeSet<String>> {
+    if let Some(cached) = read_env_flags_cache(node_path, version) {
+        return Some(cached);
+    }
+
+    // Clear an inherited NODE_OPTIONS for the probe. `node -e` (unlike `node
+    // --version`) runs NODE_OPTIONS `--require`/`--import` preloads, so an inherited
+    // preload that writes to stdout would pollute the flag list, and a preload with
+    // side effects would run for nothing. The accepted-flag set is a static property
+    // of the binary, independent of NODE_OPTIONS — so removing it makes the probe
+    // deterministic and side-effect-free. (Pollution could only ADD tokens, never
+    // drop a real flag, so this is defense-in-depth, not a correctness fix.)
+    let mut probe = Command::new(node_path);
+    super::nesting::mark_probe(&mut probe, node_path);
+    let output = probe
+        .arg("-e")
+        .arg("process.stdout.write([...process.allowedNodeEnvironmentFlags].join(\"\\n\"))")
+        .env_remove("NODE_OPTIONS")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let flags: std::collections::BTreeSet<String> =
+        stdout.split_whitespace().map(str::to_string).collect();
+    if flags.is_empty() {
+        return None;
+    }
+
+    write_env_flags_cache(node_path, version, &flags);
+    Some(flags)
+}
+
+/// Whether this Node binary ACCEPTS `flag` on the command line. Spawns the binary
+/// once per (binary, flag) with a no-op `-e` probe and caches the verdict on disk
+/// keyed by (path, version, mtime), so repeat calls are spawn-free. `None` when the probe
+/// cannot run at all; callers then fall back to pure version-band gating, matching
+/// [`accepted_env_flags`]' contract.
+///
+/// ## Why this exists separately from [`accepted_env_flags`]
+/// That probe reads `process.allowedNodeEnvironmentFlags`, which is Node's ground
+/// truth for what `NODE_OPTIONS` accepts — and a V8 flag Node takes ONLY on the
+/// command line is absent from it BY CONSTRUCTION, even on the versions where the
+/// flag works. So it reads `false` for a live flag and cannot be reused here.
+/// Without this, a `Mitigation::UnflagArgv` row with an open-ended band has no
+/// removal backstop at all: V8 hard-removes a flag once its feature ships
+/// (`flag-definitions.h` deletes the `FLAG_` variable), an unknown `--js-*` is a
+/// `node: bad option` startup abort — verified — and because the row is gated on
+/// Node VERSION rather than on whether the source uses the syntax, that abort would
+/// hit EVERY augmented invocation on that Node, from binaries already shipped.
+/// This restores the same self-correcting property the `Unflag` rows get from
+/// Stage 4: a flag the running Node no longer accepts is simply dropped.
+pub fn accepts_argv_flag(node_path: &Path, version: &NodeVersion, flag: &str) -> Option<bool> {
+    if let Some(cached) = read_argv_flag_cache(node_path, version, flag) {
+        return Some(cached);
+    }
+
+    // `-e ""` so the probe runs no user code and exits immediately. NODE_OPTIONS is
+    // cleared for the same reason as the env-flag probe: an inherited preload would
+    // run for nothing and could fail the process for reasons unrelated to `flag`.
+    let mut probe = Command::new(node_path);
+    super::nesting::mark_probe(&mut probe, node_path);
+    let output = probe
+        .arg(flag)
+        .arg("-e")
+        .arg("")
+        .env_remove("NODE_OPTIONS")
+        .output()
+        .ok()?;
+    // Only a genuine REJECTION is a durable verdict. `status.success()` alone would
+    // conflate "Node rejected the flag" with every other reason a process exits
+    // non-zero — a signal under memory pressure, a sandbox denial, a half-written
+    // install — and this verdict is persisted by (path, mtime), so caching one of
+    // those would disable the feature for that binary until Node is reinstalled or
+    // the cache file is deleted by hand. That failure is the LIKELY one here, not the
+    // rare one: the probe only runs at/above the band floor, where the flag is
+    // expected to work, while the rejection it guards against is a future removal.
+    // So narrow to the exact signal, measured on real binaries: Node 25.9.0 rejects
+    // with exit 9 and `node: bad option: --js-defer-import-eval` on STDERR, while
+    // 26.5.0 accepts with exit 0 and empty stderr. Anything else returns `None` and
+    // falls back to version-band gating, costing one re-probe rather than the feature.
+    let accepted = output.status.success();
+    if !accepted && !String::from_utf8_lossy(&output.stderr).contains("bad option") {
+        return None;
+    }
+
+    write_argv_flag_cache(node_path, version, flag, accepted);
+    Some(accepted)
+}
+
+/// Read the cached argv-flag verdict for (binary, flag), honoring the mtime key.
+fn read_argv_flag_cache(node_path: &Path, version: &NodeVersion, flag: &str) -> Option<bool> {
+    read_flag_entry(node_path, version)?.argv.get(flag).copied()
+}
+
+/// Record the argv-flag verdict for (binary, flag). Best-effort: a failed write
+/// only costs a re-probe.
+fn write_argv_flag_cache(node_path: &Path, version: &NodeVersion, flag: &str, accepted: bool) {
+    update_flag_entry(node_path, version, |entry| {
+        entry.argv.insert(flag.to_string(), accepted);
+    });
+}
+
+/// mtime (seconds since epoch) of a Node binary, for cache-key freshness. `None`
+/// if the path can't be stat'd — a miss then forces a fresh probe.
+fn node_mtime_secs(node_path: &Path) -> Option<u64> {
+    fs::metadata(node_path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Read the cached `allowedNodeEnvironmentFlags` set for a binary, honoring the
+/// (path, version, mtime) key so a rebuilt/replaced Node at the same path re-probes.
+fn read_env_flags_cache(
+    node_path: &Path,
+    version: &NodeVersion,
+) -> Option<std::collections::BTreeSet<String>> {
+    let env = read_flag_entry(node_path, version)?.env?;
+    Some(env.into_iter().collect())
+}
+
+fn write_env_flags_cache(
+    node_path: &Path,
+    version: &NodeVersion,
+    flags: &std::collections::BTreeSet<String>,
+) {
+    update_flag_entry(node_path, version, |entry| {
+        entry.env = Some(flags.iter().cloned().collect());
+    });
+}
+
+/// Both probe verdicts for ONE Node binary: its `allowedNodeEnvironmentFlags` set
+/// and its per-flag argv verdicts. They share the (path, version, mtime) key and are
+/// read on the same spawn, so they share a file and a launch reads one.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct NodeFlagEntry {
+    /// The binary this describes. Stored so a hashed-filename collision is a miss
+    /// (one re-probe) rather than another binary's verdicts.
+    path: String,
+    mtime: u64,
+    /// The version that answered. Part of the key because one path can serve
+    /// several Nodes: a version manager's shim answers with whichever Node the
+    /// directory selects, and each has its own flags.
+    #[serde(default)]
+    version: String,
+    /// Absent until the env-flag probe has run; the argv probe writes the file first
+    /// whenever a `Mitigation::UnflagArgv` row applies to a Node nub did not install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    env: Option<Vec<String>>,
+    #[serde(default)]
+    argv: std::collections::BTreeMap<String, bool>,
+}
+
+/// ONE FILE PER BINARY, not one shared map — the same shape, and for the same
+/// reason, as the launcher's `cache::ProbeStore`.
+///
+/// These verdicts used to live in two flat `{ "<path>": … }` maps
+/// (`node-env-flags.json`, `node-argv-flags.json`) that every read parsed WHOLE, via
+/// `serde_json::Value`, to pull a single key. The env-flag set is ~256 strings per
+/// binary, so the file grew ~9 KB for every Node the machine had ever seen and the
+/// parse grew with it — on a hot path taken by every compiled-artifact launch AND
+/// every non-compat `nub` spawn. Measured on linux-x64, warm, hello-world artifact:
+/// the pre-spawn flag window ran 0.08 ms at 1 entry, 0.45 at 10, 2.09 at 50 and
+/// 8.45 at 200 — 0.042 ms of pure parse per remembered Node, per launch, forever.
+/// For scale, the whole rest of the launcher's warm work is ~0.6 ms. Keyed per
+/// binary the read is one small file whatever else the machine has installed.
+///
+/// It also stops one bad entry from poisoning every other: a single malformed byte
+/// anywhere in a shared map made `from_str` fail for EVERY binary — a `node` spawn
+/// per launch, indefinitely — and the next write reset the map, discarding every
+/// other binary's verdicts.
+///
+/// The legacy files are left alone rather than deleted. They are inert (nothing
+/// reads them now) and leaving them keeps a downgrade working.
+const FLAG_ENTRY_DIR: &str = "node-flags";
+
+/// The entry filename for `node_path` answering as `version`: a hash, so an
+/// arbitrary filesystem path becomes a fixed-width name that cannot escape the
+/// directory. A collision costs one re-probe, never a wrong verdict —
+/// `read_flag_entry` compares the stored path and version.
+fn flag_entry_name(node_path: &Path, version: &NodeVersion) -> String {
+    blake3::hash(format!("{}\0{version}", node_path.to_string_lossy()).as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn read_flag_entry(node_path: &Path, version: &NodeVersion) -> Option<NodeFlagEntry> {
+    read_flag_entry_in(&cache_dir()?, node_path, version)
+}
+
+/// `read_flag_entry` against an explicit cache root, so a test can drive it without
+/// mutating process-global environment (`XDG_CACHE_HOME`) — the seam
+/// `nub_store_node_in` established.
+fn read_flag_entry_in(
+    cache_root: &Path,
+    node_path: &Path,
+    version: &NodeVersion,
+) -> Option<NodeFlagEntry> {
+    let path = cache_root
+        .join(FLAG_ENTRY_DIR)
+        .join(flag_entry_name(node_path, version));
+    let entry: NodeFlagEntry = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
+    // Any doubt means "probe it again", which is always correct and merely slower:
+    // a hash collision, or a binary rebuilt in place since the verdict was recorded.
+    if entry.path != node_path.to_string_lossy()
+        || entry.version != version.to_string()
+        || entry.mtime != node_mtime_secs(node_path)?
+    {
+        return None;
+    }
+    Some(entry)
+}
+
+/// Read-modify-write one binary's entry. Best-effort throughout: a cache that
+/// cannot be written is a slower launch, never a failed one.
+fn update_flag_entry(
+    node_path: &Path,
+    version: &NodeVersion,
+    mutate: impl FnOnce(&mut NodeFlagEntry),
+) {
+    let Some(cache_root) = cache_dir().and_then(safe_cache_dir) else {
+        return;
+    };
+    update_flag_entry_in(&cache_root, node_path, version, mutate);
+}
+
+/// `update_flag_entry` against an explicit cache root — the write half of the
+/// `read_flag_entry_in` seam.
+fn update_flag_entry_in(
+    cache_root: &Path,
+    node_path: &Path,
+    version: &NodeVersion,
+    mutate: impl FnOnce(&mut NodeFlagEntry),
+) {
+    let dir = cache_root.join(FLAG_ENTRY_DIR);
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Some(mtime) = node_mtime_secs(node_path) else {
+        return;
+    };
+    // A stale entry is replaced wholesale rather than merged — the old verdicts
+    // describe a different binary at the same path.
+    let mut entry = read_flag_entry_in(cache_root, node_path, version).unwrap_or_default();
+    entry.path = node_path.to_string_lossy().into_owned();
+    entry.version = version.to_string();
+    entry.mtime = mtime;
+    mutate(&mut entry);
+
+    let Ok(body) = serde_json::to_string(&entry) else {
+        return;
+    };
+    // Written through a temp file and renamed: the two probes write the same entry,
+    // so a concurrent reader must never see a half-written one. A torn read would
+    // only cost a re-probe, but rename is free here and removes the case.
+    let final_path = dir.join(flag_entry_name(node_path, version));
+    let staging = dir.join(format!(
+        "{}.{}.tmp",
+        flag_entry_name(node_path, version),
+        std::process::id()
+    ));
+    if fs::write(&staging, body).is_ok() && fs::rename(&staging, &final_path).is_err() {
+        let _ = fs::remove_file(&staging);
+    }
 }
 
 /// Scan the nvm install directory for a version matching the pin.
@@ -935,13 +2266,62 @@ fn store_node_binary(version_dir: &Path) -> Option<Utf8PathBuf> {
     .and_then(|p| Utf8PathBuf::try_from(p).ok())
 }
 
+/// An alias pin (`lts/*`, `lts/<codename>`, `node`, `latest`) names no concrete
+/// version, so nothing on disk satisfies it until it is resolved against the dist
+/// index. The offline discovery paths resolve it against the index the last
+/// provisioning run cached, whatever its age, and never pay a network round trip.
+/// It resolves to a release LINE, not to one release — nvm's reading, where
+/// `lts/*` is the newest LTS line and `nvm use` takes the newest installed
+/// version in it — so a refreshed index that lists a point release nobody
+/// installed does not invalidate the version on disk. When the index moves the
+/// alias to a new line (`lts/*` after an LTS promotion) the installed one no
+/// longer satisfies it and provisioning installs the new line, as nvm would.
+/// With nothing cached the alias stays as it is and reads as not found, which is
+/// what provisioning acts on.
+fn concretize_alias(pin: VersionPin, raw: &str) -> VersionPin {
+    let Some(cache_root) = cache_dir() else {
+        return pin;
+    };
+    let Some(host) = crate::version_management::HostTarget::detect() else {
+        return pin;
+    };
+    let mirror = crate::version_management::resolve_mirror_base(&host);
+    concretize_alias_in(pin, raw, &cache_root, &mirror)
+}
+
+/// [`concretize_alias`] against an explicit cache root and mirror (the testable body).
+fn concretize_alias_in(pin: VersionPin, raw: &str, cache_root: &Path, mirror: &str) -> VersionPin {
+    if !matches!(pin, VersionPin::Alias(_)) {
+        return pin;
+    }
+    use crate::version_management::node_index;
+    match node_index::load_cached_index(cache_root, mirror)
+        .and_then(|index| node_index::resolve_spec(raw, &index))
+        .and_then(|newest| u32::try_from(newest.0.major).ok())
+    {
+        Some(major) => VersionPin::Major(major),
+        None => pin,
+    }
+}
+
 /// Look up a Node satisfying `pin` in nub's own download store
 /// (`~/.cache/nub/node/<version>/`, where the directory name IS the concrete
-/// version — `wiki/runtime/node-version-management.md` §"State 1: Cache hit").
+/// version — `internal/runtime/node-version-management.md` §"State 1: Cache hit").
 /// On a hit the spawn is silent (no notice). Returns the highest cached version
 /// satisfying the pin. Parameterized over `store` so it's testable without
 /// mutating the process env (XDG_CACHE_HOME); `nub_store_node` is the wrapper.
 fn nub_store_node_in(store: &Path, pin: &VersionPin) -> Option<ResolvedNode> {
+    nub_store_node_where(store, pin, |_| true)
+}
+
+/// [`nub_store_node_in`], keeping only versions `keep` accepts BEFORE the highest
+/// is chosen — a filter applied after selection would discard a usable lower
+/// version whenever the highest one is rejected.
+fn nub_store_node_where(
+    store: &Path,
+    pin: &VersionPin,
+    keep: impl Fn(&NodeVersion) -> bool,
+) -> Option<ResolvedNode> {
     let mut candidates: Vec<(NodeVersion, Utf8PathBuf)> = fs::read_dir(store)
         .ok()?
         .filter_map(|entry| {
@@ -950,7 +2330,7 @@ fn nub_store_node_in(store: &Path, pin: &VersionPin) -> Option<ResolvedNode> {
             let bin = store_node_binary(&entry.path())?;
             Some((version, bin))
         })
-        .filter(|(v, _)| v.satisfies(pin))
+        .filter(|(v, _)| v.satisfies(pin) && keep(v))
         .collect();
 
     // Highest matching version wins (mirrors scan_nvm).
@@ -987,7 +2367,155 @@ fn nvm_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn alias_pins_name_a_release_line_from_the_cached_index() {
+        use crate::version_management::node_index::cache_path;
+        let root = std::env::temp_dir().join(format!("nub-alias-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mirror = "https://nodejs.org/dist";
+        let alias = |s: &str| VersionPin::Alias(s.to_string());
+
+        // Nothing cached: the alias stays an alias, so discovery reports the pin as
+        // not found and provisioning (which fetches the index) takes over.
+        assert_eq!(
+            concretize_alias_in(alias("lts/*"), "lts/*", &root, mirror),
+            alias("lts/*")
+        );
+
+        fs::write(
+            cache_path(&root, mirror),
+            r#"[{"version":"v23.5.0","lts":false},{"version":"v22.13.0","lts":"Jod"},{"version":"v20.18.1","lts":"Iron"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            concretize_alias_in(alias("lts/*"), "lts/*", &root, mirror),
+            VersionPin::Major(22)
+        );
+        assert_eq!(
+            concretize_alias_in(alias("lts/iron"), "lts/iron", &root, mirror),
+            VersionPin::Major(20)
+        );
+        assert_eq!(
+            concretize_alias_in(alias("node"), "node", &root, mirror),
+            VersionPin::Major(23)
+        );
+        // The index lists 22.13.0; an installed 22.12.0 still satisfies `lts/*`,
+        // so a refreshed index never invalidates the version on disk.
+        let store = root.join("node");
+        fs::create_dir_all(store.join("22.12.0").join("bin")).unwrap();
+        fs::write(store.join("22.12.0").join("bin").join("node"), b"").unwrap();
+        let lts = concretize_alias_in(alias("lts/*"), "lts/*", &root, mirror);
+        assert_eq!(
+            nub_store_node_in(&store, &lts).map(|n| n.version),
+            Some(NodeVersion::new(22, 12, 0))
+        );
+        // Up to 0.9.3 `nub node install` cached the index under the store dir;
+        // an upgraded nub still reads that copy offline.
+        fs::rename(cache_path(&root, mirror), cache_path(&store, mirror)).unwrap();
+        assert_eq!(
+            concretize_alias_in(alias("lts/*"), "lts/*", &root, mirror),
+            VersionPin::Major(22)
+        );
+        fs::rename(cache_path(&store, mirror), cache_path(&root, mirror)).unwrap();
+        // A concrete pin is untouched, and an alias the index cannot answer stays.
+        assert_eq!(
+            concretize_alias_in(VersionPin::Major(20), "20", &root, mirror),
+            VersionPin::Major(20)
+        );
+        assert_eq!(
+            concretize_alias_in(alias("lts/argon"), "lts/argon", &root, mirror),
+            alias("lts/argon")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     use super::*;
+
+    #[test]
+    fn windows_cache_dir_falls_back_to_localappdata_for_system_or_missing_home() {
+        let lad = PathBuf::from("C:\\Windows\\system32\\config\\systemprofile\\AppData\\Local");
+        let sysroot = Some(PathBuf::from("C:\\Windows"));
+
+        // Service/SYSTEM account: HOME is a system dir (C:\WINDOWS) or the SYSTEM
+        // profile beneath it, or unresolvable — all fall back to %LOCALAPPDATA%\nub.
+        for home in [
+            Some(PathBuf::from("C:\\Windows")),
+            Some(PathBuf::from(
+                "C:\\Windows\\system32\\config\\systemprofile",
+            )),
+            None,
+        ] {
+            assert_eq!(
+                windows_cache_dir(home, Some(lad.clone()), sysroot.clone()),
+                Some(lad.join("nub")),
+            );
+        }
+
+        // A normal user profile keeps the established ~/.cache/nub location.
+        let user = PathBuf::from("C:\\Users\\alice");
+        assert_eq!(
+            windows_cache_dir(Some(user.clone()), Some(lad.clone()), sysroot.clone()),
+            Some(user.join(".cache").join("nub")),
+        );
+
+        // System home but LOCALAPPDATA also unresolvable → None (honest failure,
+        // no bogus path).
+        assert_eq!(
+            windows_cache_dir(Some(PathBuf::from("C:\\Windows")), None, sysroot),
+            None,
+        );
+    }
+
+    #[test]
+    fn windows_config_dir_falls_back_to_appdata_for_system_or_missing_home() {
+        let appdata =
+            PathBuf::from("C:\\Windows\\system32\\config\\systemprofile\\AppData\\Roaming");
+        let sysroot = Some(PathBuf::from("C:\\Windows"));
+
+        // Service/SYSTEM account or unresolvable home → %APPDATA%\nub.
+        for home in [
+            Some(PathBuf::from("C:\\Windows")),
+            Some(PathBuf::from(
+                "C:\\Windows\\system32\\config\\systemprofile",
+            )),
+            None,
+        ] {
+            assert_eq!(
+                windows_config_dir(home, Some(appdata.clone()), sysroot.clone()),
+                Some(appdata.join("nub")),
+            );
+        }
+
+        // A normal user profile keeps ~/.config/nub.
+        let user = PathBuf::from("C:\\Users\\alice");
+        assert_eq!(
+            windows_config_dir(Some(user.clone()), Some(appdata.clone()), sysroot.clone()),
+            Some(user.join(".config").join("nub")),
+        );
+
+        // System home + unresolvable APPDATA → None.
+        assert_eq!(
+            windows_config_dir(Some(PathBuf::from("C:\\Windows")), None, sysroot),
+            None,
+        );
+    }
+
+    #[test]
+    fn is_windows_system_home_is_case_insensitive_and_boundary_aware() {
+        let root = Some(Path::new("C:\\Windows"));
+        assert!(is_windows_system_home(Path::new("C:\\WINDOWS"), root));
+        assert!(is_windows_system_home(
+            Path::new("c:\\windows\\system32\\config\\systemprofile"),
+            root,
+        ));
+        // A mere prefix-stem sibling must NOT be treated as a system home.
+        assert!(!is_windows_system_home(
+            Path::new("C:\\Windows.old\\me"),
+            root
+        ));
+        assert!(!is_windows_system_home(Path::new("C:\\Users\\alice"), root));
+    }
 
     #[test]
     fn which_node_finds_something() {
@@ -999,6 +2527,274 @@ mod tests {
             }
             Err(e) => panic!("unexpected error: {e}"),
         }
+    }
+
+    #[test]
+    fn which_node_skips_the_persistent_shim_dir() {
+        // A real `node` in the persistent shim dir must be SKIPPED (it's nub's
+        // own hardlink — following it would recurse), and resolution falls
+        // through to a later PATH dir holding the genuine node.
+        let tmp = unique_tmp("which-skip");
+        let shim = tmp.join("node-shim");
+        let real = tmp.join("real-bin");
+        std::fs::create_dir_all(&shim).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        write_fake_node(&shim.join("node"));
+        write_fake_node(&real.join("node"));
+
+        let path_var = env::join_paths([&shim, &real]).unwrap();
+        let canon_shim = shim.canonicalize().unwrap();
+        let got = which_node_in(&path_var, Some(&canon_shim), &[]).unwrap();
+        assert_eq!(
+            got.canonicalize().unwrap(),
+            real.join("node").canonicalize().unwrap(),
+            "the shim dir's node is skipped; the later real node wins"
+        );
+
+        // With the shim dir the ONLY PATH entry, skipping it means no node — the
+        // recursion guard never resolves back to the shim.
+        let only_shim = env::join_paths([&shim]).unwrap();
+        assert!(matches!(
+            which_node_in(&only_shim, Some(&canon_shim), &[]),
+            Err(DiscoveryError::NoNodeOnPath)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn which_node_skips_a_link_back_to_nub_from_an_ordinary_dir() {
+        // A plain directory whose `node` is a symlink into the shim dir, or to
+        // this executable, passes every directory test; following it re-enters
+        // nub, which finds the same link again.
+        let tmp = unique_tmp("which-skip-link");
+        let shim = tmp.join("nub").join("node-shim");
+        let to_shim = tmp.join("links-to-shim");
+        let to_self = tmp.join("links-to-self");
+        let real = tmp.join("real-bin");
+        for dir in [&shim, &to_shim, &to_self, &real] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        write_fake_node(&shim.join("node"));
+        write_fake_node(&real.join("node"));
+        std::os::unix::fs::symlink(shim.join("node"), to_shim.join("node")).unwrap();
+        std::os::unix::fs::symlink(env::current_exe().unwrap(), to_self.join("node")).unwrap();
+
+        let path_var = env::join_paths([&to_shim, &to_self, &real]).unwrap();
+        let got = which_node_in(&path_var, None, &[]).unwrap();
+        assert_eq!(
+            got.canonicalize().unwrap(),
+            real.join("node").canonicalize().unwrap(),
+            "links into the shim dir and to nub itself are skipped; the real node wins"
+        );
+
+        // A script's bare `node` still reaches the link, so the question "is
+        // the shell's node nub's shim" must answer yes for the same PATH, or the
+        // recorded lifecycle Node is the later binary while scripts run the pin.
+        for first in [&to_shim, &to_self] {
+            let path_var = env::join_paths([first, &real]).unwrap();
+            assert!(
+                shell_node_is_nub_shim_in(&path_var, None),
+                "{} links back to nub",
+                first.display()
+            );
+        }
+        let real_first = env::join_paths([&real, &to_shim]).unwrap();
+        assert!(!shell_node_is_nub_shim_in(&real_first, None));
+    }
+
+    #[test]
+    fn which_node_skips_an_xdg_shim_dir_the_caller_could_not_name() {
+        // The shim dir depends on XDG_DATA_HOME, but the shell running
+        // nub-as-node need not have that variable set — so `which_node` can hand
+        // in a persistent-shim path that does NOT match where the shim actually
+        // lives. Passing `None` here is exactly that case. Without the
+        // shape-based guard the shim's own `node` would be resolved as the real
+        // one and nub would recurse forever.
+        let tmp = unique_tmp("which-skip-xdg");
+        let shim = tmp.join("nub").join("node-shim");
+        let real = tmp.join("real-bin");
+        std::fs::create_dir_all(&shim).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        write_fake_node(&shim.join("node"));
+        write_fake_node(&real.join("node"));
+
+        let path_var = env::join_paths([&shim, &real]).unwrap();
+        let got = which_node_in(&path_var, None, &[]).unwrap();
+        assert_eq!(
+            got.canonicalize().unwrap(),
+            real.join("node").canonicalize().unwrap(),
+            "an XDG-rooted shim dir must be skipped on shape alone"
+        );
+
+        // A `node-shim` dir NOT under a nub root is somebody else's directory —
+        // the shape guard must not swallow it.
+        let unrelated = tmp.join("vendor").join("node-shim");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        write_fake_node(&unrelated.join("node"));
+        let got = which_node_in(&env::join_paths([&unrelated]).unwrap(), None, &[]).unwrap();
+        assert_eq!(
+            got.canonicalize().unwrap(),
+            unrelated.join("node").canonicalize().unwrap(),
+            "only a node-shim under a nub/.nub parent is nub's own"
+        );
+    }
+
+    /// A dependency's `.bin/node` must never be mistaken for the project's
+    /// runtime. The npm package `node` puts one there, and aube prepends
+    /// `.bin` to PATH for every lifecycle script — so before this guard the
+    /// version probe ran a package's bin wrapper and `nub install node@26.5.1`
+    /// never terminated (#656).
+    #[test]
+    fn which_node_skips_a_dependency_bin_dir() {
+        let tmp = unique_tmp("which-depbin");
+        let dep_bin = tmp.join("node_modules").join(".bin");
+        let real = tmp.join("real-bin");
+        std::fs::create_dir_all(&dep_bin).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        write_fake_node(&dep_bin.join("node"));
+        write_fake_node(&real.join("node"));
+
+        let path_var = env::join_paths([&dep_bin, &real]).unwrap();
+        let got = which_node_in(&path_var, None, &[]).unwrap();
+        assert_eq!(
+            got.canonicalize().unwrap(),
+            real.join("node").canonicalize().unwrap(),
+            "node_modules/.bin holds package-declared bin names, so its `node` \
+             is skipped and the later real node wins"
+        );
+
+        // With the dep `.bin` as the ONLY entry there is no node at all,
+        // rather than a fall-back onto the dependency's wrapper.
+        let only_dep = env::join_paths([&dep_bin]).unwrap();
+        assert!(matches!(
+            which_node_in(&only_dep, None, &[]),
+            Err(DiscoveryError::NoNodeOnPath)
+        ));
+    }
+
+    /// The guard keys on the `node_modules/.bin` PAIR, so a directory that
+    /// merely ends in `.bin` — or a `node_modules` holding a real toolchain —
+    /// still resolves.
+    #[test]
+    fn which_node_only_skips_bin_dirs_under_node_modules() {
+        let tmp = unique_tmp("which-binshape");
+        let bare_bin = tmp.join("vendor").join(".bin");
+        std::fs::create_dir_all(&bare_bin).unwrap();
+        write_fake_node(&bare_bin.join("node"));
+
+        let path_var = env::join_paths([&bare_bin]).unwrap();
+        let got = which_node_in(&path_var, None, &[]).unwrap();
+        assert_eq!(
+            got.canonicalize().unwrap(),
+            bare_bin.join("node").canonicalize().unwrap(),
+            "a `.bin` that is not under node_modules is an ordinary PATH entry"
+        );
+    }
+
+    /// #832: every `node` that leads back to nub is stepped over for the next one, and
+    /// with nothing after them the error names one instead of looping.
+    #[test]
+    fn which_node_skips_candidates_that_lead_back_to_nub_and_names_one_when_nothing_remains() {
+        let tmp = unique_tmp("which-loop");
+        let [mise, volta, real] = ["mise-shims", "volta-shims", "real-bin"].map(|d| tmp.join(d));
+        for dir in [&mise, &volta, &real] {
+            std::fs::create_dir_all(dir).unwrap();
+            write_fake_node(&dir.join("node"));
+        }
+        let chain = [mise.join("node"), volta.join("node")];
+
+        let path_var = env::join_paths([&mise, &volta, &real]).unwrap();
+        assert_eq!(
+            which_node_in(&path_var, None, &chain).unwrap(),
+            real.join("node")
+        );
+
+        let only_shims = env::join_paths([&mise, &volta]).unwrap();
+        match which_node_in(&only_shims, None, &chain) {
+            Err(DiscoveryError::NodeShimLoop { shim }) => {
+                assert_eq!(Path::new(&shim), chain[0]);
+            }
+            other => panic!("expected NodeShimLoop, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_node(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, b"#!/bin/sh\necho v0.0.0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    fn write_fake_node(path: &Path) {
+        std::fs::write(path, b"").unwrap();
+    }
+
+    /// A unique throwaway dir under the system temp root (nub-core has no
+    /// `tempfile` dev-dep; this mirrors the `pm::shim` tests' `tmpdir`).
+    fn unique_tmp(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nub-whichnode-{tag}-{}-{nanos:x}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `accepts_argv_flag` must treat ONLY a genuine "bad option" rejection as a
+    /// verdict. Every other non-zero exit is environmental — a signal, a sandbox
+    /// denial, a half-written install — and because the verdict is persisted by
+    /// (path, mtime), caching one would disable the feature for that binary until
+    /// Node is reinstalled. That is the likely failure here, not the rare one: the
+    /// probe only runs at/above a band floor where the flag is expected to work.
+    #[cfg(unix)]
+    #[test]
+    fn argv_flag_probe_caches_a_rejection_but_not_a_transient_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_tmp("argvprobe");
+        let fake = |name: &str, script: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+
+        // Node's actual rejection, measured on 25.9.0: exit 9, "bad option" on stderr.
+        let rejects = fake(
+            "node-rejects",
+            "#!/bin/sh\necho \"node: bad option: $1\" >&2\nexit 9\n",
+        );
+        assert_eq!(
+            accepts_argv_flag(
+                &rejects,
+                &NodeVersion::new(26, 0, 0),
+                "--js-defer-import-eval"
+            ),
+            Some(false),
+            "a 'bad option' rejection is the one durable verdict"
+        );
+
+        // Anything else: no verdict, so the caller falls back to version-band gating
+        // and pays one re-probe rather than losing the feature permanently.
+        let flaky = fake("node-flaky", "#!/bin/sh\necho 'killed' >&2\nexit 1\n");
+        assert_eq!(
+            accepts_argv_flag(
+                &flaky,
+                &NodeVersion::new(26, 0, 0),
+                "--js-defer-import-eval"
+            ),
+            None,
+            "a non-'bad option' failure must NOT become a cached negative verdict"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1197,8 +2993,8 @@ mod tests {
     }
 
     #[test]
-    fn engines_node_is_the_fourth_chain_source_below_pin_files() {
-        // engines.node alone is a resolution range (#4) — including the legal
+    fn engines_node_is_the_last_chain_source_below_pin_files() {
+        // engines.node alone is a resolution range (#5) — including the legal
         // operator-space form (">= 20"), which must not silently degrade to
         // no-constraint.
         let dir = resolution_tmpdir("eng-chain");
@@ -1210,11 +3006,84 @@ mod tests {
         assert!(NodeVersion::new(22, 13, 0).satisfies(&pin));
         assert!(!NodeVersion::new(18, 19, 0).satisfies(&pin));
 
-        // A pin file outranks it (#2 beats #4).
+        // A pin file outranks it (#2 beats #5).
         std::fs::write(dir.join(".node-version"), "20.11.0\n").unwrap();
         let chain = resolve_pin_chain(&dir).unwrap();
         let (_, _, source) = chain.pin.expect("a pin");
         assert_eq!(source, ".node-version", "a pin file must beat engines.node");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_versions_pins_node_and_ranks_below_node_specific_files() {
+        // .tool-versions (#4) resolves the `nodejs` line and sits below the
+        // Node-specific pin files (#2/#3): the Node-only files win when a project
+        // carries both, but a .tool-versions-only project (the asdf/mise norm)
+        // resolves cleanly.
+        let dir = resolution_tmpdir("tv-prec");
+        std::fs::write(
+            dir.join(".tool-versions"),
+            "python 3.12.0\nnodejs 20.11.0\n",
+        )
+        .unwrap();
+        let (raw, _pin, source) = walk_up_for_pin(&dir).expect("the nodejs line resolves");
+        assert_eq!(source, ".tool-versions");
+        assert_eq!(raw, "20.11.0", "only the nodejs line is read, not python");
+
+        // .nvmrc (#3) outranks it, and .node-version (#2) outranks that.
+        std::fs::write(dir.join(".nvmrc"), "18.19.0\n").unwrap();
+        let (_, _, source) = walk_up_for_pin(&dir).expect("a pin");
+        assert_eq!(source, ".nvmrc", ".nvmrc must beat .tool-versions");
+        std::fs::write(dir.join(".node-version"), "22.15.0\n").unwrap();
+        let (_, _, source) = walk_up_for_pin(&dir).expect("a pin");
+        assert_eq!(
+            source, ".node-version",
+            ".node-version must beat .tool-versions"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_versions_beats_engines_node_in_the_chain() {
+        // #4 (.tool-versions, an exact pin) outranks #5 (engines.node, a range).
+        let dir = resolution_tmpdir("tv-eng");
+        std::fs::write(dir.join("package.json"), r#"{"engines":{"node":">= 18"}}"#).unwrap();
+        std::fs::write(dir.join(".tool-versions"), "nodejs 20.11.0\n").unwrap();
+        let chain = resolve_pin_chain(&dir).unwrap();
+        let (raw, _, source) = chain.pin.expect("a pin");
+        assert_eq!(
+            source, ".tool-versions",
+            ".tool-versions must beat engines.node"
+        );
+        assert_eq!(raw, "20.11.0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_versions_parsing_covers_the_real_shapes() {
+        // The `node` alias key (mise), a trailing inline comment, and a
+        // multi-version fallback line (first version wins) — the shapes a real
+        // .tool-versions carries.
+        let dir = resolution_tmpdir("tv-parse");
+        std::fs::write(
+            dir.join(".tool-versions"),
+            "# toolchain\nruby 3.3.0\nnode 20.11.0 18.19.0  # fallback\n",
+        )
+        .unwrap();
+        let (raw, _pin, source) = walk_up_for_pin(&dir).expect("the node line resolves");
+        assert_eq!(source, ".tool-versions");
+        assert_eq!(
+            raw, "20.11.0",
+            "the `node` key is honored; first version wins"
+        );
+
+        // A non-modelable specifier (asdf `system`) yields no pin — the walk falls
+        // through exactly as an unparseable .node-version does.
+        std::fs::write(dir.join(".tool-versions"), "nodejs system\n").unwrap();
+        assert!(
+            walk_up_for_pin(&dir).is_none(),
+            "`nodejs system` is not a version nub can model — fall through"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1372,21 +3241,137 @@ mod tests {
             eprintln!("skipping: no node on PATH");
             return;
         };
-        let resolved = node_executable_from(Some(node_path.clone().into_os_string()))
-            .unwrap()
-            .expect("an explicit NODE_EXECUTABLE resolves to that binary");
+        let resolved = node_executable_from(
+            Some(node_path.clone().into_os_string()),
+            NODE_EXECUTABLE_SOURCE,
+        )
+        .unwrap()
+        .expect("an explicit NODE_EXECUTABLE resolves to that binary");
         assert_eq!(resolved.pin_source.as_deref(), Some("NODE_EXECUTABLE"));
         assert_eq!(resolved.path.as_std_path(), node_path.as_path());
         assert!(resolved.version.major() >= 18);
         // Unset / empty → no override (falls through to normal resolution).
-        assert!(node_executable_from(None).unwrap().is_none());
         assert!(
-            node_executable_from(Some(std::ffi::OsString::new()))
+            node_executable_from(None, NODE_EXECUTABLE_SOURCE)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            node_executable_from(Some(std::ffi::OsString::new()), NODE_EXECUTABLE_SOURCE)
                 .unwrap()
                 .is_none()
         );
         // A bad path is a clear error, not a silent fall-through.
-        assert!(node_executable_from(Some("/no/such/node".into())).is_err());
+        assert!(
+            node_executable_from(Some("/no/such/node".into()), NODE_EXECUTABLE_SOURCE).is_err()
+        );
+        // The configured field reaches the same resolution under its own label.
+        let configured = node_executable_from(
+            Some(node_path.clone().into_os_string()),
+            CONFIG_NODE_EXECUTABLE_SOURCE,
+        )
+        .unwrap()
+        .expect("a configured nodeExecutable resolves to that binary");
+        assert_eq!(
+            configured.pin_source.as_deref(),
+            Some("nub.jsonc#nodeExecutable")
+        );
+    }
+
+    /// A temp shim directory is matched the way its platform matches paths.
+    /// Windows PATH lookup is case-insensitive, so a re-cased entry names the
+    /// same directory and has to be filtered too; elsewhere it is simply a
+    /// different name and filtering it would be wrong. Asserted on both, so the
+    /// contract cannot regress on the platform the test is not running on.
+    #[test]
+    fn a_temp_shim_dir_is_matched_the_way_its_platform_matches_paths() {
+        let root = resolution_tmpdir("shim-case");
+        assert!(is_nub_shim_dir(&root.join("nub-node-shim-42-abc")));
+        assert_eq!(
+            is_nub_shim_dir(&root.join("NUB-NODE-SHIM-42-abc")),
+            cfg!(windows),
+            "the prefix test must follow the platform's own path-comparison rule"
+        );
+        assert!(!is_nub_shim_dir(&root.join("bin")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The spec grammar is a whole-value `$(…)` and nothing else — a path that
+    /// merely CONTAINS the sigil stays a path, so the exit-status contract has
+    /// exactly one command to be about.
+    #[test]
+    fn command_substitution_matches_only_the_whole_value() {
+        assert_eq!(
+            command_substitution("$(mise which node)"),
+            Some("mise which node")
+        );
+        assert_eq!(
+            command_substitution("  $(mise which node)  "),
+            Some("mise which node")
+        );
+        assert_eq!(command_substitution("/usr/local/bin/node"), None);
+        assert_eq!(command_substitution("$(brew --prefix)/bin/node"), None);
+        assert_eq!(command_substitution("$("), None);
+    }
+
+    /// A `$(command)` runs in the config file's directory and its stdout is the
+    /// path; a non-zero exit stops the run instead of falling back to the chain.
+    /// POSIX-only because the assertions are written in `sh`; the Windows leg of
+    /// the same contract rides the CLI integration test, which spells its command
+    /// per platform.
+    #[cfg(unix)]
+    #[test]
+    fn node_executable_command_reports_its_own_failure() {
+        let dir = resolution_tmpdir("node-exec-cmd");
+        let setting = |spec: &str| NodeExecutable {
+            spec: spec.to_string(),
+            root: dir.clone(),
+            cwd: dir.clone(),
+            file: dir.join("nub.jsonc"),
+        };
+        let ok = run_node_executable_command("printf ./bin/node", &setting("$(printf ./bin/node)"))
+            .expect("a zero-exit command supplies the path");
+        assert_eq!(
+            ok,
+            dir.join("bin/node"),
+            "relative output anchors where the command ran"
+        );
+
+        // Windows `where node` prints every match, so two Nodes on PATH means two
+        // lines. The first is the one PATH would have picked; taking the whole
+        // output would build a path with a newline inside it.
+        let multi = run_node_executable_command(
+            "echo /opt/a/node; echo /opt/b/node",
+            &setting("$(where node)"),
+        )
+        .expect("a multi-line answer names its first candidate");
+        assert_eq!(multi, PathBuf::from("/opt/a/node"));
+
+        let failed = run_node_executable_command(
+            "echo 'mise: command not found' >&2; exit 127",
+            &setting("$(x)"),
+        )
+        .expect_err("a non-zero exit is an error");
+        assert_eq!(failed.failure, "exited 127");
+        assert_eq!(failed.stderr, "mise: command not found");
+
+        let empty = run_node_executable_command("true", &setting("$(true)"))
+            .expect_err("a command that prints nothing has not answered the question");
+        assert_eq!(empty.failure, "printed no path");
+
+        // A toolchain's error is routinely several lines; every one is indented
+        // under nub's message rather than only the first.
+        let multiline = run_node_executable_command(
+            "printf 'no version is set\nrun: mise use node@22\n' >&2; exit 1",
+            &setting("$(x)"),
+        )
+        .expect_err("a non-zero exit is an error");
+        let rendered = DiscoveryError::from(multiline).to_string();
+        assert!(
+            rendered.ends_with("\n\x20\x20no version is set\n\x20\x20run: mise use node@22"),
+            "{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1417,6 +3402,61 @@ mod tests {
     }
 
     #[test]
+    fn unpinned_store_first_picks_newest_supported_else_falls_through() {
+        // The #294 no-pin/no-node runner policy (store-first, via
+        // `highest_store_node_in`): highest cached version wins with NO pin
+        // constraint, so a warm store never triggers a download.
+        let seed = |store: &Path, versions: &[&str]| {
+            for v in versions {
+                let bin = store.join(v).join("bin");
+                std::fs::create_dir_all(&bin).unwrap();
+                std::fs::write(bin.join("node"), b"#!/bin/sh\n").unwrap();
+            }
+        };
+
+        let store = resolution_tmpdir("store-any");
+        seed(&store, &["18.19.0", "22.15.0", "20.11.0"]);
+        assert_eq!(
+            highest_store_node_in(&store)
+                .expect("a cached version")
+                .version,
+            NodeVersion::new(22, 15, 0),
+            "newest cached wins regardless of pin"
+        );
+        let _ = std::fs::remove_dir_all(&store);
+
+        // A store holding ONLY sub-floor versions (a leftover `nub node pin 16`
+        // the user unpinned) must NOT be selected — it falls through so the
+        // caller downloads a working `latest` instead of dead-ending Unsupported.
+        let old = resolution_tmpdir("store-old");
+        seed(&old, &["16.20.0", "17.0.0"]);
+        assert!(
+            highest_store_node_in(&old).is_none(),
+            "sub-floor-only store → None → caller downloads `latest`"
+        );
+        let _ = std::fs::remove_dir_all(&old);
+
+        // A gap version (no `module.register`) sorting above a usable one must
+        // not hide it: the supported 18.19 is picked, not None.
+        let gap = resolution_tmpdir("store-gap");
+        seed(&gap, &["18.19.0", "19.8.1", "20.5.1"]);
+        assert_eq!(
+            highest_store_node_in(&gap)
+                .expect("the supported 18.19 under the gap")
+                .version,
+            NodeVersion::new(18, 19, 0),
+        );
+        let _ = std::fs::remove_dir_all(&gap);
+
+        let empty = resolution_tmpdir("store-empty");
+        assert!(
+            highest_store_node_in(&empty).is_none(),
+            "empty store → None → caller downloads `latest`"
+        );
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
     fn engines_disagreement_silent_when_satisfied_or_unpinned() {
         let dir = resolution_tmpdir("agree");
         std::fs::write(dir.join("package.json"), r#"{"engines":{"node":">=18"}}"#).unwrap();
@@ -1440,7 +3480,7 @@ mod tests {
     #[test]
     fn unsupported_error_with_pin_source_matches_canonical_wording() {
         // Canonical wording per the v0.1-anneal binding brief
-        // (and wiki/research/supported-node-versions.md). Exact-string
+        // (and internal/research/supported-node-versions.md). Exact-string
         // assertion — any rewording must update this test deliberately.
         let err = DiscoveryError::Unsupported {
             version: NodeVersion::new(16, 10, 0),
@@ -1452,6 +3492,30 @@ mod tests {
                         To run it: update the pin to 18.19+ (Nub will run it in compatibility mode), \
                         or run plain `node` directly for this project.";
         assert_eq!(msg, expected);
+    }
+
+    #[test]
+    fn unsupported_error_names_the_register_gap_for_node_19() {
+        let pinned = DiscoveryError::Unsupported {
+            version: NodeVersion::new(19, 3, 0),
+            pin_source: Some(".nvmrc".to_string()),
+        };
+        assert_eq!(
+            format!("{pinned}"),
+            "Nub requires Node 18.19+ on the 18.x line, or 20.6 or newer, for runtime augmentation. \
+             This project pins Node 19.3.0 via .nvmrc, which predates `module.register()`. \
+             To run it: update the pin to 20.6+, or run plain `node` directly for this project."
+        );
+        let unpinned = DiscoveryError::Unsupported {
+            version: NodeVersion::new(20, 5, 1),
+            pin_source: None,
+        };
+        assert_eq!(
+            format!("{unpinned}"),
+            "Nub requires Node 18.19+ on the 18.x line, or 20.6 or newer, for runtime augmentation. \
+             Node 20.5.1 predates `module.register()`. \
+             To run it: upgrade Node to 20.6+, or run plain `node` directly for this project."
+        );
     }
 
     #[test]
@@ -1498,14 +3562,19 @@ mod tests {
     }
 
     #[test]
-    fn no_node_on_path_offers_install_remedy() {
-        // A user who installed nub before any Node must be told the way out —
-        // nub augments Node, it doesn't bundle one — instead of a dead-end
-        // "no Node binary found on PATH".
+    fn no_node_on_path_offers_a_working_remedy() {
+        // The remedy must point at a command that actually works from a fresh,
+        // pin-free machine. Bare `nub node install` used to be suggested here but
+        // itself errors with no pin (#294) — the message now points at
+        // `nub node pin <version>`, which succeeds.
         let msg = DiscoveryError::NoNodeOnPath.to_string();
         assert!(
-            msg.contains("nub node install"),
-            "points at nub's own provisioning: {msg}"
+            msg.contains("nub node pin"),
+            "points at the working pin command: {msg}"
+        );
+        assert!(
+            !msg.contains("nub node install"),
+            "must not resurrect the dead-ending bare-install hint: {msg}"
         );
         assert!(
             msg.contains("doesn't bundle one"),
@@ -1568,5 +3637,117 @@ mod tests {
             }
             Err(e) => panic!("unexpected error: {e}"),
         }
+    }
+
+    /// The verdicts for one Node must be readable no matter what is on disk for
+    /// another. They used to share two flat `{ "<path>": … }` maps that every read
+    /// parsed WHOLE, which had two consequences this pins down: the parse was
+    /// O(every Node the machine had ever seen) on a path taken by every launch, and
+    /// one malformed entry made `from_str` fail for EVERY binary — a `node` spawn
+    /// per launch, indefinitely.
+    #[test]
+    fn a_damaged_entry_for_one_binary_does_not_hide_anothers_verdicts() {
+        let dir = unique_tmp("flagcache-isolation");
+        let cache = dir.join("cache");
+        let v24 = NodeVersion::new(24, 0, 0);
+        let (mine, other) = (dir.join("node-a"), dir.join("node-b"));
+        std::fs::write(&mine, b"a").unwrap();
+        std::fs::write(&other, b"b").unwrap();
+
+        update_flag_entry_in(&cache, &mine, &v24, |e| {
+            e.env = Some(vec!["--experimental-vm-modules".to_string()]);
+        });
+        update_flag_entry_in(&cache, &other, &v24, |e| e.env = Some(vec![]));
+
+        // Corrupt the OTHER binary's entry, exactly as a truncated write would.
+        let damaged = cache
+            .join(FLAG_ENTRY_DIR)
+            .join(flag_entry_name(&other, &v24));
+        std::fs::write(&damaged, b"{not json").unwrap();
+
+        assert_eq!(
+            read_flag_entry_in(&cache, &mine, &v24).and_then(|e| e.env),
+            Some(vec!["--experimental-vm-modules".to_string()]),
+            "a damaged entry for a different binary must not affect this one"
+        );
+        assert!(
+            read_flag_entry_in(&cache, &other, &v24).is_none(),
+            "the damaged entry itself must read as a miss, not as empty verdicts"
+        );
+    }
+
+    /// Both probes key on (path, version, mtime) and are read on the same spawn, so they
+    /// share one file — and a binary rebuilt in place invalidates both together.
+    #[test]
+    fn both_verdicts_share_one_entry_and_lapse_when_the_binary_changes() {
+        let dir = unique_tmp("flagcache-roundtrip");
+        let cache = dir.join("cache");
+        let v24 = NodeVersion::new(24, 0, 0);
+        let node = dir.join("node");
+        std::fs::write(&node, b"v1").unwrap();
+
+        update_flag_entry_in(&cache, &node, &v24, |e| {
+            e.env = Some(vec!["--permission".into()])
+        });
+        update_flag_entry_in(&cache, &node, &v24, |e| {
+            e.argv.insert("--js-defer-import-eval".into(), false);
+        });
+
+        let entry = read_flag_entry_in(&cache, &node, &v24).expect("both writes land in one entry");
+        assert_eq!(
+            entry.env.as_deref(),
+            Some(&["--permission".to_string()][..])
+        );
+        assert_eq!(entry.argv.get("--js-defer-import-eval"), Some(&false));
+        // A version manager's shim is one path serving several Nodes, so a verdict
+        // recorded while it answered as one version is no answer for another.
+        assert!(
+            read_flag_entry_in(&cache, &node, &NodeVersion::new(26, 0, 0)).is_none(),
+            "the same path answering as a different version must re-probe"
+        );
+        assert_eq!(
+            std::fs::read_dir(cache.join(FLAG_ENTRY_DIR))
+                .unwrap()
+                .count(),
+            1,
+            "one binary must occupy exactly one entry file"
+        );
+
+        // Move the mtime far enough that a whole-second key changes.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::write(&node, b"v2").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&node)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(
+            read_flag_entry_in(&cache, &node, &v24).is_none(),
+            "a binary replaced at the same path must re-probe, not reuse the old verdicts"
+        );
+    }
+
+    /// The entry filename is a hash of the path, so the path is stored INSIDE and
+    /// compared on read: a collision costs one re-probe, never another binary's
+    /// verdicts.
+    #[test]
+    fn an_entry_recorded_for_a_different_path_is_a_miss() {
+        let dir = unique_tmp("flagcache-collision");
+        let cache = dir.join("cache");
+        let v24 = NodeVersion::new(24, 0, 0);
+        let node = dir.join("node");
+        std::fs::write(&node, b"x").unwrap();
+        update_flag_entry_in(&cache, &node, &v24, |e| e.env = Some(vec![]));
+
+        let entry_path = cache
+            .join(FLAG_ENTRY_DIR)
+            .join(flag_entry_name(&node, &v24));
+        let mut entry: NodeFlagEntry =
+            serde_json::from_str(&std::fs::read_to_string(&entry_path).unwrap()).unwrap();
+        entry.path = "/somewhere/else/bin/node".into();
+        std::fs::write(&entry_path, serde_json::to_string(&entry).unwrap()).unwrap();
+
+        assert!(read_flag_entry_in(&cache, &node, &v24).is_none());
     }
 }

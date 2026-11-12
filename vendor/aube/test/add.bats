@@ -213,6 +213,19 @@ EOF
 	assert_output --partial 'JSR packages must be scoped'
 }
 
+@test "aube add jsr: rejects package names that escape npm name shape" {
+	cat >package.json <<'EOF'
+{
+  "name": "test-add-jsr-bad-shape",
+  "version": "0.0.0",
+  "dependencies": {}
+}
+EOF
+	run aube add jsr:@std/../collections
+	assert_failure
+	assert_output --partial 'invalid jsr: spec'
+}
+
 @test "aube add: adds multiple packages" {
 	cat >package.json <<'EOF'
 {
@@ -301,6 +314,32 @@ EOF
 	refute_output --partial 'WARN_AUBE_GVS_MODE_CHANGED'
 }
 
+@test "aube add --filter --ignore-scripts skips root pnpm:devPreinstall" {
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+	EOF
+	cat >package.json <<-'EOF'
+		{
+		  "name": "root",
+		  "version": "0.0.0",
+		  "private": true,
+		  "scripts": {
+		    "pnpm:devPreinstall": "node -e 'require(\"fs\").writeFileSync(\"dev-preinstall.marker\", \"ran\")'"
+		  }
+		}
+	EOF
+	mkdir -p packages/dashboard
+	cat >packages/dashboard/package.json <<-'EOF'
+		{"name": "dashboard", "version": "0.0.0", "private": true}
+	EOF
+
+	run aube add is-odd --filter=dashboard --ignore-scripts
+	assert_success
+	assert_file_exists packages/dashboard/node_modules/is-odd/index.js
+	assert_file_not_exists dev-preinstall.marker
+}
+
 @test "aube add -D: moves dep from dependencies to devDependencies" {
 	cat >package.json <<'EOF'
 {
@@ -323,9 +362,10 @@ EOF
 	refute_output --partial '"dependencies"'
 }
 
-@test "aube add --save-peer writes only peerDependencies and does not install" {
-	# `--save-peer` alone is a metadata-only declaration. pnpm treats
-	# this as "consumers need X" and does not install it locally.
+@test "aube add --save-peer writes only peerDependencies and auto-installs the peer" {
+	# `--save-peer` keeps the declaration in peerDependencies only. With
+	# auto-install-peers enabled, the required importer peer is still linked
+	# locally so the package can use it during development.
 	cat >package.json <<'EOF'
 {
   "name": "test-save-peer-only",
@@ -343,9 +383,9 @@ EOF
 	refute_output --partial '"dependencies"'
 	refute_output --partial '"devDependencies"'
 
-	# And no top-level node_modules entry — the peer isn't installed.
-	run test -e node_modules/is-odd
-	assert_failure
+	# The required importer peer is auto-installed without adding a second
+	# manifest declaration.
+	assert_file_exists node_modules/is-odd/index.js
 }
 
 @test "aube add --save-peer --save-dev writes to both sections and installs" {
@@ -563,6 +603,99 @@ EOF2
 	assert_file_exists node_modules/is-odd/index.js
 }
 
+# The lockfile's name depends on the embedder and on how the project was detected.
+lockfile_bytes() {
+	local name
+	for name in aube-lock.yaml nub.lock pnpm-lock.yaml; do
+		if [ -f "$1/$name" ]; then
+			cat "$1/$name"
+			return
+		fi
+	done
+	echo "no lockfile in $1" >&2
+	return 1
+}
+
+@test "aube add: a failed install leaves package.json and the lockfile as they were" {
+	cat >package.json <<'EOF2'
+{
+  "name": "test-failed-add",
+  "version": "0.0.0",
+  "dependencies": { "is-odd": "3.0.1" }
+}
+EOF2
+	mkdir broken
+	cat >broken/package.json <<'EOF2'
+{ "name": "broken", "version": "1.0.0", "dependencies": { "does-not-exist-anywhere": "1.0.0" } }
+EOF2
+	run aube install
+	assert_success
+	manifest="$(cat package.json)"
+	lockfile="$(lockfile_bytes .)"
+
+	run aube add file:./broken
+	assert_failure
+	assert_output --partial 'restored package.json and lockfile'
+	[ "$(cat package.json)" = "$manifest" ]
+	[ "$(lockfile_bytes .)" = "$lockfile" ]
+}
+
+@test "aube add --filter: a failed install restores every selected package.json" {
+	cat >package.json <<'EOF2'
+{ "name": "root", "version": "0.0.0", "private": true }
+EOF2
+	cat >pnpm-workspace.yaml <<'EOF2'
+packages:
+  - packages/*
+EOF2
+	mkdir -p packages/a packages/b broken
+	echo '{ "name": "a", "version": "1.0.0" }' >packages/a/package.json
+	echo '{ "name": "b", "version": "1.0.0" }' >packages/b/package.json
+	cat >broken/package.json <<'EOF2'
+{ "name": "broken", "version": "1.0.0", "dependencies": { "does-not-exist-anywhere": "1.0.0" } }
+EOF2
+	a="$(cat packages/a/package.json)"
+	b="$(cat packages/b/package.json)"
+
+	run aube add --filter './packages/*' file:../../broken
+	assert_failure
+	[ "$(cat packages/a/package.json)" = "$a" ]
+	[ "$(cat packages/b/package.json)" = "$b" ]
+}
+
+@test "aube add: a failed build restores each member's own lockfile" {
+	cat >package.json <<'EOF2'
+{ "name": "root", "version": "0.0.0", "private": true, "workspaces": ["packages/*"] }
+EOF2
+	echo 'shared-workspace-lockfile=false' >>.npmrc
+	mkdir -p packages/a dep
+	echo '{ "name": "a", "version": "1.0.0", "dependencies": { "is-odd": "3.0.1" } }' >packages/a/package.json
+	echo '{ "name": "dep", "version": "1.0.0", "scripts": { "postinstall": "exit 3" } }' >dep/package.json
+	run aube install
+	assert_success
+	lockfile="$(lockfile_bytes packages/a)"
+
+	run aube add --filter a --dangerously-allow-all-builds file:../../dep
+	assert_failure
+	[ "$(lockfile_bytes packages/a)" = "$lockfile" ]
+}
+
+@test "aube add: a failed build restores a relocated lockfile" {
+	cat >package.json <<'EOF2'
+{ "name": "app", "version": "0.0.0", "dependencies": { "is-odd": "3.0.1" } }
+EOF2
+	echo 'lockfile-dir=locks' >>.npmrc
+	mkdir dep
+	echo '{ "name": "dep", "version": "1.0.0", "scripts": { "postinstall": "exit 3" } }' >dep/package.json
+	run aube install
+	assert_success
+	lockfile="$(lockfile_bytes locks)"
+
+	run aube add --dangerously-allow-all-builds file:./dep
+	assert_failure
+	[ "$(lockfile_bytes locks)" = "$lockfile" ]
+}
+
 @test "aube add --no-save: restores a non-aube lockfile (package-lock.json)" {
 	# Regression: --no-save used to assume aube-lock.yaml regardless of
 	# the project's actual lockfile kind, which silently mutated
@@ -729,4 +862,63 @@ JSON
 
 	[ -L node_modules/local-dep ]
 	assert_file_exists node_modules/local-dep/package.json
+}
+
+@test "hoisted add preserves an unchanged package's directory" {
+	# nubjs/nub#610. The hoisted pass used to wipe and refill EVERY placed
+	# package on every relink, and the refill restores published tarball
+	# contents — so anything a postinstall produced (build/Release/*.node, a
+	# downloaded binary) was deleted and never put back. npm and pnpm both
+	# leave an unchanged package directory alone; so does aube now.
+	#
+	# The stand-in artifact is a file the tarball does not contain, which is
+	# exactly the shape of real build output.
+	echo "node-linker=hoisted" >>.npmrc
+	cat >package.json <<'JSON'
+{
+  "name": "hoisted-preserve-test",
+  "version": "1.0.0",
+  "dependencies": {
+    "abbrev": "4.0.0"
+  }
+}
+JSON
+	run aube install
+	assert_success
+	echo BUILT >node_modules/abbrev/build-artifact.txt
+
+	run aube add is-odd@3.0.1
+	assert_success
+	assert_file_exists node_modules/abbrev/build-artifact.txt
+}
+
+@test "hoisted add refuses to reuse a tree an interrupted link left behind" {
+	# The safety half of the reuse above. Reuse keys on a sentinel that is
+	# written before the linker touches node_modules and cleared only once the
+	# install finishes, because the install state alone cannot distinguish a
+	# complete tree from one a killed install abandoned halfway — state written
+	# by an earlier SUCCESSFUL install outlives a later failed one.
+	echo "node-linker=hoisted" >>.npmrc
+	cat >package.json <<'JSON'
+{
+  "name": "hoisted-interrupted-test",
+  "version": "1.0.0",
+  "dependencies": {
+    "abbrev": "4.0.0"
+  }
+}
+JSON
+	run aube install
+	assert_success
+	echo BUILT >node_modules/abbrev/build-artifact.txt
+
+	# Exactly what a link that died partway leaves on disk.
+	state_dir="$(find node_modules -maxdepth 3 -type d -name '*-state' | head -n 1)"
+	[ -n "$state_dir" ]
+	touch "$state_dir/link-in-progress"
+
+	run aube add is-odd@3.0.1
+	assert_success
+	# Wiped and refilled rather than reused, so the unverifiable tree is healed.
+	assert_file_not_exists node_modules/abbrev/build-artifact.txt
 }

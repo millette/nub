@@ -1,0 +1,134 @@
+---
+title: Unified runner
+description: Run TypeScript on plain Node without installing the Nub binary — one small npm package that gives you a run command and a Node preload for tools that spawn Node themselves.
+---
+
+The standalone runner puts Nub's TypeScript runtime on plain Node as an ordinary npm package. It is about 5 MB, with no package manager, no registry client, and no network code in it.
+
+```sh
+npm install --save-dev @nubjs/runner
+nubr app.ts
+```
+
+Use it when you cannot install the Nub binary, or when a `node` invocation is fixed by another tool. Everywhere else, [`nub app.ts`](/docs/runtime) gives you the same transpiler and resolver plus polyfilled web APIs, `.env` loading, and Node version provisioning.
+
+## Node flags
+
+Flags that Node reads at startup go before the file:
+
+```sh
+nubr --inspect app.ts
+nubr --max-old-space-size=4096 app.ts
+```
+
+These apply to a file run. To pass Node flags to a script, put them in the script's own command line.
+
+## Scripts
+
+The same command runs a script from `package.json`, so a project can adopt the runner without changing how anyone invokes it:
+
+```json title="package.json"
+{
+  "scripts": {
+    "dev": "nubr src/index.ts",
+    "build": "nubr build.ts --minify"
+  }
+}
+```
+
+```sh
+nubr dev              # runs the "dev" script
+nubr build -- --watch # extra arguments reach the script
+```
+
+Scripts run through the same shell npm uses, with `node_modules/.bin` on the path and `pre`/`post` hooks honored. Every Node process a script starts inherits the TypeScript support.
+
+## Installed bins
+
+A name that is neither a file nor a script resolves against `node_modules/.bin`, so an installed tool runs with TypeScript support:
+
+```sh
+nubr vitest run
+nubr tsc --noEmit
+nubr prettier --write .
+```
+
+The bin gets the same environment a script does. Nothing is fetched from the registry.
+
+Names resolve in this order:
+
+1. A file
+2. A script
+3. A bin
+
+A script wins over a bin of the same name, matching npm, because a script usually wraps the bin it is named after.
+
+## Node preload
+
+A test runner, a framework CLI, or a deploy script may start `node` itself. Register the package as a preload and those processes get TypeScript too:
+
+```sh
+node --import @nubjs/runner app.ts      # ESM hooks + CJS require()
+node --require @nubjs/runner app.ts     # same, as a CJS preload (20.19+)
+node --import @nubjs/runner/esm app.ts  # ESM hooks only
+
+# a tool that spawns node
+NODE_OPTIONS="--import @nubjs/runner" vitest
+```
+
+```json title="package.json"
+{
+  "scripts": {
+    "test": "mocha --import @nubjs/runner 'test/**/*.test.ts'"
+  }
+}
+```
+
+## Features
+
+The package registers the same resolve and transpile hooks as the `nub` command, without its polyfills, globals, or `.env` loading:
+
+- Full TypeScript — `enum`, `namespace`, parameter properties, `emitDecoratorMetadata` decorators — not just the erasable subset Node's built-in stripping accepts
+- JSX / TSX with the automatic runtime
+- Editor-style resolution — extensionless imports, `.js → .ts` rewriting, `tsconfig.json#paths`
+- Data-file imports — `.yaml`, `.toml`, `.json5`, `.jsonc`, `.txt`, and `with { type: "text" }`
+- Syntax newer than the running Node, such as `using`, downleveled by the transpiler
+- Inline source maps on every transpiled file
+
+Both `import` and `require()` of a `.ts` file work. Worker threads pick up the hooks automatically, because Node passes `--import` down to them. Dependencies under `node_modules` are never transpiled.
+
+Module formats follow Node's rules: a `.cts` file is CommonJS and a `.mts` file is an ES module. The runner does not convert one format into the other, so a `.cts` file uses `module.exports`.
+
+## Installing without npm
+
+The `nub` binary also answers to `nubr`. The Nub installer puts the command on your `PATH` with no npm step, and provisions Node when none is installed:
+
+```sh
+curl -fsSL https://nubjs.com/install.sh | bash   # macOS / Linux
+irm https://nubjs.com/install.ps1 | iex           # Windows (PowerShell)
+```
+
+Both installs run the same runner, so a file behaves the same under either.
+
+## Docker
+
+In a container, fetch the platform you deploy to rather than the one you build on. Distroless publishes its own set of Node majors, which trails the newest Node release, so pick one it carries:
+
+```dockerfile title="Dockerfile"
+FROM node:24-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --os=linux --cpu=x64 --libc=glibc
+
+FROM gcr.io/distroless/nodejs24-debian12
+WORKDIR /app
+COPY --from=build /app/node_modules ./node_modules
+COPY . .
+CMD ["--import", "@nubjs/runner", "server.ts"]
+```
+
+## Node support
+
+Node 18.19 and newer. On Node 22.15+ the hooks register synchronously in-thread through `module.registerHooks()`; on older versions they run in Node's loader worker through `module.register()`. The `--require` form needs `require(esm)`, so below Node 20.19 / 22.12 use `--import`.
+
+Platform binaries ship as `optionalDependencies` (`@nubjs/runner-*`) for macOS, Linux (glibc and musl), and Windows, on x64 and arm64.

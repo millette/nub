@@ -188,6 +188,40 @@ impl LocalSource {
             .unwrap_or_default()
     }
 
+    /// The exact `allowBuilds` keys that name this source for package
+    /// `name`, the lockfile's own spelling first. A git clone is also
+    /// accepted under pnpm's `<name>@git+<url>#<commit>` spelling, the key
+    /// pnpm prints and writes, so a project's existing pnpm approval
+    /// matches here too.
+    ///
+    /// A `file:` or `link:` source is named as pnpm names it (`dep@file:dep`),
+    /// which is also how the lockfile hands it back. `BuildPolicy` normalizes
+    /// the keys it is configured with, so any spelling of the path matches.
+    pub fn source_approval_keys(&self, name: &str) -> Vec<String> {
+        let specifier = self.pnpm_specifier();
+        let mut keys = vec![format!("{name}@{specifier}")];
+        if matches!(self, LocalSource::Git(_)) && !specifier.starts_with("git+") {
+            keys.push(format!("{name}@git+{specifier}"));
+        }
+        keys
+    }
+
+    /// The commit-free `<name>@git+<repository>` key that approves every
+    /// commit of one repository. A hosted-git archive keys as the
+    /// repository it was cut from, so one rule covers the dependency
+    /// whether it was cloned or downloaded, as pnpm's does.
+    pub fn git_repository_approval_key(&self, name: &str) -> Option<String> {
+        let url = match self {
+            LocalSource::Git(g) => g.url.clone(),
+            LocalSource::RemoteTarball(t) => t.as_hosted_git_source()?.url,
+            _ => return None,
+        };
+        Some(format!(
+            "{name}@git+{}",
+            url.strip_prefix("git+").unwrap_or(&url)
+        ))
+    }
+
     /// Canonical specifier string as pnpm writes it in the `packages:`
     /// and `snapshots:` keys (post-`<name>@` part). For `file:` /
     /// `link:` this is `file:./vendor/foo` / `link:../sibling`. For
@@ -206,17 +240,47 @@ impl LocalSource {
         }
     }
 
+    /// A `file:` or `link:` path as pnpm records it: lexically normalized, so
+    /// a manifest's `./llink` is `llink`. The graph keeps the manifest's
+    /// spelling, which hashes to the same package key, and the reader takes
+    /// either form. `portal:` and `exec:`, which pnpm lacks, stay as spelled.
+    pub fn pnpm_path(&self) -> String {
+        let (LocalSource::Directory(path) | LocalSource::Tarball(path) | LocalSource::Link(path)) =
+            self
+        else {
+            return self.path_posix();
+        };
+        aube_util::path::normalize_dep_path(&path.to_string_lossy())
+    }
+
+    /// [`Self::specifier`] with the path as [`Self::pnpm_path`] gives it: how
+    /// a local package is written to a lockfile and named to the user, so a
+    /// fresh resolve and a read of its lockfile agree on its identity.
+    /// `specifier` itself stays as spelled, for looking up the lockfile's own
+    /// keys.
+    pub fn pnpm_specifier(&self) -> String {
+        match self {
+            LocalSource::Directory(_) | LocalSource::Tarball(_) | LocalSource::Link(_) => {
+                format!("{}:{}", self.kind_str(), self.pnpm_path())
+            }
+            _ => self.specifier(),
+        }
+    }
+
     /// Internal FS-safe dep_path used as the key in
     /// `LockfileGraph.packages` and as the `.aube/` subdir name.
     ///
-    /// Distinct paths must map to distinct keys (otherwise the
+    /// Distinct normalized paths must map to distinct keys (otherwise the
     /// linker would silently mix files between two local packages),
     /// and the result must be a single filesystem component — no
     /// `/`, `\`, `:`, or `..`. Ad-hoc character substitution trips
     /// over cases like `../vendor` vs `__/vendor` or `a.b` vs `a_b`
-    /// collapsing to the same string, so we hash the raw path bytes
-    /// and suffix the first 16 hex chars (64 bits — more than enough
-    /// to avoid collisions inside a single project).
+    /// collapsing to the same string, so we hash the lexically normalized
+    /// path bytes and suffix the first 16 hex chars (64 bits — more than
+    /// enough to avoid collisions inside a single project). Normalization
+    /// also makes equivalent spellings such as `./vendor` and `vendor`
+    /// share one package identity without changing their serialized
+    /// specifiers.
     ///
     /// The hash input is the POSIX-form path string so a checked-in
     /// lockfile resolves to the same key regardless of which
@@ -237,7 +301,15 @@ impl LocalSource {
             LocalSource::RemoteTarball(t) => {
                 hasher.update(t.url.as_bytes());
             }
-            _ => hasher.update(self.path_posix().as_bytes()),
+            LocalSource::Directory(path)
+            | LocalSource::Tarball(path)
+            | LocalSource::Link(path)
+            | LocalSource::Portal(path)
+            | LocalSource::Exec(path) => {
+                let normalized = aube_util::path::normalize_lexical(path);
+                let posix = normalized.to_string_lossy().replace('\\', "/");
+                hasher.update(posix.as_bytes());
+            }
         }
         let digest = hasher.finalize();
         let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
@@ -284,10 +356,9 @@ impl LocalSource {
             ("link", r)
         } else if let Some(r) = spec.strip_prefix("portal:") {
             ("portal", r)
-        } else if let Some(r) = spec.strip_prefix("exec:") {
-            return Some(LocalSource::Exec(PathBuf::from(r)));
         } else {
-            return None;
+            let r = spec.strip_prefix("exec:")?;
+            return Some(LocalSource::Exec(PathBuf::from(r)));
         };
         let rel = PathBuf::from(rest);
         let abs = project_root.join(&rel);
@@ -1277,6 +1348,15 @@ mod tests {
             subpath: Some("packages/b".to_string()),
         });
         assert_ne!(a.dep_path("dep"), b.dep_path("dep"));
+    }
+
+    #[test]
+    fn dep_path_normalizes_equivalent_local_paths() {
+        let root = LocalSource::Directory(PathBuf::from("./injected/lib-b"));
+        let transitive = LocalSource::Directory(PathBuf::from("injected/lib-a/../lib-b"));
+
+        assert_eq!(root.dep_path("lib-b"), transitive.dep_path("lib-b"));
+        assert_eq!(root.specifier(), "file:./injected/lib-b");
     }
 
     const SHARED_SHA: &str = "0123456789abcdef0123456789abcdef01234567";

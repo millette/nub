@@ -12,9 +12,13 @@
 //!      mode (same path `--frozen-lockfile` takes).
 //!   3. `enableScripts: false` (yarn) → force a block-all-builds policy that
 //!      overrides even nub's curated default-trust floor.
-//!   4. `dependenciesMeta.*.injected` → auto-switch to the isolated linker (the
-//!      only layout where aube materializes injected copies) instead of
-//!      silently dropping the directive under nub's hoisted default.
+//!   4. `dependenciesMeta.*.injected` → the carve-out from the GVS-aware
+//!      hoisting default: a non-injected project pushes no `hoist` (it resolves
+//!      to the default `true`, which under nub's `gvs_over_default_hoist` profile
+//!      lets GVS engage without a hidden hoist tree), but injected copies
+//!      materialize only with the hidden hoist tree on, so an injected project
+//!      pushes an EXPLICIT `hoist=true` — vetoing GVS (per-project + hidden
+//!      tree, always).
 //!
 //! (`minimumReleaseAge` from bunfig is wired in [`super::bun_config`] — it maps
 //! to a synthetic `.npmrc` entry the settings registry already reads.)
@@ -31,8 +35,27 @@
 //! symmetric brand-boundary discipline the rest of `pm_engine` enforces.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use nub_core::config_cache::MtimeCache;
 
 use super::config_scope::{IgnoredField, Role};
+
+/// Per-process, mtime-validated cache of raw config-file CONTENTS keyed by path.
+/// The unsupported-config readers each opened the same `.yarnrc.yml` / `.npmrc`
+/// file once PER KEY (immutable, scripts, network, hardened; omit, include,
+/// legacy-peer-deps) — several reads of one file per command.
+/// This collapses them to a single read per `(path, mtime)`; the per-key parse
+/// then runs against the cached string. mtime validation keeps it stale-proof:
+/// any rewrite of the file bumps the mtime, the next lookup misses and re-reads.
+static CONFIG_TEXT_CACHE: MtimeCache<String> = MtimeCache::new();
+
+/// Read a config file's full contents through [`CONFIG_TEXT_CACHE`]. `None`
+/// (missing / unreadable) is never cached — identical to `read_to_string().ok()`
+/// on those paths, just deduplicated across repeated readers in one command.
+fn read_config_text(path: &Path) -> Option<Arc<String>> {
+    CONFIG_TEXT_CACHE.get_or_read(path, || std::fs::read_to_string(path).ok())
+}
 
 /// A config-derived override of the dependency selection axis
 /// (`--prod`/`--dev`/`--no-optional`). `None` per field means "not pinned by
@@ -81,7 +104,7 @@ fn npm_omit_include(root: &Path) -> DepSelectionConfig {
     let mut omit: Vec<String> = Vec::new();
     let mut include: Vec<String> = Vec::new();
     for path in npmrc_paths(root) {
-        let Ok(content) = std::fs::read_to_string(&path) else {
+        let Some(content) = read_config_text(&path) else {
             continue;
         };
         if let Some(v) = npmrc_scalar(&content, "omit") {
@@ -132,7 +155,7 @@ pub(crate) fn frozen_from_config(role: Role, root: &Path) -> bool {
 /// yarn `.yarnrc.yml` `enableImmutableInstalls: true` or a non-empty
 /// `immutablePatterns:` block.
 fn yarn_immutable(root: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(root.join(".yarnrc.yml")) else {
+    let Some(content) = read_config_text(&root.join(".yarnrc.yml")) else {
         return false;
     };
     if yarnrc_top_level_bool(&content, "enableImmutableInstalls") == Some(true) {
@@ -149,8 +172,7 @@ pub(crate) fn yarn_scripts_disabled(role: Role, root: &Path) -> bool {
     if role != Role::Yarn {
         return false;
     }
-    std::fs::read_to_string(root.join(".yarnrc.yml"))
-        .ok()
+    read_config_text(&root.join(".yarnrc.yml"))
         .and_then(|c| yarnrc_top_level_bool(&c, "enableScripts"))
         == Some(false)
 }
@@ -165,8 +187,7 @@ pub(crate) fn yarn_network_disabled(role: Role, root: &Path) -> bool {
     if role != Role::Yarn {
         return false;
     }
-    std::fs::read_to_string(root.join(".yarnrc.yml"))
-        .ok()
+    read_config_text(&root.join(".yarnrc.yml"))
         .and_then(|c| yarnrc_top_level_bool(&c, "enableNetwork"))
         == Some(false)
 }
@@ -182,26 +203,29 @@ pub(crate) fn yarn_network_disabled(role: Role, root: &Path) -> bool {
 /// The classic `.yarnrc` is a space-separated `key "value"` format (parsed by
 /// Yarn 1's own lockfile parser), distinct from Berry's `.yarnrc.yml`.
 fn yarn_offline_mirror_configured(root: &Path) -> bool {
-    std::fs::read_to_string(root.join(".yarnrc"))
-        .is_ok_and(|c| classic_yarnrc_has_key(&c, "yarn-offline-mirror"))
+    read_config_text(&root.join(".yarnrc"))
+        .is_some_and(|c| classic_yarnrc_has_key(&c, "yarn-offline-mirror"))
 }
 
 /// Whether the root (or any workspace member) manifest declares
 /// `dependenciesMeta.<pkg>.injected: true`. aube materializes injected copies
-/// only under the isolated linker, so when injection is present nub auto-
-/// switches the embedder's `nodeLinker` default to `isolated` (instead of the
-/// hoisted default for flat-layout incumbents) rather than silently dropping
-/// the directive.
-pub(crate) fn injected_deps_present(root: &Path) -> bool {
+/// only with the hidden hoist tree on, so an injected project is the carve-out
+/// from the GVS-aware hoisting default: instead of leaving `hoist` at its
+/// default (which lets GVS engage), it pushes an EXPLICIT `hoist=true` that
+/// vetoes GVS (per-project + hidden tree), rather than silently dropping the
+/// directive.
+/// `workspace_members` is the caller's one-shot workspace discovery for `root`
+/// (see `nub_setting_defaults`), shared with the version gates that scan the
+/// same manifests.
+pub(crate) fn injected_deps_present(root: &Path, workspace_members: &[PathBuf]) -> bool {
     manifest_has_injected(&root.join("package.json"))
-        || aube_workspace::find_workspace_packages(root)
-            .into_iter()
-            .flatten()
+        || workspace_members
+            .iter()
             .any(|dir| manifest_has_injected(&dir.join("package.json")))
 }
 
 fn manifest_has_injected(manifest_path: &Path) -> bool {
-    let Ok(manifest) = aube_manifest::PackageJson::from_path(manifest_path) else {
+    let Some(manifest) = super::cached_aube_manifest(manifest_path) else {
         return false;
     };
     let Some(meta) = manifest
@@ -241,14 +265,13 @@ pub(crate) enum ScanResult {
 /// load-bearing fields nub does not implement (returns the first hit so the
 /// abort names a concrete remedy); otherwise returns the WARN set.
 ///
-/// The FATAL set is deliberately SHORT — only fields whose silent omission
-/// produces a correctness-divergent install AND which nub cannot honor:
-/// npm `legacy-peer-deps` (different peer graph) and npm
-/// `install-strategy=nested` (different resolution/layout). yarn
-/// `supportedArchitectures` is NOT here — the engine honors it via the
-/// arch-filter resolver. PnP stays a WARN+downgrade (handled separately in
-/// `warn_if_pnp_requested`), not
-/// promoted. `checksumBehavior`/`enableHardenedMode` are NOT here: aube verifies
+/// The fatal set contains only fields whose silent omission changes resolution
+/// and which Nub cannot honor: npm `legacy-peer-deps` (a different peer graph).
+/// Branded layout fields are ignored and disclosed in the install header.
+/// Yarn `supportedArchitectures` is not here — the engine honors it via the
+/// arch-filter resolver. yarn `nodeLinker: pnp` is a plan-time FATAL handled
+/// separately in `pnp_fatal_if_requested` (it needs `.yarnrc.yml` reading, not
+/// the role-keyed scan here). `checksumBehavior`/`enableHardenedMode` are NOT here: aube verifies
 /// every tarball's SHA-512 by default (`verifyStoreIntegrity=true`), satisfying
 /// the `throw` posture.
 pub(crate) fn scan_unsupported_config(
@@ -282,21 +305,15 @@ fn scan_fatal(role: Role, root: &Path) -> Option<FatalField> {
                     field: "`legacy-peer-deps`",
                     detail: "nub always resolves peer dependencies; npm's legacy escape hatch \
                              would produce a different peer graph",
-                    remedy: "remove `legacy-peer-deps` from .npmrc and fix the peer conflict, \
-                             or pin the conflicting versions in `overrides`",
+                    remedy: "remove `legacy-peer-deps` from .npmrc and fix the peer conflict — \
+                             pin the conflicting versions in `overrides`, or correct a \
+                             package's peer metadata (e.g. mark a peer optional) in \
+                             `packageExtensions`",
                 });
             }
-            if let Some(strategy) = npmrc_project_value(root, "install-strategy")
-                && strategy.eq_ignore_ascii_case("nested")
-            {
-                return Some(FatalField {
-                    code: "ERR_NUB_UNSUPPORTED_CONFIG",
-                    field: "`install-strategy=nested`",
-                    detail: "nub installs a hoisted/isolated tree; npm's nested layout can change \
-                             which version a require() resolves to",
-                    remedy: "remove `install-strategy=nested` from .npmrc",
-                });
-            }
+            // `install-strategy` controls layout, so it follows the same policy
+            // as every other branded layout setting: ignore it and disclose the
+            // replacement source in the install header.
             None
         }
         // yarn `supportedArchitectures` is HONORED, not fatal: the engine
@@ -358,7 +375,7 @@ fn scan_warn(role: Role, root: &Path) -> Vec<IgnoredField> {
 }
 
 fn manifest_has_pnpm_overrides(root: &Path) -> bool {
-    let Ok(manifest) = aube_manifest::PackageJson::from_path(&root.join("package.json")) else {
+    let Some(manifest) = super::cached_aube_manifest(&root.join("package.json")) else {
         return false;
     };
     manifest
@@ -371,7 +388,7 @@ fn manifest_has_pnpm_overrides(root: &Path) -> bool {
 }
 
 fn yarnrc_top_level_bool_str(root: &Path, key: &str) -> Option<bool> {
-    let content = std::fs::read_to_string(root.join(".yarnrc.yml")).ok()?;
+    let content = read_config_text(&root.join(".yarnrc.yml"))?;
     yarnrc_top_level_bool(&content, key)
 }
 
@@ -426,10 +443,17 @@ fn npmrc_value_in(paths: &[PathBuf], key: &str) -> Option<String> {
     paths
         .iter()
         .filter_map(|path| {
-            let content = std::fs::read_to_string(path).ok()?;
+            let content = read_config_text(path)?;
             npmrc_scalar(&content, key)
         })
         .next_back()
+}
+
+/// Read a scalar `.npmrc` key across the project walk-up and, when
+/// `include_global`, the global `~/.npmrc`. The reusable entry for nub-behavior
+/// knobs read from the neutral `.npmrc` surface (the verify-deps policy).
+pub(crate) fn npmrc_scalar_value(root: &Path, key: &str, include_global: bool) -> Option<String> {
+    npmrc_value_in(&npmrc_paths_inner(root, include_global), key)
 }
 
 fn npmrc_bool_set_in(paths: &[PathBuf], key: &str) -> bool {
@@ -437,12 +461,6 @@ fn npmrc_bool_set_in(paths: &[PathBuf], key: &str) -> bool {
         let v = v.trim();
         v.is_empty() || v.eq_ignore_ascii_case("true")
     })
-}
-
-/// Read a scalar `.npmrc` key from PROJECT-SCOPED `.npmrc` files only (the
-/// project tree walk-up, excluding `~/.npmrc`). Used by the FATAL scan.
-fn npmrc_project_value(root: &Path, key: &str) -> Option<String> {
-    npmrc_value_in(&npmrc_project_paths(root), key)
 }
 
 /// Whether a boolean `.npmrc` key is set truthy (`key=true`, or bare `key`) in
@@ -505,8 +523,8 @@ fn split_list(v: &str) -> Vec<String> {
 fn bunfig_install_bool(root: &Path, key: &str) -> Option<bool> {
     let mut value = None;
     for path in bunfig_paths(root) {
-        if let Ok(raw) = std::fs::read_to_string(&path)
-            && let Ok(parsed) = raw.parse::<toml::Value>()
+        if let Some(raw) = read_config_text(&path)
+            && let Ok(parsed) = raw.parse::<toml::Table>()
             && let Some(b) = parsed
                 .get("install")
                 .and_then(toml::Value::as_table)
@@ -640,6 +658,14 @@ mod tests {
     fn tmp() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
+
+    /// Serializes the two tests that mutate the process-global `$HOME`. This lib
+    /// test binary runs MULTI-THREADED (nothing pins `--test-threads=1`), so the
+    /// set→use→restore window must be held under a lock or it races sibling tests
+    /// (and each other) — every `scan_unsupported_config` call reads
+    /// `dirs_next::home_dir()`. Poison-recovering, matching the crate's other
+    /// process-global seams (`RELEASE_ENV_LOCK`, `CWD_LOCK`).
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn npm_omit_dev_selects_prod() {
@@ -796,7 +822,7 @@ mod tests {
             r#"{"name":"x","dependenciesMeta":{"foo":{"injected":true}}}"#,
         )
         .unwrap();
-        assert!(injected_deps_present(d.path()));
+        assert!(injected_deps_present(d.path(), &[]));
     }
 
     #[test]
@@ -813,10 +839,33 @@ mod tests {
         }
     }
 
+    /// npm's layout knob is ignored like every other branded layout setting,
+    /// rather than aborting for one value and silently accepting the others.
     #[test]
-    fn scan_fatal_on_install_strategy_nested() {
+    fn install_strategy_is_ignored_not_fatal() {
+        for value in ["nested", "hoisted", "shallow", "linked"] {
+            let d = tmp();
+            fs::write(
+                d.path().join(".npmrc"),
+                format!("install-strategy={value}\n"),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    scan_unsupported_config(Role::Npm, None, None, d.path()),
+                    ScanResult::Warn(_)
+                ),
+                "install-strategy={value} is layout and must not abort"
+            );
+        }
+    }
+
+    /// `legacy-peer-deps` changes resolution rather than layout, so it remains
+    /// fatal after the layout carve-out.
+    #[test]
+    fn legacy_peer_deps_still_aborts_after_the_layout_carve_out() {
         let d = tmp();
-        fs::write(d.path().join(".npmrc"), "install-strategy=nested\n").unwrap();
+        fs::write(d.path().join(".npmrc"), "legacy-peer-deps=true\n").unwrap();
         assert!(matches!(
             scan_unsupported_config(Role::Npm, None, None, d.path()),
             ScanResult::Fatal(_)
@@ -879,11 +928,13 @@ mod tests {
     /// project walk-up never reaches the fake home.
     #[test]
     fn global_npmrc_legacy_peer_deps_does_not_trip_fatal() {
+        // Held for the whole set→use→restore window: the lib binary is
+        // multi-threaded, and HOME_LOCK serializes the two HOME-mutating tests.
+        let _home_guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp();
         let project = tmp();
         fs::write(home.path().join(".npmrc"), "legacy-peer-deps=true\n").unwrap();
 
-        // SAFETY: single-threaded test; restored before returning.
         let prev_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", home.path());
@@ -912,32 +963,6 @@ mod tests {
         assert!(
             project_is_fatal,
             "a project ./.npmrc legacy-peer-deps MUST be fatal"
-        );
-    }
-
-    /// Companion: `install-strategy=nested` in the global `~/.npmrc` is likewise
-    /// not project-fatal, while the project spelling is.
-    #[test]
-    fn global_npmrc_install_strategy_does_not_trip_fatal() {
-        let home = tmp();
-        let project = tmp();
-        fs::write(home.path().join(".npmrc"), "install-strategy=nested\n").unwrap();
-
-        let prev_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        let global_only = scan_unsupported_config(Role::Npm, None, None, project.path());
-        let global_is_fatal = matches!(global_only, ScanResult::Fatal(_));
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        assert!(
-            !global_is_fatal,
-            "a global ~/.npmrc install-strategy=nested must NOT abort an unrelated project"
         );
     }
 

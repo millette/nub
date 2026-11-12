@@ -63,9 +63,23 @@ pub(crate) fn write_applied_patches(
     map: &BTreeMap<String, String>,
 ) -> std::io::Result<()> {
     let path = nm_dir.join(applied_patches_sidecar_name());
-    let out = serde_json::to_string(map)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    aube_util::fs_atomic::atomic_write(&path, out.as_bytes())
+    // No patches applied ⇒ no sidecar: an empty `{}` manifest carries no
+    // information (a missing file already reads back as the empty map in
+    // read_applied_patches, so wipe-on-change is unchanged), and writing it
+    // clutters every patch-free `node_modules` with a stray dotfile. Remove a
+    // stale non-empty sidecar too, so `patch-remove`'ing the last patch cleans
+    // up after itself. Best-effort unlink — a missing file is the success case.
+    if map.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    } else {
+        let out = serde_json::to_string(map)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        aube_util::fs_atomic::atomic_write(&path, out.as_bytes())
+    }
 }
 
 /// Wipe `.aube/<dep_path>` for any package whose patch fingerprint
@@ -89,19 +103,25 @@ pub(crate) fn wipe_changed_patched_entries(
         return;
     }
     for (dep_path, pkg) in &graph.packages {
-        let key = pkg.spec_key();
-        if affected.contains(&key) {
+        // Patch fingerprints are keyed by the declared selector (the
+        // registry identity), so an npm-aliased entry must match on
+        // `registry_name()@version` as well as its alias-qualified
+        // `spec_key()`. Mirrors `LockedPackage::lookup_patch`.
+        let spec_key = pkg.spec_key();
+        let registry_key = format!("{}@{}", pkg.registry_name(), pkg.version);
+        if affected.contains(&spec_key) || affected.contains(&registry_key) {
             let entry = aube_dir.join(dep_path_to_filename(dep_path, max_length));
             let _ = std::fs::remove_dir_all(entry);
         }
     }
 }
 
-/// Apply a git-style multi-file unified diff to a package directory.
+/// Apply a multi-file unified diff to a package directory.
 ///
-/// The patch text is split on `diff --git ` boundaries; each section
-/// is parsed as a single-file unified diff and applied to the matching
-/// file under `pkg_dir`. We deliberately unlink the destination
+/// The patch text is split on git-style or plain unified-diff file
+/// boundaries; each section is parsed as a single-file unified diff and
+/// applied to the matching file under `pkg_dir`. We deliberately unlink
+/// the destination
 /// before writing, because the linker materializes files via reflink
 /// or hardlink — modifying the file in place would corrupt the global
 /// content-addressed store the linked file points to.
@@ -156,54 +176,173 @@ fn ensure_no_symlink_in_chain(pkg_dir: &Path, rel: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn apply_multi_file_patch(pkg_dir: &Path, patch_text: &str) -> Result<(), String> {
+/// Refuse a patch path that escapes the package directory. A hostile
+/// diff with `b/../../etc/shadow` as the target would otherwise let the
+/// patch step overwrite, delete or rename files outside the installed
+/// package. Same rules we apply to tar entries over in aube-store (no
+/// absolute, no drive prefix, no `..`, no backslash, no NUL).
+///
+/// Every parent component on disk is walked too, refusing to follow any
+/// symlink or junction. Without this guard, a package that planted a
+/// directory link inside its own tree (or a workspace where the user has
+/// a symlinked dep dir) would let `pkg_dir.join(rel)` resolve through the
+/// link, and `atomic_write` would overwrite a file outside `pkg_dir`.
+/// CVE-2018-1000156 (GNU patch) class.
+fn check_patch_path(pkg_dir: &Path, rel: &str) -> Result<(), String> {
+    if !is_safe_rel_component(rel) {
+        return Err(format!("patch file path escapes package: {rel:?}"));
+    }
+    ensure_no_symlink_in_chain(pkg_dir, rel)
+        .map_err(|e| format!("patch target contains symlink: {e}"))
+}
+
+/// A git rename moves the file before its hunks apply, as pnpm does. The
+/// rename only re-points a directory entry, so a file still linked to the
+/// global store stays byte-identical there; any hunk then replaces it
+/// through `atomic_write`. An existing destination is refused rather than
+/// clobbered, unless it is the source itself under a case-only rename.
+fn rename_in_package(from: &Path, to: &Path) -> Result<(), String> {
+    if !from.exists() {
+        return Err(format!(
+            "cannot rename {}: it does not exist",
+            from.display()
+        ));
+    }
+    if to.symlink_metadata().is_ok() && !is_case_only_rename(from, to) {
+        return Err(format!(
+            "cannot rename {} to {}: the destination already exists",
+            from.display(),
+            to.display()
+        ));
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    std::fs::rename(from, to).map_err(|e| {
+        format!(
+            "failed to rename {} to {}: {e}",
+            from.display(),
+            to.display()
+        )
+    })
+}
+
+/// `readme.md` → `README.md` on a case-insensitive filesystem (default
+/// macOS and Windows): the destination lookup finds the source itself.
+/// pnpm's `fs-extra` `moveSync` lets that through, and `rename` then
+/// stores the new casing. It must be the source's own directory entry:
+/// the linker hardlinks identical files from the store, so another entry
+/// can share the source's inode, and `rename` between two links to one
+/// inode succeeds without doing anything. So the name has to fold to the
+/// source's own name in the same directory, and not exist there verbatim.
+/// The directory is compared by identity, since its spelling in the patch
+/// may differ in case too (`lib/LICENSE` → `Lib/License`).
+fn is_case_only_rename(from: &Path, to: &Path) -> bool {
+    let (Some(from_dir), Some(dir), Some(from_name), Some(to_name)) =
+        (from.parent(), to.parent(), from.file_name(), to.file_name())
+    else {
+        return false;
+    };
+    let folds_to_source = match (from_name.to_str(), to_name.to_str()) {
+        (Some(from_name), Some(to_name)) => from_name.to_lowercase() == to_name.to_lowercase(),
+        _ => false,
+    };
+    folds_to_source
+        && same_file::is_same_file(from_dir, dir).unwrap_or(false)
+        && same_file::is_same_file(from, to).unwrap_or(false)
+        && std::fs::read_dir(dir).is_ok_and(|mut entries| {
+            entries.all(|entry| entry.is_ok_and(|entry| entry.file_name() != to_name))
+        })
+}
+
+/// Write a package's original files from the store into `dest`, the
+/// baseline `aube patch` diffs against. Every file is a fresh copy,
+/// never a hard link: the copy is edited in place, and a link would
+/// write the edit through to the shared store. Index keys pass the
+/// same traversal check the linker applies, and each file's mode comes
+/// from the index, because a CAS inode can carry an `+x` bit that
+/// another package's entry for the same content set.
+pub fn copy_package_from_store(
+    index: &aube_store::PackageIndex,
+    dest: &Path,
+) -> Result<(), String> {
+    for (rel, stored) in index {
+        crate::validate_index_key(rel).map_err(|e| e.to_string())?;
+        let target = dest.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        std::fs::copy(&stored.store_path, &target).map_err(|e| {
+            format!(
+                "failed to copy {} from the store to {}: {e}",
+                rel,
+                target.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if stored.executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("failed to set the mode of {}: {e}", target.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply a multi-file unified diff to the package directory `pkg_dir`,
+/// the same way install applies a declared patch.
+pub fn apply_multi_file_patch(pkg_dir: &Path, patch_text: &str) -> Result<(), String> {
     let sections = split_patch_sections(patch_text);
     if sections.is_empty() {
-        return Err("patch contained no `diff --git` sections".to_string());
+        return Err("patch contained no parseable file sections".to_string());
     }
     for section in sections {
         let rel = section
             .rel_path
             .as_ref()
             .ok_or_else(|| "patch section missing file path".to_string())?;
-        // Refuse patch headers that escape the package directory.
-        // A hostile diff with `b/../../etc/shadow` as the target
-        // would otherwise let the patch step overwrite or delete
-        // files outside the installed package. Same rules we apply
-        // to tar entries over in aube-store (no absolute, no drive
-        // prefix, no `..`, no backslash, no NUL).
-        if !is_safe_rel_component(rel) {
-            return Err(format!("patch file path escapes package: {rel:?}"));
-        }
-        // Walk every parent component of the target on disk and refuse
-        // to follow any symlink or junction. Without this guard, a
-        // package that planted a directory link inside its own tree
-        // (or a workspace where the user has a symlinked dep dir)
-        // would let `pkg_dir.join(rel)` resolve through the link, and
-        // `atomic_write` would overwrite a file outside `pkg_dir`.
-        // CVE-2018-1000156 (GNU patch) class.
-        if let Err(e) = ensure_no_symlink_in_chain(pkg_dir, rel) {
-            return Err(format!("patch target contains symlink: {e}"));
-        }
+        check_patch_path(pkg_dir, rel)?;
         let target = pkg_dir.join(rel);
-        let original = if target.exists() {
-            std::fs::read_to_string(&target)
-                .map_err(|e| format!("failed to read {}: {e}", target.display()))?
-        } else {
-            String::new()
-        };
-        // `+++ /dev/null` means the patch deletes the file. Skip the
-        // hunk applier entirely — emptying the file would write a
-        // zero-byte file in place of the original, leaving
+        if let Some(from) = section.ops.rename_from.as_deref() {
+            check_patch_path(pkg_dir, from)?;
+            rename_in_package(&pkg_dir.join(from), &target)?;
+        }
+        // A deletion skips the hunk applier entirely — emptying the file
+        // would write a zero-byte file in place of the original, leaving
         // `require('./removed')` resolving to an empty module instead of
         // the expected `MODULE_NOT_FOUND`.
-        if section.is_deletion {
+        if section.ops.is_deletion {
             if target.exists() {
                 std::fs::remove_file(&target)
                     .map_err(|e| format!("failed to remove {}: {e}", target.display()))?;
             }
             continue;
         }
+        let permissions = patched_file_permissions(&target, section.ops.new_mode);
+        if section.body.is_empty() {
+            // A metadata-only section. A bare rename is already done; an
+            // empty new file or a mode change is written in full rather
+            // than `chmod`ed, which would reach a store-linked inode.
+            let bytes = if section.ops.is_creation {
+                Vec::new()
+            } else if section.ops.new_mode.is_some() {
+                std::fs::read(&target)
+                    .map_err(|e| format!("failed to read {}: {e}", target.display()))?
+            } else {
+                continue;
+            };
+            write_patched_file(&target, &bytes, permissions)?;
+            continue;
+        }
+        let original = if target.exists() {
+            std::fs::read_to_string(&target)
+                .map_err(|e| format!("failed to read {}: {e}", target.display()))?
+        } else {
+            String::new()
+        };
         // git-style patches always use LF line endings, but published
         // tarballs frequently ship files with CRLF (Windows editors,
         // `core.autocrlf=true` checkouts). The hunk matcher's trailing-ws
@@ -229,32 +368,60 @@ pub(crate) fn apply_multi_file_patch(pkg_dir: &Path, patch_text: &str) -> Result
         } else {
             patched_lf
         };
-        // Break any reflink/hardlink to the global store before
-        // writing the patched bytes — otherwise we'd silently mutate
-        // every other project sharing this CAS file. Stage the write
-        // through a sibling tempfile and `rename` into place so a
-        // crash or Ctrl-C mid-patch cannot leave the package with
-        // the original file unlinked and no replacement written.
-        // POSIX `rename(2)` atomically replaces the destination, so
-        // no pre-removal is needed and removing first would create
-        // the exact TOCTOU window the rename is supposed to close.
-        // Windows `MoveFileExW` fails when the destination exists,
-        // so the unlink is gated behind `cfg(windows)`.
-        #[cfg(windows)]
-        {
-            if target.exists() {
-                std::fs::remove_file(&target)
-                    .map_err(|e| format!("failed to unlink {}: {e}", target.display()))?;
-            }
-        }
-        aube_util::fs_atomic::atomic_write(&target, patched.as_bytes()).map_err(|e| {
-            format!(
-                "failed to write patched file into place {}: {e}",
-                target.display()
-            )
-        })?;
+        write_patched_file(&target, patched.as_bytes(), permissions)?;
     }
     Ok(())
+}
+
+/// Break any reflink/hardlink to the global store before writing the
+/// patched bytes — otherwise we'd silently mutate every other project
+/// sharing this CAS file. Stage the write through a sibling tempfile and
+/// `rename` into place so a crash or Ctrl-C mid-patch cannot leave the
+/// package with the original file unlinked and no replacement written.
+/// POSIX `rename(2)` atomically replaces the destination, so no
+/// pre-removal is needed and removing first would create the exact TOCTOU
+/// window the rename is supposed to close. Windows `MoveFileExW` fails
+/// when the destination exists, so the unlink is gated behind
+/// `cfg(windows)`.
+fn write_patched_file(
+    target: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if target.exists() {
+            std::fs::remove_file(target)
+                .map_err(|e| format!("failed to unlink {}: {e}", target.display()))?;
+        }
+    }
+    aube_util::fs_atomic::atomic_write_with_permissions(target, bytes, permissions).map_err(|e| {
+        format!(
+            "failed to write patched file into place {}: {e}",
+            target.display()
+        )
+    })
+}
+
+/// The mode a patched file is written with. The atomic write installs a
+/// new inode, so without this an executable `bin` script would come back
+/// `0644`; pnpm writes patched bytes over the file in place and keeps its
+/// mode. A git `new mode` / `new file mode` header wins over both.
+#[cfg(unix)]
+fn patched_file_permissions(target: &Path, new_mode: Option<u32>) -> Option<std::fs::Permissions> {
+    use std::os::unix::fs::PermissionsExt;
+    match new_mode {
+        Some(mode) => Some(std::fs::Permissions::from_mode(mode)),
+        None => std::fs::metadata(target).ok().map(|m| m.permissions()),
+    }
+}
+
+#[cfg(not(unix))]
+fn patched_file_permissions(
+    _target: &Path,
+    _new_mode: Option<u32>,
+) -> Option<std::fs::Permissions> {
+    None
 }
 
 /// One contiguous run of like-typed lines inside a hunk — a block of
@@ -452,9 +619,7 @@ fn evaluate_hunk(
     }
     let mut context_index = base as usize;
     // `fileLines.length - contextIndex < original.length` → null.
-    if file_lines.len() < context_index
-        || file_lines.len() - context_index < hunk.original_length
-    {
+    if file_lines.len() < context_index || file_lines.len() - context_index < hunk.original_length {
         return None;
     }
 
@@ -517,7 +682,18 @@ fn apply_hunks(base_image: &str, hunks: &[Hunk]) -> Result<String, String> {
                 -fuzzing_offset - 1
             };
             if fuzzing_offset.abs() > 20 {
-                return Err(format!("could not apply hunk {i} (offset drift > 20 lines)"));
+                // Refusing is deliberate — see this function's doc comment. The
+                // message says WHERE, because the actionable fact is that the
+                // patch was cut against a different release of the package: bun
+                // applies some of these where pnpm (and so nub) will not, so a
+                // patch that works under bun can arrive here already stale.
+                return Err(format!(
+                    "could not apply hunk {} at line {} (searched 20 lines either way for its context \
+                     and found none).\n\x20\x20The file does not match what the patch was cut \
+                     against — regenerate it against this version.",
+                    i + 1,
+                    hunk.original_start
+                ));
             }
         };
         all_mods.push(mods);
@@ -536,7 +712,9 @@ fn apply_hunks(base_image: &str, hunks: &[Hunk]) -> Result<String, String> {
                 } => {
                     let at = (*index as isize + diff_offset) as usize;
                     let end = (at + num_to_delete).min(file_lines.len());
-                    let removed: Vec<String> = file_lines.splice(at..end, lines_to_insert.iter().cloned()).collect();
+                    let removed: Vec<String> = file_lines
+                        .splice(at..end, lines_to_insert.iter().cloned())
+                        .collect();
                     diff_offset += lines_to_insert.len() as isize - removed.len() as isize;
                 }
                 Modification::Pop => {
@@ -557,18 +735,58 @@ struct PatchSection {
     /// Single-file unified diff body — `parse_hunks` reads this directly.
     /// Always begins with `--- ` so the parser has a stable anchor.
     body: String,
-    /// `+++ /dev/null` was seen in the header — the patch deletes this
-    /// file, so the linker should `remove_file` instead of writing
-    /// patched bytes (which the hunk applier would emit as an empty
-    /// string).
-    is_deletion: bool,
+    ops: FileOps,
 }
 
-/// Split a git-style multi-file patch into one section per file.
-/// We look for `diff --git a/<path> b/<path>` markers, pull the path
-/// out of the `b/...` half (post-edit name), and capture everything
-/// from the next `--- ` line until the following `diff --git ` (or
-/// EOF) as the single-file diff body.
+/// What a section does to its file besides (or instead of) its hunks.
+/// git writes a rename, an empty new file, a mode flip and a deletion cut
+/// with `--irreversible-delete` (the form `pnpm patch-commit` emits) as
+/// extended-header lines with no hunks at all; pnpm's applier
+/// (`@pnpm/patch-package`'s `parse.ts`) reads the same lines.
+#[derive(Default)]
+struct FileOps {
+    /// `+++ /dev/null` or `deleted file mode` — the linker should
+    /// `remove_file` instead of writing patched bytes (which the hunk
+    /// applier would emit as an empty string).
+    is_deletion: bool,
+    /// `rename from`: move this path to `rel_path` before any hunk
+    /// applies, so the hunks match the source's content.
+    rename_from: Option<String>,
+    /// `new file mode`: the file exists after the patch even when no hunk
+    /// gives it content.
+    is_creation: bool,
+    /// Permission bits from `new mode` / `new file mode`.
+    new_mode: Option<u32>,
+}
+
+impl FileOps {
+    fn is_empty(&self) -> bool {
+        !self.is_deletion
+            && self.rename_from.is_none()
+            && !self.is_creation
+            && self.new_mode.is_none()
+    }
+}
+
+/// `rename from`/`rename to` paths carry no `a/`/`b/` prefix, and git
+/// quotes one holding special characters the way it quotes `diff --git`.
+fn git_header_path(raw: &str) -> String {
+    raw.strip_prefix('"')
+        .and_then(|q| q.strip_suffix('"'))
+        .and_then(unescape_git_quoted)
+        .unwrap_or_else(|| raw.to_string())
+}
+
+/// Permission bits of a git regular-file mode (`100644`, `100755`). A
+/// symlink or gitlink mode is ignored rather than turned into `chmod 000`.
+fn regular_file_mode(mode: &str) -> Option<u32> {
+    let mode = u32::from_str_radix(mode.trim(), 8).ok()?;
+    (mode & 0o170000 == 0o100000).then_some(mode & 0o777)
+}
+
+/// Split a multi-file patch into one section per file. Git-style patches
+/// use `diff --git` boundaries; plain unified diffs use completed hunk
+/// counts to distinguish the next `---` file header from hunk content.
 fn parse_diff_git_b_path(rest: &str) -> Option<String> {
     if let Some(after) = rest.strip_prefix("\"a/") {
         let end_a = after.find("\" \"b/")?;
@@ -655,22 +873,51 @@ fn unescape_git_quoted(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+fn unified_header_path(header: &str) -> Option<String> {
+    let path = header
+        .split_once('\t')
+        .map_or(header, |(path, _timestamp)| path);
+    if path == "/dev/null" {
+        return None;
+    }
+    Some(
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path)
+            .to_string(),
+    )
+}
+
+fn hunk_line_counts(header: &str) -> Option<(usize, usize)> {
+    let ranges = header.strip_prefix("@@ -")?.split_once(" @@")?.0;
+    let (old, new) = ranges.split_once(" +")?;
+    let count = |range: &str| {
+        range
+            .split_once(',')
+            .map_or(Some(1), |(_, count)| count.parse().ok())
+    };
+    Some((count(old)?, count(new)?))
+}
+
 fn split_patch_sections(text: &str) -> Vec<PatchSection> {
     let mut out: Vec<PatchSection> = Vec::new();
     let mut current_path: Option<String> = None;
     let mut body = String::new();
     let mut in_body = false;
-    let mut is_deletion = false;
+    let mut ops = FileOps::default();
+    let mut hunk_remaining: Option<(usize, usize)> = None;
+    let mut old_header_path: Option<String> = None;
+    let mut in_git_header = false;
 
     let flush = |out: &mut Vec<PatchSection>,
                  path: &mut Option<String>,
                  body: &mut String,
-                 is_deletion: &mut bool| {
-        if !body.is_empty() || *is_deletion {
+                 ops: &mut FileOps| {
+        if !body.is_empty() || !ops.is_empty() {
             out.push(PatchSection {
                 rel_path: path.take(),
                 body: std::mem::take(body),
-                is_deletion: std::mem::replace(is_deletion, false),
+                ops: std::mem::take(ops),
             });
         } else {
             *path = None;
@@ -681,52 +928,178 @@ fn split_patch_sections(text: &str) -> Vec<PatchSection> {
         let stripped = line.trim_end_matches(['\n', '\r']);
         if let Some(rest) = stripped.strip_prefix("diff --git ") {
             // New file boundary — flush whatever we were collecting.
-            flush(&mut out, &mut current_path, &mut body, &mut is_deletion);
+            flush(&mut out, &mut current_path, &mut body, &mut ops);
             in_body = false;
+            hunk_remaining = None;
+            old_header_path = None;
             // Parse `a/<path> b/<path>` and prefer the post-edit
             // (`b/`) path so renames land on the new name.
             current_path = parse_diff_git_b_path(rest);
+            in_git_header = true;
+            continue;
+        }
+        let at_section_boundary = !in_body || hunk_remaining.is_none();
+        if at_section_boundary && let Some(header) = stripped.strip_prefix("--- ") {
+            if in_body {
+                flush(&mut out, &mut current_path, &mut body, &mut ops);
+            }
+            in_body = true;
+            in_git_header = false;
+            hunk_remaining = None;
+            old_header_path = unified_header_path(header);
+            body.push_str(stripped);
+            body.push('\n');
             continue;
         }
         if !in_body {
-            if stripped.starts_with("--- ") {
-                in_body = true;
-                // Rewrite `--- /dev/null` (file addition) to `--- a/<path>`
-                // so the body still carries a valid `--- ` anchor. The
-                // original file content we apply against is empty for
-                // additions, which the hunk applier handles directly.
-                if stripped == "--- /dev/null"
-                    && let Some(rel) = current_path.as_deref()
-                {
-                    body.push_str(&format!("--- a/{rel}\n"));
-                } else {
-                    body.push_str(stripped);
-                    body.push('\n');
-                }
+            // git's extended headers. `index` / `similarity index` /
+            // `old mode` decorate the section and are not needed.
+            if !in_git_header {
+                continue;
             }
-            // Skip git's `index ...` / `new file mode ...` /
-            // `similarity index ...` decorations — the hunk parser
-            // doesn't need them once we know the target path.
+            if let Some(path) = stripped.strip_prefix("rename from ") {
+                ops.rename_from = Some(git_header_path(path));
+            } else if let Some(path) = stripped.strip_prefix("rename to ") {
+                // Authoritative over the `diff --git` split, which cannot
+                // place the a/b boundary when a renamed path holds ` b/`.
+                current_path = Some(git_header_path(path));
+            } else if let Some(mode) = stripped.strip_prefix("new file mode ") {
+                ops.is_creation = true;
+                ops.new_mode = regular_file_mode(mode);
+            } else if let Some(mode) = stripped.strip_prefix("new mode ") {
+                ops.new_mode = regular_file_mode(mode);
+            } else if stripped.starts_with("deleted file mode ") {
+                ops.is_deletion = true;
+            }
             continue;
         }
-        if stripped == "+++ /dev/null" {
-            // File deletion — note it and drop this header line. The
-            // linker will `remove_file` and skip the hunk applier
-            // entirely, so the rest of the body (the hunk that empties
-            // the file) is intentionally discarded.
-            is_deletion = true;
-            continue;
+        if let Some(header) = stripped.strip_prefix("+++ ") {
+            if current_path.is_none() {
+                current_path = unified_header_path(header).or_else(|| old_header_path.clone());
+            }
+            if header == "/dev/null" {
+                // File deletion — note it and drop this header line. The
+                // linker will `remove_file` and skip the hunk applier
+                // entirely, so the rest of the body (the hunk that empties
+                // the file) is intentionally discarded.
+                ops.is_deletion = true;
+                continue;
+            }
+            // `--- /dev/null` (file addition) carries no old path, so
+            // rewrite the anchor to `--- a/<path>`. The original content
+            // applied against is empty for additions, which the hunk
+            // applier handles directly.
+            if old_header_path.is_none()
+                && let Some(rel) = current_path.as_deref()
+            {
+                body.clear();
+                body.push_str(&format!("--- a/{rel}\n"));
+            }
         }
         body.push_str(stripped);
         body.push('\n');
+        if let Some(counts) = hunk_line_counts(stripped) {
+            hunk_remaining = (counts != (0, 0)).then_some(counts);
+        } else if let Some((old, new)) = hunk_remaining.as_mut() {
+            match stripped.as_bytes().first() {
+                Some(b' ') => {
+                    *old = old.saturating_sub(1);
+                    *new = new.saturating_sub(1);
+                }
+                Some(b'-') => *old = old.saturating_sub(1),
+                Some(b'+') => *new = new.saturating_sub(1),
+                _ => {}
+            }
+            if *old == 0 && *new == 0 {
+                hunk_remaining = None;
+            }
+        }
     }
-    flush(&mut out, &mut current_path, &mut body, &mut is_deletion);
+    flush(&mut out, &mut current_path, &mut body, &mut ops);
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_package_from_store_takes_modes_from_the_index_and_refuses_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        // One CAS file shared by an executable and a plain entry, with the
+        // +x bit an earlier link already set on its inode.
+        let cas = dir.path().join("cas");
+        std::fs::write(&cas, "#!/usr/bin/env node\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cas, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let stored = |executable| aube_store::StoredFile {
+            hex_hash: String::new(),
+            store_path: cas.clone(),
+            executable,
+            size: None,
+        };
+        let mut index = aube_store::PackageIndex::default();
+        index.insert("bin/cli.js".to_string(), stored(true));
+        index.insert("lib/plain.js".to_string(), stored(false));
+        let dest = dir.path().join("copy");
+        copy_package_from_store(&index, &dest).unwrap();
+
+        std::fs::write(dest.join("lib/plain.js"), "edited\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cas).unwrap(),
+            "#!/usr/bin/env node\n",
+            "editing the copy must not write through to the store"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |rel: &str| {
+                std::fs::metadata(dest.join(rel))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode("bin/cli.js"), 0o755);
+            assert_eq!(mode("lib/plain.js"), 0o644);
+        }
+
+        let mut escaping = aube_store::PackageIndex::default();
+        escaping.insert("../outside.js".to_string(), stored(false));
+        assert!(copy_package_from_store(&escaping, &dest).is_err());
+        assert!(!dir.path().join("outside.js").exists());
+    }
+
+    #[test]
+    fn empty_patch_set_writes_no_sidecar_and_cleans_a_stale_one() {
+        // A patch-free install must not litter `node_modules` with an empty
+        // `{}` manifest — a missing file already reads back as the empty map,
+        // so the sidecar carries no information. And removing the last patch
+        // (non-empty → empty) must delete the now-stale sidecar.
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path();
+        let sidecar = nm.join(applied_patches_sidecar_name());
+
+        write_applied_patches(nm, &BTreeMap::new()).unwrap();
+        assert!(
+            !sidecar.exists(),
+            "empty patch set must not create the sidecar"
+        );
+
+        let one: BTreeMap<String, String> =
+            [("left-pad@1.0.0".to_string(), "deadbeef".to_string())].into();
+        write_applied_patches(nm, &one).unwrap();
+        assert!(sidecar.exists(), "a real patch set writes the sidecar");
+
+        write_applied_patches(nm, &BTreeMap::new()).unwrap();
+        assert!(
+            !sidecar.exists(),
+            "dropping the last patch must remove the stale sidecar"
+        );
+    }
 
     #[cfg(windows)]
     #[test]
@@ -795,6 +1168,144 @@ mod tests {
     }
 
     #[test]
+    fn applies_plain_unified_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("index.js"), "module.exports = 'old';\n").unwrap();
+
+        let patch = "--- a/index.js\n\
+                     +++ b/index.js\n\
+                     @@ -1 +1 @@\n\
+                     -module.exports = 'old';\n\
+                     +module.exports = 'new';\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pkg.join("index.js")).unwrap(),
+            "module.exports = 'new';\n"
+        );
+    }
+
+    #[test]
+    fn applies_plain_unified_patch_with_bare_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("index.js"), "old\n").unwrap();
+
+        let patch = "--- index.js\t2026-07-11 00:00:00\n\
+                     +++ index.js\t2026-07-11 00:00:01\n\
+                     @@ -1 +1 @@\n\
+                     -old\n\
+                     +new\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pkg.join("index.js")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[test]
+    fn applies_multi_hunk_plain_unified_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("index.js"), "one\ntwo\nthree\nfour\n").unwrap();
+
+        let patch = "--- a/index.js\n\
+                     +++ b/index.js\n\
+                     @@ -1 +1 @@\n\
+                     -one\n\
+                     +ONE\n\
+                     @@ -4 +4 @@\n\
+                     -four\n\
+                     +FOUR\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pkg.join("index.js")).unwrap(),
+            "ONE\ntwo\nthree\nFOUR\n"
+        );
+    }
+
+    #[test]
+    fn applies_multi_file_plain_unified_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("a.js"), "a\n").unwrap();
+        std::fs::write(pkg.join("b.js"), "b\n").unwrap();
+
+        let patch = "--- a/a.js\n\
+                     +++ b/a.js\n\
+                     @@ -1 +1 @@\n\
+                     -a\n\
+                     +A\n\
+                     --- a/b.js\n\
+                     +++ b/b.js\n\
+                     @@ -1 +1 @@\n\
+                     -b\n\
+                     +B\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        assert_eq!(std::fs::read_to_string(pkg.join("a.js")).unwrap(), "A\n");
+        assert_eq!(std::fs::read_to_string(pkg.join("b.js")).unwrap(), "B\n");
+    }
+
+    #[test]
+    fn plain_unified_patch_adds_and_deletes_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("old.js"), "old\n").unwrap();
+
+        let patch = "--- /dev/null\n\
+                     +++ b/new.js\n\
+                     @@ -0,0 +1 @@\n\
+                     +new\n\
+                     --- a/old.js\n\
+                     +++ /dev/null\n\
+                     @@ -1 +0,0 @@\n\
+                     -old\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pkg.join("new.js")).unwrap(),
+            "new\n"
+        );
+        assert!(!pkg.join("old.js").exists());
+    }
+
+    #[test]
+    fn plain_unified_patch_path_cannot_escape_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let patch = "--- a/index.js\n\
+                     +++ b/../../outside.js\n\
+                     @@ -0,0 +1 @@\n\
+                     +pwned\n";
+
+        let result = apply_multi_file_patch(&pkg, patch);
+        assert!(result.is_err());
+        assert!(!dir.path().join("outside.js").exists());
+    }
+
+    #[test]
+    fn zero_count_hunk_does_not_hide_next_file_boundary() {
+        let patch = "--- a/empty.js\n\
+                     +++ b/empty.js\n\
+                     @@ -0,0 +0,0 @@\n\
+                     --- a/index.js\n\
+                     +++ b/index.js\n\
+                     @@ -1 +1 @@\n\
+                     -old\n\
+                     +new\n";
+
+        let sections = split_patch_sections(patch);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].rel_path.as_deref(), Some("empty.js"));
+        assert_eq!(sections[1].rel_path.as_deref(), Some("index.js"));
+    }
+
+    #[test]
     fn crlf_patch_path_does_not_carry_carriage_return() {
         let patch = "diff --git a/index.js b/index.js\r\n\
                      --- a/index.js\r\n\
@@ -817,7 +1328,7 @@ mod tests {
                      -gone\r\n";
         let sections = split_patch_sections(patch);
         assert_eq!(sections.len(), 1);
-        assert!(sections[0].is_deletion);
+        assert!(sections[0].ops.is_deletion);
     }
 
     #[test]
@@ -904,6 +1415,252 @@ mod tests {
         assert_eq!(path, "café.js");
     }
 
+    fn pkg_with(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for (rel, content) in files {
+            std::fs::write(pkg.join(rel), content).unwrap();
+        }
+        (dir, pkg)
+    }
+
+    // git's rename-with-edit form (#845): the hunk was cut against the
+    // source's content, so the move has to happen first.
+    #[test]
+    fn git_rename_moves_the_source_then_applies_hunks_to_the_destination() {
+        let (dir, pkg) = pkg_with(&[]);
+        // The package file is a hardlink into a store, as the linker leaves it.
+        let store_file = dir.path().join("store-LICENSE");
+        std::fs::write(&store_file, "ISC License\n\nCopyright\n").unwrap();
+        std::fs::hard_link(&store_file, pkg.join("LICENSE")).unwrap();
+        let patch = "diff --git a/LICENSE b/LICENSE.txt\n\
+                     similarity index 97%\n\
+                     rename from LICENSE\n\
+                     rename to LICENSE.txt\n\
+                     index 82adb48..f352d52 100644\n\
+                     --- a/LICENSE\n\
+                     +++ b/LICENSE.txt\n\
+                     @@ -1 +1 @@\n\
+                     -ISC License\n\
+                     +ISC License (patched)\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        assert!(!pkg.join("LICENSE").exists(), "rename source must be gone");
+        assert_eq!(
+            std::fs::read_to_string(pkg.join("LICENSE.txt")).unwrap(),
+            "ISC License (patched)\n\nCopyright\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&store_file).unwrap(),
+            "ISC License\n\nCopyright\n",
+            "patching the renamed file must not write through to the store"
+        );
+    }
+
+    #[test]
+    fn git_rename_without_hunks_moves_the_file_into_a_new_directory() {
+        let (_dir, pkg) = pkg_with(&[("old.js", "same\n")]);
+        let patch = "diff --git a/old.js b/lib/new.js\n\
+                     similarity index 100%\n\
+                     rename from old.js\n\
+                     rename to lib/new.js\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        assert!(!pkg.join("old.js").exists());
+        assert_eq!(
+            std::fs::read_to_string(pkg.join("lib/new.js")).unwrap(),
+            "same\n"
+        );
+    }
+
+    #[test]
+    fn git_rename_refuses_paths_outside_the_package_and_an_existing_destination() {
+        let (dir, pkg) = pkg_with(&[("a.js", "a\n"), ("b.js", "b\n")]);
+        std::fs::write(dir.path().join("outside.js"), "outside\n").unwrap();
+        for (from, to) in [("../outside.js", "stolen.js"), ("a.js", "../escaped.js")] {
+            let patch = format!(
+                "diff --git a/{from} b/{to}\n\
+                 similarity index 100%\n\
+                 rename from {from}\n\
+                 rename to {to}\n"
+            );
+            let err = apply_multi_file_patch(&pkg, &patch).unwrap_err();
+            assert!(err.contains("escapes package"), "{from} -> {to}: {err}");
+        }
+        assert!(dir.path().join("outside.js").exists());
+        assert!(!pkg.join("stolen.js").exists());
+        assert!(!dir.path().join("escaped.js").exists());
+
+        let patch = "diff --git a/a.js b/b.js\n\
+                     similarity index 100%\n\
+                     rename from a.js\n\
+                     rename to b.js\n";
+        let err = apply_multi_file_patch(&pkg, patch).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read_to_string(pkg.join("b.js")).unwrap(), "b\n");
+    }
+
+    // On a case-insensitive filesystem the destination already "exists" as
+    // the source. On a case-sensitive one (Linux CI) it does not, so there
+    // this covers only the plain rename path; both must end on the new name.
+    #[test]
+    fn git_case_only_rename_applies_hunks_under_the_new_name() {
+        let (_dir, pkg) = pkg_with(&[]);
+        std::fs::create_dir(pkg.join("lib")).unwrap();
+        std::fs::write(pkg.join("LICENSE"), "ISC License\n").unwrap();
+        std::fs::write(pkg.join("lib/LICENSE"), "ISC License\n").unwrap();
+        let case_insensitive = pkg.join("License").exists();
+        let names = |dir: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        // The second section's parent differs only in case as well. As
+        // with pnpm, the file takes the new casing and the directory keeps
+        // its own.
+        let patch = "diff --git a/LICENSE b/License\n\
+                     similarity index 97%\n\
+                     rename from LICENSE\n\
+                     rename to License\n\
+                     --- a/LICENSE\n\
+                     +++ b/License\n\
+                     @@ -1 +1 @@\n\
+                     -ISC License\n\
+                     +ISC License (patched)\n\
+                     diff --git a/lib/LICENSE b/Lib/License\n\
+                     similarity index 97%\n\
+                     rename from lib/LICENSE\n\
+                     rename to Lib/License\n\
+                     --- a/lib/LICENSE\n\
+                     +++ b/Lib/License\n\
+                     @@ -1 +1 @@\n\
+                     -ISC License\n\
+                     +ISC License (patched)\n";
+        apply_multi_file_patch(&pkg, patch)
+            .unwrap_or_else(|e| panic!("case_insensitive={case_insensitive}: {e}"));
+        let moved = if case_insensitive {
+            assert_eq!(names(&pkg), ["License", "lib"]);
+            pkg.join("lib")
+        } else {
+            assert_eq!(names(&pkg), ["Lib", "License", "lib"]);
+            pkg.join("Lib")
+        };
+        assert_eq!(names(&moved), ["License"]);
+        for file in [pkg.join("License"), moved.join("License")] {
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "ISC License (patched)\n",
+                "{}",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn git_rename_onto_another_name_of_the_same_or_a_case_folded_file_is_refused() {
+        // A second hard link to the source's inode is a distinct entry.
+        let (_dir, pkg) = pkg_with(&[
+            ("LICENSE", "license\n"),
+            ("a.js", "a\n"),
+            ("README.md", "readme\n"),
+        ]);
+        std::fs::hard_link(pkg.join("LICENSE"), pkg.join("COPYING")).unwrap();
+        let rename = |from: &str, to: &str| {
+            apply_multi_file_patch(
+                &pkg,
+                &format!("diff --git a/{from} b/{to}\nrename from {from}\nrename to {to}\n"),
+            )
+        };
+        let err = rename("LICENSE", "COPYING").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(pkg.join("LICENSE").exists() && pkg.join("COPYING").exists());
+
+        // Folded onto a different entry: these collide only where the
+        // filesystem is case-insensitive; on Linux the names are free. The
+        // second shares the source's inode, so identity cannot tell it apart.
+        let case_insensitive = pkg.join("readme.md").exists();
+        let entries = || {
+            let mut names: Vec<String> = std::fs::read_dir(&pkg)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let folded_onto_other = rename("a.js", "readme.MD");
+        let folded_onto_hard_link = rename("LICENSE", "Copying");
+        if case_insensitive {
+            for result in [folded_onto_other, folded_onto_hard_link] {
+                let err = result.unwrap_err();
+                assert!(err.contains("already exists"), "{err}");
+            }
+            assert_eq!(entries(), ["COPYING", "LICENSE", "README.md", "a.js"]);
+            assert_eq!(
+                std::fs::read_to_string(pkg.join("README.md")).unwrap(),
+                "readme\n"
+            );
+        } else {
+            folded_onto_other.unwrap();
+            folded_onto_hard_link.unwrap();
+        }
+    }
+
+    // `pnpm patch-commit` diffs with `--irreversible-delete`, and git
+    // writes the same header-only form for an empty file (#844).
+    #[test]
+    fn git_deletion_without_hunks_removes_the_file() {
+        let (_dir, pkg) = pkg_with(&[("index.ts", "export {}\n"), ("keep.js", "keep\n")]);
+        let patch = "diff --git a/index.ts b/index.ts\n\
+                     deleted file mode 100644\n\
+                     index 611bbbc777f9f82283b88a67c29f3697806eea0f..0000000000000000000000000000000000000000\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        assert!(!pkg.join("index.ts").exists());
+        assert!(pkg.join("keep.js").exists());
+    }
+
+    #[test]
+    fn git_new_file_without_hunks_creates_an_empty_file() {
+        let (_dir, pkg) = pkg_with(&[]);
+        let patch = "diff --git a/lib/empty.js b/lib/empty.js\n\
+                     new file mode 100644\n\
+                     index 0000000..e69de29\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        assert_eq!(std::fs::read(pkg.join("lib/empty.js")).unwrap(), b"");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_mode_change_applies_and_a_patched_file_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, pkg) = pkg_with(&[("cli.js", "old\n")]);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(pkg.join("cli.js"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let store_file = dir.path().join("store-run.sh");
+        std::fs::write(&store_file, "run\n").unwrap();
+        std::fs::set_permissions(&store_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::hard_link(&store_file, pkg.join("run.sh")).unwrap();
+        let patch = "diff --git a/cli.js b/cli.js\n\
+                     --- a/cli.js\n\
+                     +++ b/cli.js\n\
+                     @@ -1 +1 @@\n\
+                     -old\n\
+                     +new\n\
+                     diff --git a/run.sh b/run.sh\n\
+                     old mode 100644\n\
+                     new mode 100755\n";
+        apply_multi_file_patch(&pkg, patch).unwrap();
+        assert_eq!(mode(&pkg.join("cli.js")), 0o755, "patched bin lost +x");
+        assert_eq!(mode(&pkg.join("run.sh")), 0o755);
+        assert_eq!(
+            std::fs::read_to_string(pkg.join("run.sh")).unwrap(),
+            "run\n"
+        );
+        assert_eq!(mode(&store_file), 0o644, "chmod must not reach the store");
+    }
+
     // The `pnpm patch` output for `@convex-dev/resend@0.2.4` in issue #25:
     // the file's last line has no trailing newline, and pnpm omits the
     // `\ No newline at end of file` marker. pnpm + GNU `patch` apply it;
@@ -954,7 +1711,8 @@ mod tests {
         // no-trailing-newline EOF. With the newline-agnostic line array
         // this round-trips for free — the marker is informational here.
         let original = "a\nb\nlast";
-        let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n last\n\\ No newline at end of file\n";
+        let body =
+            "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n last\n\\ No newline at end of file\n";
         assert_eq!(apply_body(original, body).unwrap(), "a\nB\nlast");
     }
 
@@ -1000,7 +1758,10 @@ mod tests {
         // comparing; the old diffy byte-exact match rejected. We match.
         let original = "alpha   \nbeta\ngamma\n"; // "alpha" has trailing spaces
         let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n";
-        assert_eq!(apply_body(original, body).unwrap(), "alpha   \nBETA\ngamma\n");
+        assert_eq!(
+            apply_body(original, body).unwrap(),
+            "alpha   \nBETA\ngamma\n"
+        );
     }
 
     #[test]
@@ -1027,8 +1788,12 @@ mod tests {
         let body = "--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n anchor\n-target\n+TARGET\n tail\n";
         let err = apply_body(&original, body).unwrap_err();
         assert!(
-            err.contains("offset drift"),
-            "expected an offset-drift rejection, got: {err}"
+            err.contains("could not apply hunk 1 at line 1"),
+            "the rejection must say which hunk and where it looked: {err}"
+        );
+        assert!(
+            err.contains("regenerate it"),
+            "and what to do about it, since the patch is simply stale: {err}"
         );
     }
 
@@ -1063,8 +1828,12 @@ mod tests {
     #[test]
     fn happy_path_simple_edit_byte_identical() {
         let original = "module.exports = 'old';\n";
-        let body = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-module.exports = 'old';\n+module.exports = 'new';\n";
-        assert_eq!(apply_body(original, body).unwrap(), "module.exports = 'new';\n");
+        let body =
+            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-module.exports = 'old';\n+module.exports = 'new';\n";
+        assert_eq!(
+            apply_body(original, body).unwrap(),
+            "module.exports = 'new';\n"
+        );
     }
 
     #[test]
@@ -1073,7 +1842,10 @@ mod tests {
         let body = "--- a/x\n+++ b/x\n\
                     @@ -1,3 +1,3 @@\n 1\n-2\n+TWO\n 3\n\
                     @@ -6,3 +6,3 @@\n 6\n-7\n+SEVEN\n 8\n";
-        assert_eq!(apply_body(original, body).unwrap(), "1\nTWO\n3\n4\n5\n6\nSEVEN\n8\n");
+        assert_eq!(
+            apply_body(original, body).unwrap(),
+            "1\nTWO\n3\n4\n5\n6\nSEVEN\n8\n"
+        );
     }
 
     #[test]

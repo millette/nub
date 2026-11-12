@@ -1,5 +1,8 @@
 use super::berry::{file_protocol_source, strip_hash_fragment};
-use crate::{DepType, DirectDep, Error, LocalSource, LockedPackage, LockfileGraph};
+use crate::{
+    DepType, DirectDep, EXTRA_PRESERVE_TARBALL_URL, Error, LocalSource, LockedPackage,
+    LockfileGraph, RemoteTarballSource,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +19,15 @@ pub(super) fn parse_classic_str(
     // from package.json ranges and transitive dep references.
     let mut spec_to_dep_path: BTreeMap<String, String> = BTreeMap::new();
     let mut packages: BTreeMap<String, LockedPackage> = BTreeMap::new();
+    // Under `strict_unsupported_source` (nub), a block whose source the
+    // classic reader can't resolve (git, github shorthand, jsr, http
+    // tarball, …) is RECORDED here (keyed by each of its specs) instead of
+    // being reclassified to a registry `name@version` that 404s at fetch, so
+    // the edge sites below can raise an eager fatal / warn+skip. Empty (and
+    // inert) for standalone aube, which keeps the reclassify default.
+    let strict = aube_util::embedder().strict_unsupported_source;
+    let mut unsupported: BTreeMap<String, crate::UnsupportedSpec> = BTreeMap::new();
+    let mut skipped_optional: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
 
     for block in &blocks {
         let version = block
@@ -61,10 +73,48 @@ pub(super) fn parse_classic_str(
         // install. The dep_path is keyed by `LocalSource::dep_path` (the
         // FS-safe hashed form) exactly like the berry parser keys its
         // local packages.
-        let local_source = block
-            .specs
-            .iter()
-            .find_map(|s| classic_local_source(s, &name));
+        // Classify the block's source. All specs in a yarn.lock v1 block share
+        // one resolution, so they classify identically; scan for the first
+        // non-Registry signal (a `Local` source, or an `Unsupported` protocol).
+        // The block's `resolved` URL carries the pinned commit for a git
+        // source — yarn records the SHA there, not on the spec range (a
+        // `github:owner/repo#7.0.0` spec resolves to a `…/tar.gz/<sha>`
+        // archive) — so the classifier needs it to build a `LocalSource::Git`.
+        let resolved = block.fields.get("resolved").map(String::as_str);
+        let mut classic_src = ClassicSource::Registry;
+        for s in &block.specs {
+            match classic_local_source(s, &name, resolved) {
+                ClassicSource::Registry => {}
+                other => {
+                    classic_src = other;
+                    break;
+                }
+            }
+        }
+        let local_source = match classic_src {
+            ClassicSource::Registry => None,
+            ClassicSource::Local(src) => Some(src),
+            ClassicSource::Unsupported(protocol) => {
+                if strict {
+                    // Record under each spec and skip the block entirely (no
+                    // registry package, no `spec_to_dep_path` entry), so a
+                    // consumer raises a fatal / warn at the edge sites instead
+                    // of resolving to a `name@version` that 404s at fetch.
+                    for s in &block.specs {
+                        unsupported.insert(
+                            s.clone(),
+                            crate::UnsupportedSpec {
+                                name: name.clone(),
+                                key: s.clone(),
+                                protocol: protocol.clone(),
+                            },
+                        );
+                    }
+                    continue;
+                }
+                None
+            }
+        };
         let dep_path = match &local_source {
             Some(src) => src.dep_path(&name),
             None => format!("{name}@{version}"),
@@ -86,12 +136,27 @@ pub(super) fn parse_classic_str(
                 .iter()
                 .map(|(n, r)| (n.clone(), r.clone()))
                 .collect();
+            let tarball_url = block
+                .fields
+                .get("resolved")
+                .and_then(|url| yarn_resolved_tarball_url(url));
+            let extra_meta = tarball_url
+                .as_deref()
+                .filter(|url| yarn_resolved_tarball_url_needs_preserve(url))
+                .map(|_| {
+                    BTreeMap::from([(
+                        EXTRA_PRESERVE_TARBALL_URL.to_string(),
+                        serde_json::Value::Bool(true),
+                    )])
+                })
+                .unwrap_or_default();
             packages.insert(
                 dep_path.clone(),
                 LockedPackage {
                     name: name.clone(),
                     version: version.clone(),
                     integrity: block.fields.get("integrity").cloned(),
+                    tarball_url,
                     // Store raw "name@range" pairs for now; resolve below.
                     dependencies: block
                         .dependencies
@@ -100,23 +165,30 @@ pub(super) fn parse_classic_str(
                         .collect(),
                     dep_path,
                     declared_dependencies: declared,
+                    declared_dependencies_known: true,
                     alias_of: alias_of.clone(),
                     local_source: local_source.clone(),
+                    extra_meta,
                     ..Default::default()
                 },
             );
         }
     }
 
-    // Second pass: resolve transitive dep references to dep_paths.
+    // Second pass: resolve transitive dep references to dep_paths. Classic
+    // tracks only `dependencies:` sections (the tokenizer drops
+    // `optionalDependencies:`), so every transitive edge here is non-optional
+    // — an unsupported one is therefore an eager fatal, never a warn.
     let mut resolved: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for (dep_path, pkg) in &packages {
         let mut deps: BTreeMap<String, String> = BTreeMap::new();
         for (name, raw_spec) in &pkg.dependencies {
-            if let Some(resolved_path) = spec_to_dep_path.get(raw_spec) {
+            if let Some(resolved_path) =
+                crate::resolve_dep_spec(raw_spec, false, &spec_to_dep_path, &unsupported, path)?
+            {
                 deps.insert(
                     name.clone(),
-                    crate::npm::dep_path_tail(name, resolved_path).to_string(),
+                    crate::npm::dep_path_tail(name, &resolved_path).to_string(),
                 );
             }
         }
@@ -128,27 +200,138 @@ pub(super) fn parse_classic_str(
         }
     }
 
-    // Build direct deps from the manifest, cross-referencing against spec_to_dep_path.
+    // Discover the workspace members once, up front, so both the root
+    // and member importers can recognize a dep on a SIBLING member.
+    // Classic yarn.lock never records workspace members (they aren't
+    // registry packages), so a member-to-member dependency is absent
+    // from `spec_to_dep_path` and would otherwise be dropped — the
+    // consumer then never gets the sibling symlinked into node_modules.
+    // `member_versions` maps each member's package name → its on-disk
+    // version; `member_manifests` carries the parsed manifests forward
+    // so we don't re-read them when building each member's importer.
+    let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut member_versions: BTreeMap<String, String> = BTreeMap::new();
+    let mut member_manifests: Vec<(String, aube_manifest::PackageJson)> = Vec::new();
+    if let Some(workspaces) = &manifest.workspaces {
+        for member_dir in super::discover_workspace_members(project_dir, workspaces.patterns()) {
+            let member_pj_path = project_dir.join(&member_dir).join("package.json");
+            let Ok(member_pj) = aube_manifest::PackageJson::from_path(&member_pj_path) else {
+                continue;
+            };
+            if let Some(name) = &member_pj.name {
+                member_versions.insert(
+                    name.clone(),
+                    member_pj.version.clone().unwrap_or_else(|| "0.0.0".into()),
+                );
+            }
+            member_manifests.push((member_dir, member_pj));
+        }
+    }
+
+    // A dep on a workspace SIBLING links to the local member rather than
+    // a registry tarball. Mirror the resolver's `try_workspace_link`
+    // (aube-resolver `driver.rs`): a `workspace:`/`link:`/`portal:` spec
+    // binds unconditionally for the `*`/`^`/`~`/empty sigils, and a bare
+    // semver range binds when the member's version satisfies it. We emit
+    // a DirectDep whose `dep_path` (`name@version`) has NO entry in
+    // `packages` — the convention the linker keys on to symlink the
+    // sibling dir (`aube-linker` link.rs: `workspace_dirs.contains_key`
+    // && `!graph.packages.contains_key(dep_path)`). The real yarn.lock
+    // entry, when one exists (a member that is ALSO published), still
+    // wins via the `spec_to_dep_path` path checked first by the callers.
+    let workspace_link = |name: &str, range: &str| -> Option<String> {
+        let version = member_versions.get(name)?;
+        let matches = match range
+            .strip_prefix("workspace:")
+            .or_else(|| range.strip_prefix("link:"))
+            .or_else(|| range.strip_prefix("portal:"))
+        {
+            Some("" | "*" | "^" | "~") => true,
+            // `link:`/`portal:` to a member binds by name; the path tail
+            // is the on-disk location, not a version constraint.
+            Some(_) if range.starts_with("link:") || range.starts_with("portal:") => true,
+            Some(rest) => super::version_satisfies(version, rest),
+            None if range.is_empty() || range == "*" => true,
+            None => super::version_satisfies(version, range),
+        };
+        matches.then(|| format!("{name}@{version}"))
+    };
+
+    // Build direct deps from the manifest, cross-referencing against
+    // spec_to_dep_path; falling back to a workspace-sibling link.
     let mut direct: Vec<DirectDep> = Vec::new();
-    let push_direct = |name: &str, range: &str, dep_type: DepType, direct: &mut Vec<DirectDep>| {
+    let push_dep = |name: &str,
+                    range: &str,
+                    dep_type: DepType,
+                    importer: &str,
+                    into: &mut Vec<DirectDep>,
+                    skipped: &mut BTreeMap<String, BTreeMap<String, String>>|
+     -> Result<(), Error> {
         let spec = format!("{name}@{range}");
-        if let Some(dep_path) = spec_to_dep_path.get(&spec) {
-            direct.push(DirectDep {
+        let optional = matches!(dep_type, DepType::Optional);
+        // `resolve_dep_spec`: `Some` when the spec resolves; `Err` for a
+        // non-optional unsupported source (the eager fatal); `None` for a
+        // genuine miss OR an optional unsupported source (warned inside).
+        if let Some(dep_path) =
+            crate::resolve_dep_spec(&spec, optional, &spec_to_dep_path, &unsupported, path)?
+        {
+            into.push(DirectDep {
                 name: name.to_string(),
-                dep_path: dep_path.clone(),
+                dep_path,
                 dep_type,
-                specifier: None,
+                specifier: Some(range.to_string()),
+            });
+            return Ok(());
+        }
+        // An optional unsupported dep was warned + skipped; record it as a
+        // consciously-skipped optional so a frozen install's drift check
+        // tolerates the absent dep (same as a platform-filtered optional).
+        if optional && unsupported.contains_key(&spec) {
+            skipped
+                .entry(importer.to_string())
+                .or_default()
+                .insert(name.to_string(), range.to_string());
+            return Ok(());
+        }
+        if let Some(dep_path) = workspace_link(name, range) {
+            into.push(DirectDep {
+                name: name.to_string(),
+                dep_path,
+                dep_type,
+                specifier: Some(range.to_string()),
             });
         }
+        Ok(())
     };
     for (name, range) in &manifest.dependencies {
-        push_direct(name, range, DepType::Production, &mut direct);
+        push_dep(
+            name,
+            range,
+            DepType::Production,
+            ".",
+            &mut direct,
+            &mut skipped_optional,
+        )?;
     }
     for (name, range) in &manifest.dev_dependencies {
-        push_direct(name, range, DepType::Dev, &mut direct);
+        push_dep(
+            name,
+            range,
+            DepType::Dev,
+            ".",
+            &mut direct,
+            &mut skipped_optional,
+        )?;
     }
     for (name, range) in &manifest.optional_dependencies {
-        push_direct(name, range, DepType::Optional, &mut direct);
+        push_dep(
+            name,
+            range,
+            DepType::Optional,
+            ".",
+            &mut direct,
+            &mut skipped_optional,
+        )?;
     }
 
     let mut importers = BTreeMap::new();
@@ -161,89 +344,51 @@ pub(super) fn parse_classic_str(
     // yarn-source workspace converts to a single lone `.` importer and
     // the target PM frozen-rejects (pnpm ERR_PNPM_OUTDATED_LOCKFILE on a
     // child package.json, npm "Missing" members, bun "lockfile had
-    // changes"). Discover each member from the globs + disk and build
-    // its importer, cross-referencing its declared ranges against the
-    // flat resolution list the same way the root importer is built.
-    if let Some(workspaces) = &manifest.workspaces {
-        let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        for member_dir in discover_workspace_members(project_dir, workspaces.patterns()) {
-            let member_pj_path = project_dir.join(&member_dir).join("package.json");
-            let Ok(member_pj) = aube_manifest::PackageJson::from_path(&member_pj_path) else {
-                continue;
-            };
-            let mut member_direct: Vec<DirectDep> = Vec::new();
-            let mut push_member = |name: &str, range: &str, dep_type: DepType| {
-                let spec = format!("{name}@{range}");
-                if let Some(dep_path) = spec_to_dep_path.get(&spec) {
-                    member_direct.push(DirectDep {
-                        name: name.to_string(),
-                        dep_path: dep_path.clone(),
-                        dep_type,
-                        specifier: Some(range.to_string()),
-                    });
-                }
-            };
-            for (name, range) in &member_pj.dependencies {
-                push_member(name, range, DepType::Production);
-            }
-            for (name, range) in &member_pj.dev_dependencies {
-                push_member(name, range, DepType::Dev);
-            }
-            for (name, range) in &member_pj.optional_dependencies {
-                push_member(name, range, DepType::Optional);
-            }
-            importers.insert(member_dir, member_direct);
+    // changes"). Build each member's importer from the manifests
+    // gathered above, cross-referencing its declared ranges against the
+    // flat resolution list — and against the workspace siblings — the
+    // same way the root importer is built.
+    for (member_dir, member_pj) in &member_manifests {
+        let mut member_direct: Vec<DirectDep> = Vec::new();
+        for (name, range) in &member_pj.dependencies {
+            push_dep(
+                name,
+                range,
+                DepType::Production,
+                member_dir,
+                &mut member_direct,
+                &mut skipped_optional,
+            )?;
         }
+        for (name, range) in &member_pj.dev_dependencies {
+            push_dep(
+                name,
+                range,
+                DepType::Dev,
+                member_dir,
+                &mut member_direct,
+                &mut skipped_optional,
+            )?;
+        }
+        for (name, range) in &member_pj.optional_dependencies {
+            push_dep(
+                name,
+                range,
+                DepType::Optional,
+                member_dir,
+                &mut member_direct,
+                &mut skipped_optional,
+            )?;
+        }
+        importers.insert(member_dir.clone(), member_direct);
     }
 
     Ok(LockfileGraph {
         importers,
         packages,
+        skipped_optional_dependencies: skipped_optional,
         ..Default::default()
     })
-}
-
-/// Expand the root manifest's `workspaces` globs against the on-disk
-/// tree, returning each member's project-relative directory (POSIX
-/// `/`-separated, the importer-key form) that contains a `package.json`.
-/// Mirrors npm/yarn-classic workspace globbing: a `packages/*` pattern
-/// matches direct child directories; an explicit `packages/app` matches
-/// that one directory.
-fn discover_workspace_members(project_dir: &Path, patterns: &[String]) -> Vec<String> {
-    let mut members: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for pattern in patterns {
-        // Negation patterns (`!packages/excluded`) and the root itself
-        // aren't member sources here.
-        if pattern.starts_with('!') || pattern == "." {
-            continue;
-        }
-        let glob_pat = project_dir.join(pattern);
-        let Some(glob_str) = glob_pat.to_str() else {
-            continue;
-        };
-        let Ok(paths) = glob::glob(glob_str) else {
-            continue;
-        };
-        for entry in paths.flatten() {
-            if !entry.is_dir() || !entry.join("package.json").is_file() {
-                continue;
-            }
-            let Ok(rel) = entry.strip_prefix(project_dir) else {
-                continue;
-            };
-            // Importer keys are POSIX-relative (`packages/app`), never
-            // the host's `\`-separated form.
-            let rel_posix = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            if !rel_posix.is_empty() {
-                members.insert(rel_posix);
-            }
-        }
-    }
-    members.into_iter().collect()
 }
 
 #[derive(Debug)]
@@ -381,6 +526,42 @@ fn unquote_yarn_scalar(value: &str) -> &str {
     }
 }
 
+fn yarn_resolved_tarball_url(resolved: &str) -> Option<String> {
+    let url = resolved.split_once('#').map_or(resolved, |(url, _)| url);
+    if crate::parse_git_spec(url).is_some() {
+        return None;
+    }
+    if !yarn_resolved_tarball_url_needs_preserve(url) {
+        return None;
+    }
+    LocalSource::looks_like_remote_tarball_url(url).then(|| url.to_string())
+}
+
+fn yarn_resolved_tarball_url_needs_preserve(url: &str) -> bool {
+    let Some(host) = http_url_host(url) else {
+        return false;
+    };
+    !matches!(host.as_str(), "registry.npmjs.org" | "registry.yarnpkg.com")
+}
+
+fn http_url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest
+        .split_once('/')
+        .map_or(rest, |(authority, _)| authority);
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    Some(
+        host_port
+            .split_once(':')
+            .map_or(host_port, |(host, _)| host)
+            .to_ascii_lowercase(),
+    )
+}
+
 /// Extract the package name from a spec like `foo@^1.0.0` or `@scope/pkg@^1.0.0`.
 pub(super) fn parse_spec_name(spec: &str) -> Option<String> {
     if let Some(rest) = spec.strip_prefix('@') {
@@ -395,22 +576,99 @@ pub(super) fn parse_spec_name(spec: &str) -> Option<String> {
     }
 }
 
-/// Detect a yarn-classic local-package protocol on a spec key and map
-/// it to a [`LocalSource`]. Classic encodes the protocol in the spec
-/// *range* (`name@link:./path`, `name@file:./path`, `name@portal:./path`)
-/// rather than in a separate `resolution:` field the way berry does.
-/// Registry and remote (`http(s):`, git) specs return `None` — they
-/// resolve through the normal `name@version` path.
-fn classic_local_source(spec: &str, name: &str) -> Option<LocalSource> {
-    let range = spec.strip_prefix(name)?.strip_prefix('@')?;
-    let (protocol, body) = range.split_once(':')?;
-    match protocol {
-        "link" => Some(LocalSource::Link(PathBuf::from(strip_hash_fragment(body)))),
-        "file" => Some(file_protocol_source(body)),
-        "portal" => Some(LocalSource::Portal(PathBuf::from(strip_hash_fragment(
-            body,
-        )))),
-        _ => None,
+/// How the classic reader classifies a spec's source.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ClassicSource {
+    /// A registry-resolvable spec: a semver range, a dist-tag, or an `npm:`
+    /// alias (the real name rides on `alias_of`). Resolves via `name@version`.
+    Registry,
+    /// A local on-disk source (`link:`/`file:`/`portal:`) the linker
+    /// materializes directly.
+    Local(LocalSource),
+    /// A source the classic reader cannot resolve from a yarn.lock — an
+    /// `http(s)` (non-git) tarball, `jsr:`, an unknown protocol, or a git
+    /// dep whose `resolved` URL carries no pinned commit. Reclassifying it to
+    /// `name@version` would 404 at fetch. Carries the protocol token for the
+    /// diagnostic. Git deps with a pinned `resolved` are NOT here — they
+    /// classify as [`ClassicSource::Local`] via [`classic_git_source`].
+    Unsupported(String),
+}
+
+/// Build the git [`LocalSource`] for a classic block from its `resolved`
+/// field. yarn 1.22 records the pinned commit on `resolved`, not the spec
+/// range, in two shapes: a `git+<transport>://…#<sha>` URL → a plain
+/// `LocalSource::Git` (cloned + checked out at the SHA); and a hosted-
+/// shorthand's flat codeload archive (`https://codeload.<host>/…/<sha>`) →
+/// `RemoteTarball { git_hosted: true }`, the same stand-in the pnpm v9 reader
+/// produces and the yarn/npm writers re-derive a git form from. Returns
+/// `None` when `resolved` is absent or holds no pinned commit, so the caller
+/// keeps the block `Unsupported` (a frozen install can't reproduce an
+/// unpinned git source).
+fn classic_git_source(resolved: Option<&str>) -> Option<LocalSource> {
+    let resolved = resolved?;
+    if let Some(git) = crate::npm::local_git_source_from_resolved(resolved) {
+        return Some(git);
+    }
+    crate::parse_hosted_git_tarball(resolved).map(|_| {
+        LocalSource::RemoteTarball(RemoteTarballSource {
+            url: resolved.to_string(),
+            integrity: String::new(),
+            git_hosted: true,
+        })
+    })
+}
+
+/// Classify a yarn-classic spec's source. Classic encodes the protocol in
+/// the spec *range* (`name@link:./path`, `name@user/repo#ref`,
+/// `name@git+https://…`) rather than a separate `resolution:` field the way
+/// berry does. `resolved` is the block's `resolved` URL — the only place the
+/// pinned git commit lives — passed through so a git range resolves to a
+/// proper `LocalSource::Git` instead of an abort.
+pub(super) fn classic_local_source(
+    spec: &str,
+    name: &str,
+    resolved: Option<&str>,
+) -> ClassicSource {
+    let Some(range) = spec.strip_prefix(name).and_then(|r| r.strip_prefix('@')) else {
+        // Not a `name@…` spec (malformed block); keep the historical
+        // registry default rather than inventing an unsupported source.
+        return ClassicSource::Registry;
+    };
+    // A git range is resolvable: pin it from the block's `resolved` URL.
+    // Falls back to `Unsupported("git")` only when no commit is recorded.
+    let git = || {
+        classic_git_source(resolved).map_or_else(
+            || ClassicSource::Unsupported("git".to_string()),
+            ClassicSource::Local,
+        )
+    };
+    match range.split_once(':') {
+        Some(("link", body)) => {
+            ClassicSource::Local(LocalSource::Link(PathBuf::from(strip_hash_fragment(body))))
+        }
+        Some(("file", body)) => ClassicSource::Local(file_protocol_source(body)),
+        Some(("portal", body)) => ClassicSource::Local(LocalSource::Portal(PathBuf::from(
+            strip_hash_fragment(body),
+        ))),
+        // `npm:` is a registry alias (resolves via `alias_of`) — NOT a local
+        // or unsupported source. Must be matched before the github-shorthand
+        // rule below, since an alias body can contain `/` (`npm:@scope/x@1`).
+        Some(("npm", _)) => ClassicSource::Registry,
+        // A `user/repo#semver:<range>` github shorthand splits on the
+        // `#semver:` colon, so its "protocol" carries the `/` — same git
+        // source as the no-colon `user/repo#ref` form below.
+        Some((protocol, _)) if protocol.contains('/') => git(),
+        // An explicit protocol that maps to a git spec (git+https/git+ssh/
+        // git/ssh/github:/gitlab:/bitbucket:/`.git` http) is a resolvable git
+        // source; anything else (jsr/http-non-git/unknown) the classic reader
+        // genuinely can't resolve from yarn.lock.
+        Some((_, _)) if crate::parse_git_spec(range).is_some() => git(),
+        Some((protocol, _)) => ClassicSource::Unsupported(protocol.to_string()),
+        // No protocol colon: a bare semver/dist-tag is registry-resolvable, but
+        // a `/`-bearing range is a github shorthand (`user/repo#ref`) — a git
+        // source. A registry range never contains `/`.
+        None if range.contains('/') => git(),
+        None => ClassicSource::Registry,
     }
 }
 

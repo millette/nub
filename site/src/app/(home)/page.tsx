@@ -1,34 +1,19 @@
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
 import Link from 'next/link';
 import type { ReactNode } from 'react';
 import { InstallTabs } from '@/components/install-tabs';
 import { MigrationPrompt, ViewRepoLink } from '@/components/migration-prompt';
 import { Terminal, Source, BenchBars } from '@/components/code';
 import { ToolkitTabs } from '@/components/toolkit-tabs';
+import { StarNudge } from '@/components/star-nudge';
 import { getLatestNode } from '@/lib/node-version';
-
-/* The "Copy agent prompt" button copies start.md VERBATIM — start.md is the
-   single source of truth for the adoption flow, so the button reproduces it
-   byte-for-byte rather than paraphrasing or linking. Read the raw file at build
-   time; on any read failure return undefined so the component falls back to a
-   short pointer instead of breaking the build. */
-async function getStartPrompt(): Promise<string | undefined> {
-  try {
-    return await readFile(
-      path.join(process.cwd(), 'public', 'start.md'),
-      'utf8',
-    );
-  } catch {
-    return undefined;
-  }
-}
+import { START_PROMPT } from '@/lib/start-prompt';
 
 export default function HomePage() {
   return (
     <div className="relative w-full overflow-x-hidden">
       <Hero />
       <Toolkit />
+      {/* Temporarily hidden: <VideoFeature /> */}
       <RunFileBand />
       <RunScriptBand />
       <NubxBand />
@@ -39,6 +24,50 @@ export default function HomePage() {
   );
 }
 
+/* ------------------------------------------------------------ Video feature */
+
+function VideoFeature() {
+  return (
+    <section className="border-b border-fd-border" aria-labelledby="video-heading">
+      <Container className="py-20 md:py-28">
+        <div className="mx-auto max-w-5xl">
+          <div className="mx-auto mb-8 max-w-2xl text-center">
+            <h2
+              id="video-heading"
+              className="text-balance font-display text-3xl font-medium leading-tight md:text-4xl"
+            >
+              Watch Nub in action
+            </h2>
+            <p className="mt-4 text-lg text-fd-muted-foreground">
+              A video walkthrough by our friends at{' '}
+              <a
+                href="https://www.youtube.com/@betterstack"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-fd-foreground underline decoration-dotted decoration-fd-muted-foreground/50 underline-offset-4 hover:decoration-fd-muted-foreground"
+              >
+                Better Stack
+              </a>
+              .
+            </p>
+          </div>
+          <div className="overflow-hidden rounded-xl border border-fd-border bg-black shadow-2xl shadow-black/20">
+            <iframe
+              className="block aspect-video w-full"
+              src="https://www.youtube-nocookie.com/embed/6YRpXxbtc2c?start=2"
+              title="An Ex-Bun Dev Just Built The Anti-Bun (Nub)"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+              referrerPolicy="strict-origin-when-cross-origin"
+              loading="lazy"
+              allowFullScreen
+            />
+          </div>
+        </div>
+      </Container>
+    </section>
+  );
+}
+
 /* --------------------------------------------------------------- primitives */
 
 function Container({ children, className = '' }: { children: ReactNode; className?: string }) {
@@ -46,7 +75,10 @@ function Container({ children, className = '' }: { children: ReactNode; classNam
 }
 
 function Mono({ children }: { children: ReactNode }) {
-  return <span className="font-mono text-[0.84em] text-fd-foreground">{children}</span>;
+  // 0.95em — Geist Mono set a tick under x-height parity with Encode Sans so the
+  // token reads in-scale with the sentence rather than a hair large (same value as
+  // inline `code` in global.css).
+  return <span className="font-mono text-[0.95em] tracking-[-0.005em] text-fd-foreground">{children}</span>;
 }
 
 /* An external link to upstream docs (Node, oxc). Neutral underline that brightens
@@ -139,8 +171,8 @@ function Feature({
   reverse?: boolean;
 }) {
   return (
-    <div className="grid items-center gap-12 py-14 xl:grid-cols-2">
-      <div className={`min-w-0 ${reverse ? 'xl:order-2' : ''}`}>
+    <div className="grid items-center gap-12 py-14 lg:grid-cols-2">
+      <div className={`min-w-0 ${reverse ? 'lg:order-2' : ''}`}>
         <p className={`eyebrow ${ACCENT_TEXT[accent]}`}>{eyebrow}</p>
         <h3 className="mt-3 text-balance font-display text-2xl font-medium leading-snug md:text-3xl">
           {title}
@@ -149,7 +181,7 @@ function Feature({
           {body}
         </p>
       </div>
-      <div className={`min-w-0 ${reverse ? 'xl:order-1' : ''}`}>{visual}</div>
+      <div className={`min-w-0 ${reverse ? 'lg:order-1' : ''}`}>{visual}</div>
     </div>
   );
 }
@@ -160,7 +192,7 @@ const heroLines = (major: string) => [
   { cmd: 'nub index.ts', comment: 'TypeScript-first Node.js runtime' },
   { cmd: 'nub run dev', comment: '24× faster pnpm run' },
   { cmd: 'nubx prisma generate', comment: '19× faster npx' },
-  { cmd: 'nub install', comment: '2.5× faster pnpm install' },
+  { cmd: 'nub install', comment: '5× faster pnpm install' },
   { cmd: 'nub watch src/server.ts', comment: 'native watch mode' },
   { cmd: 'nub pm shim', comment: 'built-in Corepack-style shims' },
   { cmd: `nub node install ${major}`, comment: 'Node version manager' },
@@ -169,14 +201,24 @@ const heroLines = (major: string) => [
 function HeroPill() {
   return (
     <Link
-      href="/blog/introducing-nub"
-      className="group inline-flex items-center gap-2 rounded-full border border-fd-border bg-fd-card/50 py-1 pl-1 pr-3 text-sm leading-none text-fd-muted-foreground hover:border-ember/50"
+      href="/blog/nub-0-7-0"
+      className="group inline-flex max-w-full items-center gap-2 rounded-full border border-fd-border bg-fd-card/50 py-1 pl-1 pr-3 text-sm leading-none text-fd-muted-foreground hover:border-ember/50"
     >
-      <span className="rounded-full bg-ember px-2.5 py-0.5 font-mono text-[0.7rem] font-medium uppercase tracking-wider text-[#fffdf8] dark:text-[#160c08]">
+      {/* flex items-center centers all three optically (verified to <0.25px against the
+          pill center); no manual vertical nudges. The title is the only shrinkable
+          child — `max-w-full` bounds the pill to the hero column and `min-w-0` lets
+          the title shrink below its intrinsic width, so a narrow viewport ellipsizes
+          it instead of wrapping the pill to two lines. Badge and arrow stay whole. */}
+      <span className="shrink-0 rounded-full bg-ember px-2.5 py-0.5 font-mono text-[0.7rem] font-medium uppercase tracking-wider text-[#fffdf8] dark:text-[#160c08]">
         New
       </span>
-      <span className="translate-y-px text-fd-foreground">Introducing Nub</span>
-      <span aria-hidden className="translate-y-px text-fd-muted-foreground group-hover:translate-x-0.5">
+      <span className="min-w-0 truncate text-fd-foreground">
+        Nub v0.7 — nub.jsonc, Varlock support, Promise.allKeyed, and more
+      </span>
+      <span
+        aria-hidden
+        className="shrink-0 text-fd-muted-foreground transition-transform group-hover:translate-x-0.5"
+      >
         →
       </span>
     </Link>
@@ -186,11 +228,9 @@ function HeroPill() {
 function HeroH1({ className = '' }: { className?: string }) {
   return (
     <h1
-      className={`text-balance font-display font-medium leading-[1.05] tracking-tight text-fd-foreground ${className}`}
+      className={`text-balance font-display font-medium leading-[1.2] tracking-tight text-fd-foreground ${className}`}
     >
-      The all-in-one JavaScript toolkit that{' '}
-      <span className="italic text-ember">augments</span> Node.js instead of trying
-      to replace it
+      The <span className="italic text-ember">all-in-one</span> Node.js toolkit
     </h1>
   );
 }
@@ -198,7 +238,7 @@ function HeroH1({ className = '' }: { className?: string }) {
 function HeroSub({ className = '' }: { className?: string }) {
   return (
     <p
-      className={`text-balance text-lg leading-relaxed text-fd-muted-foreground md:text-xl ${className}`}
+      className={`text-balance text-lg leading-[1.75] text-fd-muted-foreground md:text-xl ${className}`}
     >
       A TypeScript-first toolchain for Node.js. Run TypeScript files,{' '}
       <Mono>package.json</Mono>{' '}scripts, and local CLIs on the{' '}
@@ -210,7 +250,6 @@ function HeroSub({ className = '' }: { className?: string }) {
 
 async function Hero() {
   const node = await getLatestNode();
-  const startPrompt = await getStartPrompt();
   return (
     <section className="relative border-b border-fd-border">
       <div
@@ -221,19 +260,29 @@ async function Hero() {
             'radial-gradient(55% 50% at 50% -5%, rgba(255,93,59,0.16), transparent 70%)',
         }}
       />
+      {/* Handwritten "Leave a star" annotation in the hero's top-right; its arrow
+          swoops up to the star pill in the bar above. Mounted here but PORTALS to
+          <body> so it renders over the nav (escaping the hero's stacking context);
+          only the home route mounts it. Optional — see StarNudge. */}
+      <StarNudge />
       {/* Wider than the rest of the page (smaller gutters) so the H1 has room
           and never breaks past 3 lines. Stacks to one column below xl. */}
       <div className="relative mx-auto flex min-h-[calc(100svh-3.5rem)] w-full max-w-[88rem] items-center px-6 py-16 sm:px-8">
         <div className="grid w-full items-center gap-12 xl:grid-cols-[minmax(0,1fr)_minmax(640px,1fr)] xl:gap-12">
           <div className="min-w-0">
             <HeroPill />
-            <HeroH1 className="mt-6 text-4xl md:text-5xl" />
+            {/* Fluid in the 2-col zone: the xl grid squeezes the heading column to
+                ~528px at the 1280 boundary, where a flat 48px wraps to 4 lines.
+                clamp() scales the type with the viewport so it stays ≤3 lines through
+                the squeeze, then caps at 48px once there's room. Single-column (<xl)
+                keeps the flat 4xl/5xl — the heading is full-width there. */}
+            <HeroH1 className="mt-6 text-4xl md:text-5xl xl:text-[clamp(2.3rem,3vw,3rem)]" />
             <HeroSub className="mt-6" />
             <div className="mt-9">
               <InstallTabs />
             </div>
             <div className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2">
-              <MigrationPrompt prompt={startPrompt} />
+              <MigrationPrompt prompt={START_PROMPT} />
               <ViewRepoLink />
             </div>
           </div>
@@ -635,7 +684,6 @@ const APIS: { name: string; label: string }[] = [
   { name: 'using / await using', label: 'Transpiled' },
   { name: 'node:sqlite', label: 'Unflagged < 23' },
   { name: 'vm.Module', label: 'Auto-unflagged' },
-  { name: 'ShadowRealm', label: 'Auto-unflagged' },
   { name: 'RegExp.escape', label: 'Polyfilled < 24' },
   { name: 'Promise.try', label: 'Polyfilled < 24' },
   { name: 'Float16Array', label: 'Polyfilled < 24' },
@@ -902,21 +950,20 @@ function NubxBand() {
 
 /* ------------------------------------------------------------ Compatibility */
 
-/* Source: tests/cross-runtime/results.json, using Deno's Node-compat corpus (colinhacks/node_test @ node-25.8.1). Rates = runtime_pass / node_pass. */
+/* Source: tests/cross-runtime/results.json `scores.denoExclusions`, using Node 26.7.0's own test tree (tests/node-suite at v26.7.0) with Deno's directory set and config skips applied. Rate = the share of the tests real Node passes that this runtime ALSO passes, so numerator and denominator come from the same set. Do NOT recompute it as runtime_pass / node_pass: that draws the numerator from a larger set than the denominator and reads high (98.8 vs 98.6 for nub on the same June data). */
 const COMPAT = [
-  { name: 'Node 25.8', rate: 100, tests: '4,368 / 4,368', us: false, dim: false },
-  { name: 'Nub', rate: 98.8, tests: '4,315 / 4,368', us: true, dim: false },
-  { name: 'Deno 2.8', rate: 77.4, tests: '3,380 / 4,368', us: false, dim: true },
-  { name: 'Bun 1.3.14', rate: 40.5, tests: '1,770 / 4,368', us: false, dim: true },
+  { name: 'Node 26.7', rate: 100, tests: '4,690 / 4,690', us: false, dim: false },
+  { name: 'Nub', rate: 98.4, tests: '4,613 / 4,690', us: true, dim: false },
+  { name: 'Deno 2.9', rate: 72.4, tests: '3,397 / 4,690', us: false, dim: true },
+  { name: 'Bun 1.4', rate: 68.5, tests: '3,214 / 4,690', us: false, dim: true },
 ];
 
 function Compatibility() {
   return (
     <div className="py-14">
         <div className="mx-auto max-w-2xl text-center">
-          <p className="eyebrow text-ember">Compatibility</p>
-          <h3 className="mt-3 text-balance font-display text-2xl font-medium leading-snug md:text-3xl">
-            Node-compatible, because it <span className="italic">is</span> Node
+          <h3 className="text-balance font-display text-2xl font-medium leading-snug md:text-3xl">
+            Node.js compatibility benchmark
           </h3>
           <p className="mt-5 text-balance text-lg leading-relaxed text-fd-muted-foreground">
             Your code is transpiled and executed with the stock <Mono>node</Mono>{' '}binary, so it
@@ -957,7 +1004,7 @@ function Compatibility() {
           })}
         </div>
         <p className="mx-auto mt-6 max-w-lg text-center text-sm leading-relaxed text-fd-muted-foreground">
-          Deno&rsquo;s Node-compat corpus, scored against stock Node. Nub&rsquo;s misses come from auto-enabling experimental features and loading native addons.<br/>
+          Node 26.7&rsquo;s own test suite under Deno&rsquo;s compatibility lens, scored against stock Node. Most of Nub&rsquo;s 77 misses are tests that assert on machinery Nub installs itself &mdash; the permission model, module-loader hooks, the test runner, the compile cache &mdash; or on stack and output snapshots its preload changes.<br/>
           <a
             href="https://github.com/nubjs/nub/tree/main/tests/cross-runtime"
             target="_blank"
@@ -991,10 +1038,18 @@ const RULES = [
    `packageExtensions` row has no pm_engine dialect-scoping (no per-PM conflict);
    the nub=yes cell is grounded in the embedded aube engine, which honors a
    top-level `packageExtensions` natively (vendor/aube/crates/aube-manifest/src/lib.rs
-   `package_extensions()` → resolver package_ext.rs). Same for `allowBuilds` — a real
-   pnpm field (pnpm-workspace.yaml; pnpm/core/types/src/package.ts) that aube reads via
-   its pnpm-compat settings family; bun honors none of it (only `trustedDependencies`).
-   Both bun=no cells verified: zero refs in bun source + docs. Legend:
+   `package_extensions()` → resolver package_ext.rs). Same for `allowScripts` — a real
+   npm field (top-level package.json, npm 12; RFC npm/rfcs#868) that the engine reads at
+   the manifest root (vendor/aube/crates/aube-manifest/src/lib.rs ROOT_ALLOW_SCRIPTS_KEY).
+   pnpm=no because pnpm's own map is `allowBuilds` in pnpm-workspace.yaml, which nub
+   still reads under a pnpm incumbent — a different field, so a different row's claim.
+   Both bun=no cells verified: zero refs in bun source + docs.
+   `trustedDependencies` is nub=no on purpose: `honors_trusted_dependencies` returns
+   true for Role::Bun ALONE (config_scope.rs, asserted for every other role), so under
+   its own identity nub reads the neutral `allowScripts` and ignores bun's branded field.
+   `catalog:` is yarn=yes for berry — `role_honors_catalog` honors Role::Yarn at major>=2
+   (pm_engine/mod.rs); only a `1.x` pin refuses. Version-gated cells show the modern
+   line's truth, same as npm=yes for `overrides` (which npm gained in 8.3). Legend:
      yes  — honored
      no   — ignored
      —    — n/a
@@ -1016,19 +1071,19 @@ const PM_MATRIX: { field: ReactNode; cells: Record<(typeof PM_COLUMNS)[number], 
   },
   {
     field: <><Mono>catalog:</Mono></>,
-    cells: { npm: 'no', pnpm: 'yes', yarn: 'no', bun: 'yes', nub: 'yes' },
+    cells: { npm: 'no', pnpm: 'yes', yarn: 'yes', bun: 'yes', nub: 'yes' },
   },
   {
     field: <><Mono>packageExtensions</Mono></>,
     cells: { npm: 'no', pnpm: 'yes', yarn: 'yes', bun: 'no', nub: 'yes' },
   },
   {
-    field: <><Mono>allowBuilds</Mono></>,
-    cells: { npm: 'no', pnpm: 'yes', yarn: 'no', bun: 'no', nub: 'yes' },
+    field: <><Mono>allowScripts</Mono></>,
+    cells: { npm: 'yes', pnpm: 'no', yarn: 'no', bun: 'no', nub: 'yes' },
   },
   {
     field: <><Mono>trustedDependencies</Mono></>,
-    cells: { npm: 'no', pnpm: 'no', yarn: 'no', bun: 'yes', nub: 'yes' },
+    cells: { npm: 'no', pnpm: 'no', yarn: 'no', bun: 'yes', nub: 'no' },
   },
   {
     field: <><Mono>.npmrc</Mono></>,
@@ -1086,7 +1141,7 @@ function HypermanagerBand() {
           command="nub install"
           title={
             <>
-              A <span className="text-pink">2.5×</span> faster pnpm
+              A <span className="text-pink">5×</span> faster pnpm
             </>
           }
           subhead={
@@ -1139,10 +1194,9 @@ function HypermanagerBand() {
             title={<>Drop-in <HeadingCode>pnpm</HeadingCode> compatibility</>}
             body={
               <>
-                Nub&rsquo;s <Mono>install</Mono>{' '}and <Mono>add</Mono>{' '}accept pnpm&rsquo;s flags
-                with the same spelling and semantics, down to advanced features like the workspace
-                catalog. Swap <Mono>pnpm</Mono>{' '}for <Mono>nub</Mono>{' '}and your install commands
-                run unchanged.
+                Every package-manager command accepts pnpm&rsquo;s flags with the same spelling
+                and semantics, down to advanced features like the workspace catalog. Swap{' '}
+                <Mono>pnpm</Mono>{' '}for <Mono>nub</Mono>{' '}and your commands run unchanged.
               </>
             }
             visual={
@@ -1163,36 +1217,42 @@ function HypermanagerBand() {
             body={
               <>
                 Like pnpm, Nub keeps package files in a global content-addressed store and links
-                them into{' '}<Mono>node_modules</Mono>. Nub embeds{' '}
+                them into{' '}<Mono>node_modules</Mono>. The default layout relinks one symlink per
+                package instead of one hardlink per file, so a warm install scales with package
+                count, not file count. Nub embeds{' '}
                 <DocLink href="https://github.com/jdx/aube">aube</DocLink>, a highly optimized
                 Rust-based resolver and linker.
               </>
             }
             visual={
               <div className="nub-code-panel rounded-xl border p-6">
-                {/* Source: tests/bench/install/results/warm-t3-20260617-{100017,100453,100743}.json (create-t3-app, Next 16), warm + frozen + offline, node_modules wiped between runs. Bars are arithmetic means across 36 timed runs. */}
+                {/* Source: `large` fixture (1168 packages, 81398 files), warm + frozen + offline, node_modules wiped between runs; hyperfine, 25 runs / 6 warmup, near-idle ubuntu-latest CI. Linux is the honest shared primitive: bun and nub's hoisted mode both link with per-file hardlinks there (macOS forces both onto clonefile). The hoisted row is bun's exact layout + syscall — the same-regime bar; the default row adds the O(packages) GVS relink. bun 1.3.14, pnpm 10.34.4, npm on Node 24. */}
                 <p className="nub-code-muted mb-5 font-mono text-[0.7rem] uppercase tracking-[0.14em]">
-                  warm frozen install · create-t3-app · 222 deps · macOS
+                  warm frozen install · 1168 packages · Linux
                 </p>
                 <BenchBars
                   accent="pink"
-                  max={4163}
+                  max={12945}
                   unit="ms"
                   rows={[
-                    { cmd: 'nub', ms: 1122, us: true },
-                    { cmd: 'bun', ms: 1444, label: '29% slower' },
-                    { cmd: 'pnpm', ms: 2847, ratio: 2.5 },
-                    { cmd: 'npm', ms: 4163, ratio: 3.7 },
+                    { cmd: 'nub', ms: 346, us: true },
+                    { cmd: 'nub (hoisted)', ms: 1461, ratio: 4.2 },
+                    { cmd: 'bun', ms: 1896, ratio: 5.5 },
+                    { cmd: 'pnpm', ms: 3453, ratio: 10 },
+                    { cmd: 'npm', ms: 12945, ratio: 37.4 },
                   ]}
                 />
-                <a
-                  href="https://github.com/nubjs/nub/blob/main/tests/bench/install/README.md"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="nub-code-link nub-code-muted mt-3 inline-block py-1.5 font-mono text-[0.7rem] uppercase tracking-[0.14em] underline decoration-dotted underline-offset-4"
-                >
-                  View methodology →
-                </a>
+                <p className="nub-code-muted mt-4 font-mono text-[0.7rem] uppercase tracking-[0.14em]">
+                  ubuntu-latest · hyperfine, 25 runs ·{' '}
+                  <a
+                    href="https://github.com/nubjs/nub/blob/main/tests/bench/install/README.md"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="nub-code-link underline decoration-dotted underline-offset-4"
+                  >
+                    methodology →
+                  </a>
+                </p>
               </div>
             }
           />
@@ -1301,7 +1361,6 @@ function HypermanagerBand() {
 }
 
 async function FinalCta() {
-  const startPrompt = await getStartPrompt();
   return (
     <section className="relative border-b border-fd-border">
       <div
@@ -1326,7 +1385,7 @@ async function FinalCta() {
         <div className="mt-10 flex flex-col items-center gap-4">
           <InstallTabs className="mx-auto" />
           <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2">
-            <MigrationPrompt prompt={startPrompt} />
+            <MigrationPrompt prompt={START_PROMPT} />
             <ViewRepoLink />
           </div>
         </div>
@@ -1388,7 +1447,7 @@ function Footer() {
             links={[
               ['File runner', '/docs/runtime'],
               ['Script runner', '/docs/run'],
-              ['Package runner', '/docs/nubx'],
+              ['Bin runner', '/docs/nubx'],
               ['Package manager', '/docs/pm'],
               ['Version manager', '/docs/node'],
               ['Watch mode', '/docs/watch'],

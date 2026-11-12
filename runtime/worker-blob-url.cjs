@@ -10,86 +10,197 @@
 // main-thread preload can install the wrap EAGERLY: it must be live before user
 // code calls createObjectURL, whereas worker-polyfill.mjs (which pulls
 // worker_threads + the whole streams/worker-io builtin set) is loaded LAZILY on
-// first `new Worker` to protect cold start. The Worker class imports THIS module to
-// read `blobUrlSources`. Touches only URL / Blob / Buffer — all already-realized
+// first `new Worker` to protect cold start. The Worker class calls THIS module's
+// `blobUrlSource()`. Touches only URL / Blob / Buffer — all already-realized
 // core globals — so requiring it adds nothing to the main-thread bootstrap set.
+//
+// WHAT IS RETAINED, AND WHY IT IS THE MINIMUM. This wrap is installed on every
+// nub run without a native Worker, and the overwhelming majority of object URLs
+// never back a Worker at all (a download link, an image preview, a CSV export).
+// Node cannot read a Blob's bytes synchronously, so supporting `new Worker(blobUrl)`
+// at all means capturing SOMETHING when the Blob is built. Three properties keep
+// that honest:
+//
+//   * it is a COMPACT COPY, not the caller's parts. Holding the parts pinned
+//     whatever they referenced — `new Blob([big.subarray(0, 32)])` kept the
+//     whole 256 KB backing buffer alive for 32 bytes of content, measured at
+//     504 MB retained for 2000 such Blobs where plain Node held 2 MB.
+//   * it lives OFF the V8 heap, as a Buffer. The previous decoded-string form
+//     put a second full copy of every blob on the JS heap — measured at +43 MB
+//     against plain Node's +1 MB for 20k object URLs — where it counts against
+//     `--max-old-space-size` and can OOM a process Node would not. Decoding to
+//     text is deferred to `blobUrlSource()`, which only `new Worker` reaches.
+//   * it is CAPPED. A blob: worker entry is a script; past the cap nothing is
+//     kept, and `new Worker` reports the URL as unknown rather than silently
+//     retaining tens of megabytes per object URL to serve a case that does not
+//     occur in practice.
 
-// blob: URL → source text. Shared with worker-polyfill.mjs's Worker constructor.
+const {
+  ArrayBuffer,
+  ArrayBufferIsView,
+  ArrayPrototypePush,
+  Map,
+  MapPrototypeDelete,
+  MapPrototypeGet,
+  MapPrototypeSet,
+  ObjectDefineProperty,
+  Proxy,
+  ReflectApply,
+  ReflectConstruct,
+  SymbolFor,
+  WeakMap,
+  WeakMapPrototypeGet,
+  WeakMapPrototypeSet,
+  uncurryThis,
+} = require("./primordials.cjs");
+
+const { Buffer } = require("node:buffer");
+const BufferFrom = Buffer.from;
+const BufferConcat = Buffer.concat;
+const BufferIsBuffer = Buffer.isBuffer;
+const BufferPrototypeToString = uncurryThis(Buffer.prototype.toString);
+
+// blob: URL → the Blob's UTF-8 source bytes (a Buffer, off the V8 heap).
+// Read via blobUrlSource(); cleared by revokeObjectURL.
 const blobUrlSources = new Map();
-// Blob construction parts, remembered so createObjectURL can assemble source sync.
+// Per-Blob captured source bytes, so createObjectURL can assemble the entry
+// synchronously and a nested Blob part can be resolved.
 const blobParts = new WeakMap();
 
-function decode(parts) {
-  let src = "";
+// Generous ceiling on what is worth capturing: far above any real inline worker
+// script, far below the media/data blobs this must not duplicate.
+const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
+
+// Encode a Blob's construction parts into ONE compact Buffer, or null when the
+// content exceeds MAX_CAPTURE_BYTES (or a nested Blob was itself uncaptured).
+// `Buffer.concat` allocates a fresh exactly-sized buffer, which is also what
+// detaches the result from any larger backing store the caller passed a view of.
+function encodeParts(parts) {
+  const chunks = [];
+  let total = 0;
   for (const p of parts ?? []) {
-    if (typeof p === "string") src += p;
-    else if (typeof Buffer !== "undefined" && Buffer.isBuffer(p)) src += p.toString("utf8");
-    else if (ArrayBuffer.isView(p)) src += Buffer.from(p.buffer, p.byteOffset, p.byteLength).toString("utf8");
-    else if (p instanceof ArrayBuffer) src += Buffer.from(p).toString("utf8");
+    let chunk;
+    if (typeof p === "string") chunk = BufferFrom(p, "utf8");
+    else if (BufferIsBuffer(p)) chunk = p;
+    else if (ArrayBufferIsView(p)) chunk = BufferFrom(p.buffer, p.byteOffset, p.byteLength);
+    else if (p instanceof ArrayBuffer) chunk = BufferFrom(p);
     else if (typeof p === "object" && p && typeof p.size === "number") {
-      const nested = blobParts.get(p); // a nested Blob made via our wrapper
-      if (nested) src += decode(nested);
-    }
+      chunk = WeakMapPrototypeGet(blobParts, p); // a nested Blob made via our wrapper
+      if (chunk === undefined) return null; // nested blob was over the cap
+    } else continue;
+    total += chunk.length;
+    if (total > MAX_CAPTURE_BYTES) return null;
+    ArrayPrototypePush(chunks, chunk);
   }
-  return src;
+  return BufferConcat(chunks, total);
 }
 
-// Wrap URL.createObjectURL/revokeObjectURL and subclass Blob to remember parts.
+// Wrap URL.createObjectURL/revokeObjectURL and Proxy Blob to remember parts.
 // Idempotent + transparent for every non-worker use. No-op when URL has no
 // createObjectURL (older floors) — blob: workers are then simply unavailable.
+//
+// The install-marker is a Symbol, not a string property: it sits on the native
+// Blob constructor (a shared global), so a string key would show up in
+// `Reflect.ownKeys(Blob)` / `"x" in Blob` — a (cosmetic) divergence from vanilla
+// Node. A Symbol keeps the marker invisible to those reflective surfaces.
+const INSTALLED = SymbolFor("nub.blobUrlSupport.installed");
 function installBlobUrlSupport() {
   if (typeof URL === "undefined" || typeof URL.createObjectURL !== "function") return;
-  if (URL.createObjectURL.__nubWrapped) return;
+  if (URL.createObjectURL[INSTALLED]) return;
 
   const NativeBlob = globalThis.Blob;
-  if (typeof NativeBlob === "function" && !NativeBlob.__nubWrapped) {
-    // Transparent subclass: `instanceof Blob` stays true and the full Blob API is
-    // intact; we only record the construction parts for sync source assembly.
-    class Blob extends NativeBlob {
-      constructor(parts = [], options) {
-        super(parts, options);
-        blobParts.set(this, parts);
-      }
-    }
-    Object.defineProperty(Blob, "__nubWrapped", { value: true });
-    Object.defineProperty(globalThis, "Blob", {
-      value: Blob,
+  if (typeof NativeBlob === "function" && !NativeBlob[INSTALLED]) {
+    // Record construction parts WITHOUT changing Blob's identity. The earlier
+    // approach — a `class extends NativeBlob` swapped onto globalThis.Blob — broke
+    // brand identity in two ways that a structured-clone exposes:
+    //   1. A deserialized Blob (postMessage / structuredClone) is a NATIVE Blob, so
+    //      `cloned instanceof globalThis.Blob` was FALSE (subclass.prototype is not
+    //      in a native instance's chain) — a spec violation; native Node passes.
+    //   2. WORSE, undici's webidl `is.Blob` uses the ORDINARY `[Symbol.hasInstance]`
+    //      (a prototype-chain check that ignores a custom hasInstance) against
+    //      `globalThis.Blob`, so `new Response(clonedBlob).arrayBuffer()` failed the
+    //      brand check and stringified the Blob to "[object Blob]" (13 bytes) instead
+    //      of reading its bytes. A custom `Symbol.hasInstance` can't fix this — undici
+    //      bypasses it.
+    // The ROOT cause was `globalThis.Blob !== node:buffer.Blob`. A Proxy whose target
+    // is the native Blob keeps `globalThis.Blob.prototype === NativeBlob.prototype`,
+    // so every native Blob (constructed OR deserialized) passes both `instanceof` and
+    // undici's ordinary-hasInstance check exactly as on vanilla Node — while the
+    // `construct` trap still records parts for sync blob: worker source assembly. File
+    // (which `extends` native Blob) then needs NO re-parenting: its instances already
+    // have NativeBlob.prototype in their chain.
+    const BlobProxy = new Proxy(NativeBlob, {
+      construct(target, args, newTarget) {
+        // FORWARD newTarget so a user subclass (`class X extends Blob {}`) gets ITS
+        // prototype — passing `target` here would force NativeBlob.prototype and
+        // silently break `new X() instanceof X` + the subclass's methods (an
+        // additivity violation vs vanilla Node). When `new Blob(...)` is called
+        // directly, newTarget IS this Proxy; Reflect.construct(NativeBlob, args, Proxy)
+        // resolves the new instance's proto from `Proxy.prototype`, which the Proxy
+        // forwards to NativeBlob.prototype — so a direct Blob is byte-identical to a
+        // native one (same brand, passes instanceof + undici's webidl check).
+        const inst = ReflectConstruct(target, args, newTarget);
+        if (args[0] != null) {
+          // Capture a compact copy NOW — the only moment the bytes are readable
+          // synchronously. `encodeParts` returns null past the cap, and a Blob
+          // with no entry simply is not usable as a worker entry. Never let our
+          // accounting fail a Blob construction that vanilla Node would allow.
+          try {
+            const bytes = encodeParts(args[0]);
+            if (bytes !== null) WeakMapPrototypeSet(blobParts, inst, bytes);
+          } catch {
+            /* exotic parts: no capture, so no blob: worker from this Blob */
+          }
+        }
+        return inst;
+      },
+    });
+    ObjectDefineProperty(NativeBlob, INSTALLED, { value: true });
+    ObjectDefineProperty(globalThis, "Blob", {
+      value: BlobProxy,
       enumerable: false,
       writable: true,
       configurable: true,
     });
-
-    // `File` is a Node bootstrap global that `extends` the NATIVE Blob, realized
-    // before this swap. Without re-pointing, `new File(...) instanceof Blob`
-    // becomes FALSE (File still extends native Blob, but `globalThis.Blob` is now
-    // the subclass) — a silent additivity violation vs vanilla Node, where File
-    // IS-A Blob. Re-parent File's prototype chain onto the new Blob so the
-    // `instanceof` contract holds. Both the .prototype link (instances) and the
-    // constructor link (static inheritance) are re-pointed.
-    const File = globalThis.File;
-    if (typeof File === "function" && Object.getPrototypeOf(File) === NativeBlob) {
-      Object.setPrototypeOf(File.prototype, Blob.prototype);
-      Object.setPrototypeOf(File, Blob);
-    }
+    // File's `extends` link still points at the real NativeBlob (unchanged), so
+    // `new File(...) instanceof Blob` holds natively — no re-parenting needed.
   }
 
-  const nativeCreate = URL.createObjectURL.bind(URL);
+  const URLConstructor = URL;
+  const createObjectURL = URL.createObjectURL;
+  const revokeObjectURL = URL.revokeObjectURL;
+  const nativeCreate = (obj) => ReflectApply(createObjectURL, URLConstructor, [obj]);
   const nativeRevoke =
-    typeof URL.revokeObjectURL === "function" ? URL.revokeObjectURL.bind(URL) : null;
+    typeof revokeObjectURL === "function" ? (...args) => ReflectApply(revokeObjectURL, URLConstructor, args) : null;
   const wrappedCreate = function createObjectURL(obj) {
     const url = nativeCreate(obj);
-    const parts = blobParts.get(obj);
-    if (parts) blobUrlSources.set(url, decode(parts));
+    // Point the URL at the compact bytes captured at construction — never at the
+    // Blob itself, which would keep our own WeakMap entry (and so the caller's
+    // parts) reachable for as long as the URL lives.
+    const bytes = WeakMapPrototypeGet(blobParts, obj);
+    if (bytes !== undefined) MapPrototypeSet(blobUrlSources, url, bytes);
     return url;
   };
-  Object.defineProperty(wrappedCreate, "__nubWrapped", { value: true });
+  ObjectDefineProperty(wrappedCreate, INSTALLED, { value: true });
   URL.createObjectURL = wrappedCreate;
   if (nativeRevoke) {
     URL.revokeObjectURL = function revokeObjectURL(url) {
-      blobUrlSources.delete(url);
-      return nativeRevoke(url);
+      MapPrototypeDelete(blobUrlSources, url);
+      // Forward the caller's real arguments rather than a fixed arity of one, so a
+      // zero-arg call still reaches Node's own ERR_MISSING_ARGS check.
+      return nativeRevoke(...arguments);
     };
   }
 }
 
-module.exports = { blobUrlSources, installBlobUrlSupport };
+// The source text behind a `blob:` worker entry, decoded ON DEMAND — the only
+// caller is worker-polyfill.mjs's Worker constructor, so an object URL that
+// never becomes a Worker is never decoded at all. `undefined` when the URL was
+// not minted through our wrap, was revoked, or held content past the capture
+// cap; the constructor turns that into its "not a known object URL" TypeError.
+function blobUrlSource(url) {
+  const bytes = MapPrototypeGet(blobUrlSources, url);
+  return bytes === undefined ? undefined : BufferPrototypeToString(bytes, "utf8");
+}
+
+module.exports = { blobUrlSources, blobUrlSource, installBlobUrlSupport };

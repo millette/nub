@@ -86,7 +86,7 @@ pub struct PmTargetResolution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmPinResolution {
     pub pin: PmPin,
-    pub source: PinSource,
+    source: PinSource,
     pub warnings: Vec<PinWarning>,
 }
 
@@ -348,57 +348,59 @@ fn disagreement_warning(
     let dev = manifest
         .get("devEngines")
         .and_then(|d| d.get("packageManager"))?;
-    // Mirror the identity probe's array handling: the last named entry governs.
-    let entry = match dev {
-        serde_json::Value::Array(items) => items
-            .iter()
-            .rev()
-            .find(|e| e.get("name").and_then(|n| n.as_str()).is_some())?,
-        other => other,
+    // An array lists acceptable managers in any order: the pin agrees when ANY
+    // entry naming its manager accepts it, so the verdict never depends on order.
+    let pm_name = pm_pin.pm.to_string();
+    let named: Vec<(&str, Option<&str>)> = match dev {
+        serde_json::Value::Array(items) => items.iter().filter_map(dev_engines_entry).collect(),
+        other => dev_engines_entry(other).into_iter().collect(),
     };
-    let dev_name = entry.get("name")?.as_str()?.trim();
-    if dev_name.is_empty() {
-        return None;
-    }
-    let dev_version = entry.get("version").and_then(|v| v.as_str());
-    let dev_spec = match dev_version {
-        Some(v) => format!("{dev_name}@{v}"),
-        None => dev_name.to_string(),
+    let spec = |(name, version): (&str, Option<&str>)| match version {
+        Some(v) => format!("{name}@{v}"),
+        None => name.to_string(),
     };
+    let same_pm: Vec<_> = named
+        .iter()
+        .copied()
+        .filter(|(n, _)| *n == pm_name)
+        .collect();
 
     // Name mismatch: yarn classic vs Berry both print `yarn`, so compare on the
     // Display name (the user-visible PM), not the classic/Berry split.
-    if dev_name != pm_pin.pm.to_string() {
+    if same_pm.is_empty() {
         return Some(PinWarning::Disagreement {
             package_manager: pm_spec.trim().to_string(),
-            dev_engines: dev_spec,
+            dev_engines: spec(*named.last()?),
             kind: DisagreementKind::Name,
         });
     }
 
-    // Same PM: does packageManager's exact version satisfy the devEngines range?
+    // Same PM: does packageManager's exact version satisfy a devEngines range?
     // Strip the Corepack hash suffix before parsing (it rides as semver build
-    // metadata and isn't part of the comparison). A devEngines entry with no
-    // version, or a version/range either side can't parse, isn't a checkable
-    // disagreement — skip rather than warn on noise.
-    let (Some(pm_version), Some(dev_range)) = (pm_pin.version.as_deref(), dev_version) else {
-        return None;
-    };
+    // metadata and isn't part of the comparison). An entry with no version, or a
+    // range that can't parse, isn't a checkable disagreement, so it accepts
+    // rather than warning on noise; so does a pin version that can't parse.
+    let pm_version = pm_pin.version.as_deref()?;
     let pm_bare = pm_version.split('+').next().unwrap_or(pm_version);
     let parsed = semver::Version::parse(pm_bare).ok()?;
-    let req = semver::VersionReq::parse(&crate::pm::registry::normalize_range(dev_range)).ok()?;
-    if !req.matches(&parsed) {
-        return Some(PinWarning::Disagreement {
-            package_manager: pm_spec.trim().to_string(),
-            dev_engines: dev_spec,
-            kind: DisagreementKind::Version,
-        });
+    let accepts = |(_, version): &(&str, Option<&str>)| {
+        version.is_none_or(|range| {
+            semver::VersionReq::parse(&crate::pm::registry::normalize_range(range))
+                .map_or(true, |req| req.matches(&parsed))
+        })
+    };
+    if same_pm.iter().any(accepts) {
+        return None;
     }
-    None
+    Some(PinWarning::Disagreement {
+        package_manager: pm_spec.trim().to_string(),
+        dev_engines: same_pm.into_iter().map(spec).collect::<Vec<_>>().join(", "),
+        kind: DisagreementKind::Version,
+    })
 }
 
 /// The project's PM identity at the NAME level — the declared-first identity
-/// probe (wiki/commands/pm/identity-policy.md, Axiom 1: declaration outranks
+/// probe (`identity-policy` (no such document), Axiom 1: declaration outranks
 /// lockfile inference). Unlike [`resolve_pin`] it never reads a project as
 /// unpinned just because the pin's *version* is unusable, and it sees identity
 /// channels that carry no provisionable version:
@@ -432,6 +434,35 @@ pub fn declared_pm_raw(cwd: &Path) -> Option<(String, Option<String>)> {
             .to_string()
     });
     Some((name, version))
+}
+
+/// The workspace-root `packageManager` field's `(name, version)` — the exact
+/// Corepack ENFORCEMENT field ONLY, with the `+sha512` build metadata stripped.
+/// Deliberately does NOT fall back to `devEngines.packageManager` the way
+/// [`declared_pm_raw`] does: `packageManager` is the exact pin a tool executes,
+/// while `devEngines` is a range-of-intent. The nub self-shim reads through this
+/// so a `devEngines.packageManager` naming nub (a range) never drives a provision
+/// or a spurious not-exact notice — only the exact `packageManager` field does.
+/// `None` when there is no `packageManager` field at the workspace root.
+pub fn declared_package_manager_field(cwd: &Path) -> Option<(String, Option<String>)> {
+    let manifest = root_manifest(cwd)?;
+    let spec = manifest
+        .get("packageManager")
+        .and_then(|v| v.as_str())?
+        .trim();
+    let (name, version) = match spec.split_once('@') {
+        Some((n, v)) => (n, Some(v.to_string())),
+        None => (spec, None),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let version = version.map(|v| {
+        v.split_once('+')
+            .map_or(v.as_str(), |(bare, _)| bare)
+            .to_string()
+    });
+    Some((name.to_string(), version))
 }
 
 /// The workspace-root `packageManager` field decomposed as
@@ -486,9 +517,13 @@ pub fn project_pm_identity(cwd: &Path) -> Option<PmIdentity> {
 
 /// The raw `(name, version)` a manifest's pin fields state, with NO usability
 /// check — `packageManager` first, then `devEngines.packageManager` (object or
-/// array; an array yields its LAST named entry, the one the spec's
-/// ignore-earlier/error-last semantics make govern). The identity probe's
-/// reader; [`pin_from_manifest`] stays the strict, warning-emitting one.
+/// array). An array naming more than one distinct tool says any of them is
+/// acceptable, so it is no single pin and yields `None`, leaving the lockfile to
+/// decide; an array repeating one tool yields that tool, with a version only when
+/// every entry states the same one. That is `aube_lockfile::declared_package_manager`'s
+/// rule, which the engine and the CLI's config surface use, so the role read here
+/// never depends on the array's order. The identity probe's reader;
+/// [`pin_from_manifest`] stays the strict, warning-emitting one.
 fn raw_pin_name_version(manifest: &serde_json::Value) -> Option<(String, Option<String>)> {
     if let Some(spec) = manifest.get("packageManager").and_then(|v| v.as_str()) {
         let spec = spec.trim();
@@ -499,36 +534,110 @@ fn raw_pin_name_version(manifest: &serde_json::Value) -> Option<(String, Option<
         return (!name.is_empty()).then(|| (name.to_string(), version));
     }
     let dev = manifest.get("devEngines")?.get("packageManager")?;
-    let entry = match dev {
-        serde_json::Value::Array(items) => items
-            .iter()
-            .rev()
-            .find(|e| e.get("name").and_then(|n| n.as_str()).is_some())?,
-        other => other,
+    let entries: Vec<(&str, Option<&str>)> = match dev {
+        serde_json::Value::Array(items) => items.iter().filter_map(dev_engines_entry).collect(),
+        other => dev_engines_entry(other).into_iter().collect(),
     };
-    let name = entry.get("name")?.as_str()?.trim();
-    if name.is_empty() {
+    let (name, version) = *entries.first()?;
+    if entries.iter().any(|(n, _)| *n != name) {
         return None;
     }
-    let version = entry
-        .get("version")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    Some((name.to_string(), version))
+    let version = entries
+        .iter()
+        .all(|(_, v)| *v == version)
+        .then_some(version)
+        .flatten();
+    Some((name.to_string(), version.map(str::to_string)))
 }
 
-/// The `package.json` value at [`pin_target_dir`] — the workspace root if one is
-/// above `cwd`, else the nearest project root. The detected project already parsed
-/// the nearest manifest; only a distinct workspace root needs a second read.
-fn root_manifest(cwd: &Path) -> Option<serde_json::Value> {
-    let project = detect_project(cwd)?;
-    match &project.workspace_root {
-        Some(ws) if *ws != project.root => {
-            let content = std::fs::read_to_string(ws.join("package.json")).ok()?;
-            serde_json::from_str(&content).ok()
-        }
-        _ => Some(project.manifest),
+/// The version the workspace-root manifest declares for `tool`, `+sha512`
+/// suffix stripped. A single pin ([`declared_pm_raw`]) answers only for the tool
+/// it names. A `devEngines.packageManager` array of several tools is no single
+/// pin, so the lockfile picks the tool, and the entries naming that tool give
+/// its version when they all state the same one: `[pnpm@^11, npm@^11]` beside
+/// `pnpm-lock.yaml` is pnpm 11 in either order. Mirrors
+/// `aube_lockfile::declared_version_for`.
+pub fn declared_pm_version(cwd: &Path, tool: &str) -> Option<String> {
+    let manifest = root_manifest(cwd)?;
+    let version = raw_version_for(&manifest, tool)?;
+    Some(
+        version
+            .split_once('+')
+            .map_or(version.as_str(), |(bare, _)| bare)
+            .to_string(),
+    )
+}
+
+fn raw_version_for(manifest: &serde_json::Value, tool: &str) -> Option<String> {
+    if let Some((name, version)) = raw_pin_name_version(manifest) {
+        return (name == tool).then_some(version).flatten();
     }
+    if manifest.get("packageManager").is_some() {
+        return None;
+    }
+    let items = manifest
+        .get("devEngines")?
+        .get("packageManager")?
+        .as_array()?;
+    let versions: Vec<Option<&str>> = items
+        .iter()
+        .filter_map(dev_engines_entry)
+        .filter(|(name, _)| *name == tool)
+        .map(|(_, version)| version)
+        .collect();
+    let first = *versions.first()?;
+    versions
+        .iter()
+        .all(|v| *v == first)
+        .then_some(first)
+        .flatten()
+        .map(str::to_string)
+}
+
+/// A `devEngines.packageManager` entry's `(name, version)`, when it names a tool.
+fn dev_engines_entry(entry: &serde_json::Value) -> Option<(&str, Option<&str>)> {
+    let name = entry.get("name")?.as_str()?.trim();
+    (!name.is_empty()).then(|| (name, entry.get("version").and_then(|v| v.as_str())))
+}
+
+/// Per-process, mtime-validated cache of the root manifest keyed by the
+/// resolved manifest FILE path. `declared_pm_raw` is called several times per PM
+/// command (config-scoping, the lifecycle UA, the install-signals re-read) and
+/// each call walked + read + parsed the same `package.json`; this collapses
+/// those to one read per `(path, mtime)`. mtime validation makes it stale-proof:
+/// any rewrite of the manifest (the in-process engine mid-command) bumps the
+/// mtime, the next lookup misses, and the file is re-read.
+static ROOT_MANIFEST_CACHE: crate::config_cache::MtimeCache<serde_json::Value> =
+    crate::config_cache::MtimeCache::new();
+
+/// The `package.json` value at [`pin_target_dir`] — the workspace root if one is
+/// above `cwd`, else the nearest project root.
+///
+/// The path is resolved via [`detect_project`] (a directory walk), then the
+/// chosen manifest is read through [`ROOT_MANIFEST_CACHE`] keyed on that path so
+/// repeated callers within one command share a single read + parse. Returns an
+/// `Arc` so a cache hit is a pointer clone, not a deep manifest copy.
+fn root_manifest(cwd: &Path) -> Option<std::sync::Arc<serde_json::Value>> {
+    let project = detect_project(cwd)?;
+    // The manifest path the value is read from — keys (and mtime-validates) the
+    // cache. A distinct workspace root reads the workspace manifest; otherwise
+    // the project root's own manifest.
+    let manifest_path = match &project.workspace_root {
+        Some(ws) if *ws != project.root => ws.join("package.json"),
+        _ => project.root.join("package.json"),
+    };
+    ROOT_MANIFEST_CACHE.get_or_read(&manifest_path, || {
+        // `detect_project` already parsed the project-root manifest; reuse it on
+        // the common (no distinct workspace root) path to avoid a second parse on
+        // a cache miss. A distinct workspace root needs its own read.
+        match &project.workspace_root {
+            Some(ws) if *ws != project.root => {
+                let content = std::fs::read_to_string(ws.join("package.json")).ok()?;
+                serde_json::from_str(crate::strip_utf8_bom(&content)).ok()
+            }
+            _ => Some(project.manifest),
+        }
+    })
 }
 
 /// The result of [`write_declared_pm`]: the manifest written, and the
@@ -537,14 +646,14 @@ fn root_manifest(cwd: &Path) -> Option<serde_json::Value> {
 /// write — `nub pm update`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredPmWrite {
-    pub path: PathBuf,
+    path: PathBuf,
     pub dev_engines_range: Option<String>,
 }
 
 /// Write the `packageManager` declaration into the workspace-root
 /// `package.json` — the identity-setting write behind `nub pm use` (and the
 /// version bump behind `nub pm update`). Per the PM identity policy
-/// (wiki/commands/pm/identity-policy.md, Axiom 3) this is the ONLY code path
+/// (`identity-policy` (no such document), Axiom 3) this is the ONLY code path
 /// that writes the field:
 ///
 ///   - `packageManager: "<name>@<exact>+sha512.<hex>"` — the resolved record
@@ -718,11 +827,15 @@ fn edit_manifest(
         );
     }
 
-    let content =
+    let raw =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let format = detect_format(&content);
+    // Strip a leading BOM before both format-sniffing and parsing; the rewrite
+    // is emitted BOM-free (npm/pnpm write without one), which is the desired
+    // normalization rather than round-tripping the BOM.
+    let content = crate::strip_utf8_bom(&raw);
+    let format = detect_format(content);
     let mut manifest: serde_json::Value =
-        serde_json::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+        serde_json::from_str(content).with_context(|| format!("parsing {}", path.display()))?;
 
     let obj = manifest
         .as_object_mut()
@@ -794,7 +907,7 @@ fn pin_target_dir(cwd: &Path) -> PathBuf {
 ///
 /// Public so the CLI's pin consumers parse through the SAME pin parser the
 /// `packageManager` reader uses — there is no second spec parser.
-pub fn parse_spec(spec: &str) -> Result<PmPin> {
+fn parse_spec(spec: &str) -> Result<PmPin> {
     let spec = spec.trim();
     let (name, version) = spec.split_once('@').with_context(|| {
         format!("packageManager \"{spec}\" must be in name@version form (e.g. pnpm@9.1.0)")
@@ -1173,6 +1286,29 @@ mod tests {
     }
 
     #[test]
+    fn write_declared_pm_reads_through_a_utf8_bom_and_rewrites_bom_free() {
+        // A BOM-prefixed manifest (Windows editors / PowerShell 5.1) must parse
+        // for the pin write, not error at the read-modify-write seam — and the
+        // rewrite is emitted BOM-free (npm/pnpm write without one).
+        let dir = tmpdir("write-pin-bom");
+        write_pkg(&dir, "\u{feff}{\n  \"name\": \"app\"\n}\n");
+        let written = write_declared_pm("pnpm", "9.1.0", "abc", &dir, false)
+            .unwrap()
+            .path;
+        let bytes = std::fs::read(&written).unwrap();
+        assert!(
+            !bytes.starts_with(b"\xEF\xBB\xBF"),
+            "the rewrite must not carry a BOM"
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            manifest["packageManager"].as_str(),
+            Some("pnpm@9.1.0+sha512.abc"),
+        );
+        assert_eq!(manifest["name"].as_str(), Some("app"));
+    }
+
+    #[test]
     fn keeping_dev_engines_preserves_a_hand_written_range_while_the_record_bumps() {
         // The pair semantics under `nub pm update`: devEngines is the user's
         // INTENT, packageManager the resolved record. A hand-written range
@@ -1461,6 +1597,36 @@ mod tests {
                 ..
             }]
         ));
+
+        // An array accepts the pin when any entry naming its manager does, in
+        // either order; it warns only when none does.
+        for entries in [
+            r#"[{"name":"npm","version":"^10.0.0"},{"name":"npm","version":"^11.0.0"}]"#,
+            r#"[{"name":"npm","version":"^11.0.0"},{"name":"npm","version":"^10.0.0"}]"#,
+        ] {
+            let manifest: serde_json::Value = serde_json::from_str(&format!(
+                r#"{{"packageManager":"npm@11.2.0","devEngines":{{"packageManager":{entries}}}}}"#
+            ))
+            .unwrap();
+            assert!(
+                pin_from_manifest(&manifest).warnings.is_empty(),
+                "{entries}: the ^11 entry accepts npm@11.2.0"
+            );
+        }
+        let manifest: serde_json::Value = serde_json::from_str(
+            r#"{"packageManager":"npm@11.2.0","devEngines":{"packageManager":[{"name":"npm","version":"^9.0.0"},{"name":"pnpm"},{"name":"npm","version":"^10.0.0"}]}}"#,
+        )
+        .unwrap();
+        match pin_from_manifest(&manifest).warnings.as_slice() {
+            [
+                PinWarning::Disagreement {
+                    dev_engines,
+                    kind: DisagreementKind::Version,
+                    ..
+                },
+            ] => assert_eq!(dev_engines, "npm@^9.0.0, npm@^10.0.0"),
+            other => panic!("no npm entry accepts npm@11.2.0, so a Version warning: {other:?}"),
+        }
 
         // In range → no warning (and the hash suffix is stripped before the
         // satisfaction check).
@@ -1850,16 +2016,35 @@ mod tests {
         write_pkg(&dir, r#"{"name":"app"}"#);
         assert_eq!(project_pm_identity(&dir), None);
 
-        // (d) devEngines array form: the LAST named entry governs the identity.
-        let dir = tmpdir("ident-array");
+        // (d) devEngines array form. Several distinct tools are "any of these",
+        // so no single identity in either order (the lockfile decides); one tool,
+        // repeated, is that tool.
+        for array in [
+            r#"[{"name":"bun"},{"name":"pnpm","version":"^9"}]"#,
+            r#"[{"name":"pnpm","version":"^9"},{"name":"bun"}]"#,
+        ] {
+            let dir = tmpdir("ident-array");
+            write_pkg(
+                &dir,
+                &format!(r#"{{"devEngines":{{"packageManager":{array}}}}}"#),
+            );
+            assert_eq!(project_pm_identity(&dir), None, "{array}");
+            // The tool the lockfile then picks still has a declared version.
+            assert_eq!(
+                declared_pm_version(&dir, "pnpm").as_deref(),
+                Some("^9"),
+                "{array}"
+            );
+            assert_eq!(declared_pm_version(&dir, "bun"), None, "{array}");
+        }
+        let dir = tmpdir("ident-array-one-tool");
         write_pkg(
             &dir,
-            r#"{"devEngines":{"packageManager":[{"name":"bun"},{"name":"pnpm","version":"^9"}]}}"#,
+            r#"{"devEngines":{"packageManager":[{"name":"pnpm","version":"^9"},{"name":"pnpm","version":"^9"}]}}"#,
         );
         assert_eq!(
             project_pm_identity(&dir).map(|i| i.name),
-            Some("pnpm".to_string()),
-            "the array's last named entry (spec: error-last) is the identity"
+            Some("pnpm".to_string())
         );
     }
 }

@@ -35,7 +35,7 @@ import { onMounted, ref } from "vue";
 
 const sponsors = ref([]);
 const error = ref(false);
-const footerTiers = new Set(["anchor", "premier", "partner"]);
+const footerTiers = new Set(["title", "premier", "partner"]);
 const sponsorFeedTimeoutMs = 5000;
 
 const sponsorItems = (items) => (Array.isArray(items) ? items : []);
@@ -136,8 +136,10 @@ onMounted(async () => {
 
 .EndevSponsorsLogo img {
   display: block;
-  max-height: 22px;
+  height: 22px;
   max-width: 120px;
+  object-fit: contain;
+  width: auto;
 }
 
 .EndevSponsorsCta {
